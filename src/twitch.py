@@ -1,0 +1,322 @@
+from __future__ import annotations
+
+import json
+import logging
+import socket
+import ssl
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+from typing import Mapping
+
+from .db import (
+	connect_database,
+	initialize_database,
+	list_twitch_channels,
+	persist_normalized_message,
+	update_twitch_channel_status,
+	upsert_twitch_channel,
+)
+from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp
+
+
+class TwitchPayloadError(ValueError):
+	pass
+
+
+class TwitchConnectionError(RuntimeError):
+	pass
+
+
+def normalize_twitch_message(payload: Mapping[str, object]) -> NormalizedMessage:
+	user_id = str(payload.get("user_id") or "").strip()
+	username = str(payload.get("username") or payload.get("display_name") or "").strip()
+	channel = str(payload.get("channel") or payload.get("channel_id") or "").strip()
+	content = str(payload.get("content") or payload.get("message") or "")
+
+	if not user_id:
+		raise TwitchPayloadError("Twitch payload requires user_id")
+	if not username:
+		raise TwitchPayloadError("Twitch payload requires username")
+	if not channel:
+		raise TwitchPayloadError("Twitch payload requires channel")
+	if not content.strip():
+		raise TwitchPayloadError("Twitch payload requires content")
+
+	badges = payload.get("badges")
+	if isinstance(badges, (list, tuple)):
+		normalized_badges = tuple(str(badge).strip() for badge in badges if str(badge).strip())
+	else:
+		normalized_badges = ()
+
+	is_moderator = bool(payload.get("is_moderator", False))
+	if not is_moderator and normalized_badges:
+		moderator_badges = {"moderator", "broadcaster", "vip"}
+		is_moderator = any(badge.casefold() in moderator_badges for badge in normalized_badges)
+
+	return NormalizedMessage(
+		platform="twitch",
+		platform_message_id=str(payload.get("message_id")) if payload.get("message_id") is not None else None,
+		platform_user_id=user_id,
+		username=username,
+		channel_id=channel,
+		guild_or_channel_context=channel,
+		content_raw=content,
+		sent_at=coerce_timestamp(payload.get("sent_at") or payload.get("timestamp")),
+		role_names=normalized_badges,
+		is_moderator=is_moderator,
+		metadata={"badges": normalized_badges},
+	)
+
+
+def parse_twitch_irc_message(raw_line: str) -> Mapping[str, object] | None:
+	line = raw_line.strip()
+	if not line or " PRIVMSG " not in line:
+		return None
+
+	tags: dict[str, str] = {}
+	remainder = line
+	if remainder.startswith("@"):
+		tag_blob, remainder = remainder.split(" ", 1)
+		for item in tag_blob[1:].split(";"):
+			if "=" not in item:
+				continue
+			key, value = item.split("=", 1)
+			tags[key] = value
+
+	if not remainder.startswith(":"):
+		return None
+
+	try:
+		prefix, command_section = remainder[1:].split(" PRIVMSG ", 1)
+		channel_part, content = command_section.split(" :", 1)
+	except ValueError:
+		return None
+
+	username = prefix.split("!", 1)[0].strip()
+	channel = channel_part.strip().lstrip("#")
+	if not username or not channel:
+		return None
+
+	badges = []
+	for badge_entry in tags.get("badges", "").split(","):
+		if not badge_entry:
+			continue
+		badge_name = badge_entry.split("/", 1)[0].strip()
+		if badge_name:
+			badges.append(badge_name)
+
+	timestamp = None
+	tmi_sent_ts = tags.get("tmi-sent-ts")
+	if tmi_sent_ts and tmi_sent_ts.isdigit():
+		timestamp = datetime.fromtimestamp(
+			int(tmi_sent_ts) / 1000,
+			tz=timezone.utc,
+		).isoformat()
+
+	return {
+		"message_id": tags.get("id"),
+		"timestamp": timestamp,
+		"channel": channel,
+		"content": content,
+		"user_id": tags.get("user-id") or "",
+		"username": tags.get("display-name") or username,
+		"display_name": tags.get("display-name") or username,
+		"badges": tuple(badges),
+		"is_moderator": tags.get("mod") == "1",
+	}
+
+
+class TwitchConnector:
+	def __init__(
+		self,
+		database_path: Path,
+		*,
+		join_command_channel: str = "its_not_qwerty",
+		bootstrap_channels: tuple[str, ...] = (),
+	) -> None:
+		self.database_path = Path(database_path)
+		self.join_command_channel = join_command_channel.strip().casefold()
+		self.bootstrap_channels = tuple(
+			channel.strip().casefold() for channel in bootstrap_channels if channel.strip()
+		)
+		self._last_status = "idle"
+		self._logger = logging.getLogger("qbot4k.twitch")
+
+	def ingest_message(self, payload: Mapping[str, object]) -> IngestionResult:
+		normalized = normalize_twitch_message(payload)
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			self._seed_bootstrap_channels(connection)
+			result = persist_normalized_message(connection, normalized)
+			self._process_join_command(connection, normalized, result)
+			self._last_status = "ready"
+			return result
+		finally:
+			connection.close()
+
+	def configured_channels(self) -> tuple[str, ...]:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			self._seed_bootstrap_channels(connection)
+			rows = list_twitch_channels(connection)
+			self._last_status = "ready"
+			return tuple(str(row["channel_name"]) for row in rows)
+		finally:
+			connection.close()
+
+	def run_forever(self, bot_token: str) -> None:
+		bot_login = self._validate_token_and_get_login(bot_token)
+		channels = self.configured_channels()
+		if not channels:
+			raise TwitchConnectionError("No Twitch channels configured")
+
+		self._last_status = "connecting"
+		token_for_irc = bot_token.removeprefix("oauth:")
+		ssl_context = ssl.create_default_context()
+
+		with socket.create_connection(("irc.chat.twitch.tv", 6697), timeout=30) as raw_socket:
+			with ssl_context.wrap_socket(raw_socket, server_hostname="irc.chat.twitch.tv") as irc_socket:
+				irc_socket.settimeout(None)
+				irc_reader = irc_socket.makefile("r", encoding="utf-8", newline="\r\n")
+				self._send_irc_line(irc_socket, f"PASS oauth:{token_for_irc}")
+				self._send_irc_line(irc_socket, f"NICK {bot_login}")
+				self._send_irc_line(irc_socket, "CAP REQ :twitch.tv/tags twitch.tv/commands")
+				joined_channels = set()
+				for channel_name in channels:
+					self._join_channel(irc_socket, channel_name)
+					joined_channels.add(channel_name.casefold())
+
+				self._last_status = "ready"
+				self._logger.info("connected to twitch irc for channels: %s", ", ".join(sorted(joined_channels)))
+
+				while True:
+					try:
+						raw_line = irc_reader.readline()
+					except TimeoutError:
+						continue
+					if raw_line == "":
+						raise TwitchConnectionError("Twitch IRC connection closed")
+
+					line = raw_line.rstrip("\r\n")
+					if not line:
+						continue
+					if line.startswith("PING "):
+						self._send_irc_line(irc_socket, line.replace("PING", "PONG", 1))
+						continue
+
+					payload = parse_twitch_irc_message(line)
+					if payload is None:
+						continue
+
+					result = self.ingest_message(payload)
+					self._logger.info(
+						"ingested twitch message channel=%s user=%s status=%s",
+						payload["channel"],
+						payload["username"],
+						result.status,
+					)
+
+					requested_channel = self._requested_join_channel_from_payload(payload)
+					if requested_channel and requested_channel not in joined_channels:
+						self._join_channel(irc_socket, requested_channel)
+						joined_channels.add(requested_channel)
+						self._mark_channel_active(requested_channel)
+						self._logger.info(
+							"joined requested twitch channel=%s from command channel=%s",
+							requested_channel,
+							payload["channel"],
+						)
+
+	def _seed_bootstrap_channels(self, connection: object) -> None:
+		for channel_name in self.bootstrap_channels:
+			upsert_twitch_channel(
+				connection,
+				channel_name=channel_name,
+				requested_by_platform_account_id=None,
+				request_source_message_id=None,
+				join_source="config",
+				status="active",
+			)
+
+	def _process_join_command(
+		self,
+		connection: object,
+		normalized: NormalizedMessage,
+		result: IngestionResult,
+	) -> None:
+		if normalized.channel_id.casefold() != self.join_command_channel:
+			return
+		if normalized.content_normalized != "!join":
+			return
+		if result.platform_account_id is None:
+			return
+
+		upsert_twitch_channel(
+			connection,
+			channel_name=normalized.username,
+			requested_by_platform_account_id=result.platform_account_id,
+			request_source_message_id=result.message_id,
+			join_source="command",
+			status="requested",
+		)
+
+	def health_snapshot(self) -> ConnectorHealth:
+		return ConnectorHealth(
+			name="twitch",
+			status=self._last_status,
+			details={"join_command_channel": self.join_command_channel},
+		)
+
+	def _validate_token_and_get_login(self, bot_token: str) -> str:
+		token = bot_token.removeprefix("oauth:")
+		request = Request(
+			"https://id.twitch.tv/oauth2/validate",
+			headers={"Authorization": f"OAuth {token}"},
+		)
+		try:
+			with urlopen(request, timeout=15) as response:
+				payload = json.loads(response.read().decode("utf-8"))
+		except HTTPError as exc:
+			raise TwitchConnectionError(f"Failed to validate Twitch token: HTTP {exc.code}") from exc
+		except URLError as exc:
+			raise TwitchConnectionError(f"Failed to validate Twitch token: {exc.reason}") from exc
+
+		login = str(payload.get("login") or "").strip()
+		if not login:
+			raise TwitchConnectionError("Twitch token validation response did not include login")
+		return login
+
+	def _send_irc_line(self, irc_socket: ssl.SSLSocket, line: str) -> None:
+		irc_socket.sendall(f"{line}\r\n".encode("utf-8"))
+
+	def _join_channel(self, irc_socket: ssl.SSLSocket, channel_name: str) -> None:
+		normalized_channel_name = channel_name.strip().casefold()
+		if not normalized_channel_name:
+			return
+		self._send_irc_line(irc_socket, f"JOIN #{normalized_channel_name}")
+
+	def _requested_join_channel_from_payload(self, payload: Mapping[str, object]) -> str | None:
+		channel = str(payload.get("channel") or "").strip().casefold()
+		content = str(payload.get("content") or "").strip().casefold()
+		username = str(payload.get("username") or payload.get("display_name") or "").strip().casefold()
+		if channel != self.join_command_channel:
+			return None
+		if content != "!join":
+			return None
+		return username or None
+
+	def _mark_channel_active(self, channel_name: str) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			update_twitch_channel_status(
+				connection,
+				channel_name=channel_name,
+				status="active",
+			)
+		finally:
+			connection.close()
