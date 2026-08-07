@@ -56,13 +56,33 @@ def search_users(
 	connection: sqlite3.Connection,
 	*,
 	query: str = "",
+	sort_by: str = "score",
+	sort_dir: str = "desc",
 	limit: int = 25,
 	offset: int = 0,
 ) -> list[UserListItem]:
 	search_term = query.strip()
 	like_pattern = f"%{search_term}%" if search_term else "%"
+
+	normalized_sort = sort_by.strip().casefold() if sort_by else "score"
+	if normalized_sort not in {"score", "messages", "poweruser", "accounts", "name"}:
+		normalized_sort = "score"
+
+	normalized_direction = sort_dir.strip().casefold() if sort_dir else ""
+	default_direction = "asc" if normalized_sort == "name" else "desc"
+	if normalized_direction not in {"asc", "desc"}:
+		normalized_direction = default_direction
+
+	order_column = {
+		"score": "results.current_reputation_score",
+		"messages": "results.message_count",
+		"poweruser": "results.candidate_flag",
+		"accounts": "results.account_count",
+		"name": "results.primary_display_name COLLATE NOCASE",
+	}[normalized_sort]
+	order_direction = "ASC" if normalized_direction == "asc" else "DESC"
 	rows = connection.execute(
-		"""
+		f"""
 		SELECT
 			results.user_id,
 			results.primary_display_name,
@@ -99,7 +119,7 @@ def search_users(
 				AND platform_accounts.username LIKE ?
 			GROUP BY platform_accounts.id
 		) AS results
-		ORDER BY results.current_reputation_score DESC, results.primary_display_name
+		ORDER BY {order_column} {order_direction}, results.current_reputation_score DESC, results.primary_display_name COLLATE NOCASE ASC
 		LIMIT ? OFFSET ?
 		""",
 		(like_pattern, like_pattern, limit, offset),

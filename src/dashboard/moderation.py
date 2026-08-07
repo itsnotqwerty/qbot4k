@@ -8,6 +8,7 @@ from dataclasses import dataclass
 class ReviewItem:
 	review_id: int
 	message_id: int
+	target_username: str
 	severity: str
 	reason_code: str
 	status: str
@@ -17,6 +18,7 @@ class ReviewItem:
 class ModerationActionItem:
 	action_id: int
 	platform: str
+	target_username: str
 	action_type: str
 	status: str
 	reason: str | None
@@ -25,10 +27,18 @@ class ModerationActionItem:
 def list_open_reviews(connection: sqlite3.Connection, limit: int = 25) -> list[ReviewItem]:
 	rows = connection.execute(
 		"""
-		SELECT id, message_id, severity, queue_reason_code, status
+		SELECT
+			review_queue.id,
+			review_queue.message_id,
+			platform_accounts.username,
+			review_queue.severity,
+			review_queue.queue_reason_code,
+			review_queue.status
 		FROM review_queue
-		WHERE status = 'open'
-		ORDER BY created_at DESC, id DESC
+		INNER JOIN messages ON messages.id = review_queue.message_id
+		INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+		WHERE review_queue.status = 'open'
+		ORDER BY review_queue.created_at DESC, review_queue.id DESC
 		LIMIT ?
 		""",
 		(limit,),
@@ -37,9 +47,10 @@ def list_open_reviews(connection: sqlite3.Connection, limit: int = 25) -> list[R
 		ReviewItem(
 			review_id=int(row[0]),
 			message_id=int(row[1]),
-			severity=str(row[2]),
-			reason_code=str(row[3]),
-			status=str(row[4]),
+			target_username=str(row[2]),
+			severity=str(row[3]),
+			reason_code=str(row[4]),
+			status=str(row[5]),
 		)
 		for row in rows
 	]
@@ -48,9 +59,16 @@ def list_open_reviews(connection: sqlite3.Connection, limit: int = 25) -> list[R
 def list_recent_actions(connection: sqlite3.Connection, limit: int = 25) -> list[ModerationActionItem]:
 	rows = connection.execute(
 		"""
-		SELECT id, platform, action_type, status, reason
+		SELECT
+			moderation_actions.id,
+			moderation_actions.platform,
+			platform_accounts.username,
+			moderation_actions.action_type,
+			moderation_actions.status,
+			moderation_actions.reason
 		FROM moderation_actions
-		ORDER BY created_at DESC, id DESC
+		INNER JOIN platform_accounts ON platform_accounts.id = moderation_actions.target_platform_account_id
+		ORDER BY moderation_actions.created_at DESC, moderation_actions.id DESC
 		LIMIT ?
 		""",
 		(limit,),
@@ -59,9 +77,10 @@ def list_recent_actions(connection: sqlite3.Connection, limit: int = 25) -> list
 		ModerationActionItem(
 			action_id=int(row[0]),
 			platform=str(row[1]),
-			action_type=str(row[2]),
-			status=str(row[3]),
-			reason=str(row[4]) if row[4] is not None else None,
+			target_username=str(row[2]),
+			action_type=str(row[3]),
+			status=str(row[4]),
+			reason=str(row[5]) if row[5] is not None else None,
 		)
 		for row in rows
 	]

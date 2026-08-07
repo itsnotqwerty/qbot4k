@@ -113,6 +113,100 @@ class IngestionTests(unittest.TestCase):
 
         self.assertEqual(score, 501)
 
+    def test_reply_to_non_bot_user_gives_larger_social_score_increase(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-reply-human",
+                "timestamp": "2026-08-06T05:01:10Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "thanks for the tip",
+                "author": {
+                    "id": "user-reply-human",
+                    "username": "sam",
+                    "bot": False,
+                },
+                "referenced_message": {
+                    "author": {
+                        "id": "user-original",
+                        "username": "alex",
+                        "bot": False,
+                    }
+                },
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-reply-human'
+                """
+            ).fetchone()[0]
+            reason = connection.execute(
+                """
+                SELECT reputation_events.reason_code
+                FROM reputation_events
+                INNER JOIN users ON users.id = reputation_events.user_id
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-reply-human'
+                ORDER BY reputation_events.id DESC
+                LIMIT 1
+                """
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 502)
+        self.assertEqual(reason, "reply_to_non_bot")
+
+    def test_reply_to_bot_user_keeps_standard_social_score_increase(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-reply-bot",
+                "timestamp": "2026-08-06T05:01:20Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "thanks for the tip",
+                "author": {
+                    "id": "user-reply-bot",
+                    "username": "sam",
+                    "bot": False,
+                },
+                "referenced_message": {
+                    "author": {
+                        "id": "helper-bot",
+                        "username": "helperbot",
+                        "bot": True,
+                    }
+                },
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-reply-bot'
+                """
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 501)
+
     def test_welcoming_new_user_grants_small_bonus(self) -> None:
         connector = DiscordConnector(self.database_path)
 
@@ -281,6 +375,61 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(request_row[0], "fulfilled")
         self.assertEqual(request_row[1], "/bump")
 
+    def test_server_bump_reward_uses_interaction_user_when_command_not_literal(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-bump-seed-user",
+                "timestamp": "2026-08-06T05:01:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "thanks",
+                "author": {
+                    "id": "user-bump-interaction",
+                    "username": "sam",
+                    "bot": False,
+                },
+            }
+        )
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-bump-success-interaction",
+                "timestamp": "2026-08-06T05:02:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "Bump done!",
+                "author": {
+                    "id": "bump-bot",
+                    "username": "bumpbot",
+                    "bot": True,
+                },
+                "interaction_user_id": "user-bump-interaction",
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-bump-interaction'
+                """
+            ).fetchone()[0]
+            request_row = connection.execute(
+                "SELECT status, command_name FROM server_boost_requests ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 503)
+        self.assertEqual(request_row[0], "fulfilled")
+        self.assertEqual(request_row[1], "/bump")
+
     def test_very_negative_messages_cause_reputation_drop_without_moderation(self) -> None:
         connector = DiscordConnector(self.database_path)
 
@@ -368,6 +517,136 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(match_row[1], "egregious_term")
         self.assertIsNotNone(action_row)
         self.assertEqual(action_row[0], "timeout")
+
+    def test_egregious_discord_messages_execute_pending_actions_immediately(self) -> None:
+        connector = DiscordConnector(self.database_path, bot_token="discord-bot-token")
+
+        class _FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        observed_requests: list[tuple[str, str]] = []
+
+        def _fake_urlopen(request, timeout=15):
+            observed_requests.append((request.method, request.full_url))
+            return _FakeResponse()
+
+        with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
+            connector.ingest_message(
+                {
+                    "id": "discord-msg-egregious-exec",
+                    "timestamp": "2026-08-06T05:03:30Z",
+                    "channel_id": "channel-1",
+                    "guild_id": "guild-1",
+                    "content": "you are a nazi",
+                    "author": {
+                        "id": "user-egregious-exec",
+                        "username": "links776_",
+                        "bot": False,
+                    },
+                }
+            )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            action_row = connection.execute(
+                "SELECT action_type, status FROM moderation_actions ORDER BY id LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertIn(("DELETE", "https://discord.com/api/v10/channels/channel-1/messages/discord-msg-egregious-exec"), observed_requests)
+        self.assertIn(("PATCH", "https://discord.com/api/v10/guilds/guild-1/members/user-egregious-exec"), observed_requests)
+        self.assertEqual(action_row[0], "timeout")
+        self.assertEqual(action_row[1], "completed")
+
+    def test_egregious_discord_moderator_skips_timeout_but_deletes_message(self) -> None:
+        connector = DiscordConnector(self.database_path, bot_token="discord-bot-token")
+
+        class _FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        observed_requests: list[tuple[str, str]] = []
+
+        def _fake_urlopen(request, timeout=15):
+            observed_requests.append((request.method, request.full_url))
+            return _FakeResponse()
+
+        with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
+            result = connector.ingest_message(
+                {
+                    "id": "discord-msg-egregious-mod",
+                    "timestamp": "2026-08-06T05:03:40Z",
+                    "channel_id": "channel-1",
+                    "guild_id": "guild-1",
+                    "content": "hello there",
+                    "author": {
+                        "id": "user-egregious-mod",
+                        "username": "mod_user",
+                        "bot": False,
+                    },
+                    "role_names": ["Moderator"],
+                }
+            )
+
+            connection = connect_database(self.database_path)
+            try:
+                initialize_database(connection)
+                connection.execute(
+                    """
+                    INSERT INTO moderation_actions (
+                        platform,
+                        message_id,
+                        target_platform_account_id,
+                        action_type,
+                        actor_type,
+                        actor_id,
+                        reason,
+                        status
+                    ) VALUES ('discord', ?, (SELECT id FROM platform_accounts WHERE platform = 'discord' AND platform_user_id = 'user-egregious-mod'), 'timeout', 'system', NULL, 'egregious_term', 'pending')
+                    """,
+                    (result.message_id,),
+                )
+                normalized = connector.__class__.__dict__["ingest_message"].__globals__["normalize_discord_message"](
+                    {
+                        "id": "discord-msg-egregious-mod",
+                        "timestamp": "2026-08-06T05:03:40Z",
+                        "channel_id": "channel-1",
+                        "guild_id": "guild-1",
+                        "content": "hello there",
+                        "author": {
+                            "id": "user-egregious-mod",
+                            "username": "mod_user",
+                            "bot": False,
+                        },
+                        "role_names": ["Moderator"],
+                    }
+                )
+                connector._execute_pending_moderation_actions(connection, normalized, result)
+                action_row = connection.execute(
+                    "SELECT action_type, status FROM moderation_actions ORDER BY id LIMIT 1"
+                ).fetchone()
+            finally:
+                connection.close()
+
+        self.assertIn(("DELETE", "https://discord.com/api/v10/channels/channel-1/messages/discord-msg-egregious-mod"), observed_requests)
+        self.assertNotIn(("PATCH", "https://discord.com/api/v10/guilds/guild-1/members/user-egregious-mod"), observed_requests)
+        self.assertEqual(action_row[0], "timeout")
+        self.assertEqual(action_row[1], "completed")
 
     def test_priority_usernames_get_max_default_social_score_on_ingestion(self) -> None:
         discord_connector = DiscordConnector(self.database_path)

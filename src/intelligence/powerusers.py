@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -41,7 +42,7 @@ _EGREGIOUS_TERMS = {
 	"chink", "chinky",
 	"coon", "coondog",
 	"dago", "darkie", "darky", "datnigga",
-	"faggot", "fagot",
+	"faggot", "fagot", "fag",
 	"gook", "greaseball",
 	"hebe", "heeb", "honkey", "honky", "hymie",
 	"ikey",
@@ -299,7 +300,10 @@ def score_delta_for_message(content_raw: str) -> tuple[int, str] | None:
 
 def is_egregious_content(content: str) -> bool:
 	normalized = content.casefold().strip()
-	return any(term in normalized for term in _EGREGIOUS_TERMS)
+	return any(
+		re.search(rf"(?<!\w){re.escape(term)}(?!\w)", normalized) is not None
+		for term in _EGREGIOUS_TERMS
+	)
 
 
 def score_delta_for_moderation(*, severity: str, action_type: str | None = None) -> tuple[int, str]:
@@ -374,6 +378,8 @@ def apply_reputation_event(
 			""",
 			(updated_score, int(candidate_flag), user_id),
 		)
+		if current_score > minimum_score and updated_score <= minimum_score:
+			_enforce_score_floor_ban(connection, user_id=user_id, floor_score=minimum_score)
 		connection.execute(
 			"""
 			INSERT INTO audit_log (
@@ -401,6 +407,87 @@ def apply_reputation_event(
 		current_score=updated_score,
 		candidate_flag=candidate_flag,
 		reason_code=reason_code,
+	)
+
+
+def _enforce_score_floor_ban(
+	connection: sqlite3.Connection,
+	*,
+	user_id: int,
+	floor_score: int,
+) -> None:
+	platform_accounts = connection.execute(
+		"""
+		SELECT id, platform, username
+		FROM platform_accounts
+		WHERE user_id = ?
+		ORDER BY id
+		""",
+		(user_id,),
+	).fetchall()
+	deleted_message_count = connection.execute(
+		"""
+		SELECT COUNT(*)
+		FROM messages
+		INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+		WHERE platform_accounts.user_id = ?
+		""",
+		(user_id,),
+	).fetchone()[0]
+
+	for account in platform_accounts:
+		connection.execute(
+			"""
+			INSERT INTO moderation_actions (
+				platform,
+				message_id,
+				target_platform_account_id,
+				action_type,
+				actor_type,
+				actor_id,
+				reason,
+				status
+			) VALUES (?, NULL, ?, 'ban', 'system', NULL, ?, 'completed')
+			""",
+			(
+				str(account[1]),
+				int(account[0]),
+				f"social_score_floor_reached:{floor_score}",
+			),
+		)
+
+	connection.execute(
+		"""
+		DELETE FROM messages
+		WHERE platform_account_id IN (
+			SELECT id FROM platform_accounts WHERE user_id = ?
+		)
+		""",
+		(user_id,),
+	)
+	connection.execute(
+		"""
+		INSERT INTO audit_log (
+			actor_type,
+			actor_id,
+			action_type,
+			entity_type,
+			entity_id,
+			payload_json
+		) VALUES (
+			'system',
+			NULL,
+			'user_score_floor_enforced',
+			'user',
+			?,
+			json_object(
+				'floor_score', ?,
+				'deleted_message_count', ?,
+				'banned_account_count', ?
+			)
+		)
+		""",
+		(user_id, floor_score, int(deleted_message_count), len(platform_accounts)),
 	)
 
 

@@ -683,6 +683,10 @@ def persist_normalized_message(
             message_delta = score_delta_for_message(message.content_raw)
             if message_delta is not None:
                 delta, reason_code = message_delta
+                # Reward constructive human-to-human replies with a higher baseline bonus.
+                if delta > 0 and message.metadata.get("reply_to_author_is_bot") is False:
+                    delta = 2
+                    reason_code = "reply_to_non_bot"
                 apply_reputation_event(
                     connection,
                     user_id=canonical_user_id,
@@ -1242,6 +1246,45 @@ def record_moderation_action(
             ),
         )
     return int(cursor.lastrowid)
+
+
+def list_pending_moderation_actions_for_message(
+    connection: sqlite3.Connection,
+    message_id: int,
+) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        """
+        SELECT
+            moderation_actions.id,
+            moderation_actions.platform,
+            moderation_actions.target_platform_account_id,
+            moderation_actions.action_type,
+            moderation_actions.reason,
+            platform_accounts.username
+        FROM moderation_actions
+        INNER JOIN platform_accounts ON platform_accounts.id = moderation_actions.target_platform_account_id
+        WHERE moderation_actions.message_id = ?
+          AND moderation_actions.status = 'pending'
+        ORDER BY moderation_actions.id
+        """,
+        (message_id,),
+    ).fetchall()
+    return list(rows)
+
+
+def mark_moderation_action_completed(
+    connection: sqlite3.Connection,
+    action_id: int,
+) -> None:
+    with connection:
+        connection.execute(
+            """
+            UPDATE moderation_actions
+            SET status = 'completed'
+            WHERE id = ?
+            """,
+            (action_id,),
+        )
 
 
 def _utcnow_iso() -> str:

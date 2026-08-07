@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 import socket
 import ssl
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 from typing import Mapping
 
 from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
@@ -22,6 +20,7 @@ from .db import (
 	upsert_twitch_channel,
 )
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp
+from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
 
 class TwitchPayloadError(ValueError):
@@ -139,6 +138,7 @@ class TwitchConnector:
 		join_command_channel: str = "its_not_qwerty",
 		bootstrap_channels: tuple[str, ...] = (),
 		command_registry: CommandRegistry | None = None,
+		token_manager: TwitchTokenManager | None = None,
 	) -> None:
 		self.database_path = Path(database_path)
 		self.join_command_channel = join_command_channel.strip().casefold()
@@ -146,9 +146,26 @@ class TwitchConnector:
 			channel.strip().casefold() for channel in bootstrap_channels if channel.strip()
 		)
 		self._command_registry = command_registry or build_default_command_registry()
+		self._token_manager = token_manager
+		self._active_irc_token: str | None = None
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.twitch")
 		self._streamboo_term_pattern = re.compile(r"(?<!\\w)viewers(?!\\w)", re.IGNORECASE)
+		self._stop_event = threading.Event()
+		self._active_socket: ssl.SSLSocket | None = None
+
+	def stop(self) -> None:
+		self._stop_event.set()
+		irc_socket = self._active_socket
+		if irc_socket is not None:
+			try:
+				irc_socket.shutdown(socket.SHUT_RDWR)
+			except OSError:
+				pass
+			try:
+				irc_socket.close()
+			except OSError:
+				pass
 
 	def ingest_message(
 		self,
@@ -183,80 +200,91 @@ class TwitchConnector:
 			connection.close()
 
 	def run_forever(self, bot_token: str) -> None:
+		self._stop_event.clear()
 		bot_login = self._validate_token_and_get_login(bot_token)
 		channels = self.configured_channels()
 		if not channels:
 			raise TwitchConnectionError("No Twitch channels configured")
 
 		self._last_status = "connecting"
-		token_for_irc = bot_token.removeprefix("oauth:")
+		token_for_irc = self._active_irc_token or bot_token.removeprefix("oauth:")
 		ssl_context = ssl.create_default_context()
 
 		with socket.create_connection(("irc.chat.twitch.tv", 6697), timeout=30) as raw_socket:
 			with ssl_context.wrap_socket(raw_socket, server_hostname="irc.chat.twitch.tv") as irc_socket:
-				irc_socket.settimeout(None)
-				irc_reader = irc_socket.makefile("r", encoding="utf-8", newline="\r\n")
-				self._send_irc_line(irc_socket, f"PASS oauth:{token_for_irc}")
-				self._send_irc_line(irc_socket, f"NICK {bot_login}")
-				self._send_irc_line(irc_socket, "CAP REQ :twitch.tv/tags twitch.tv/commands")
-				joined_channels = set()
-				for channel_name in channels:
-					self._join_channel(irc_socket, channel_name)
-					joined_channels.add(channel_name.casefold())
+				self._active_socket = irc_socket
+				try:
+					irc_socket.settimeout(1.0)
+					irc_reader = irc_socket.makefile("r", encoding="utf-8", newline="\r\n")
+					self._send_irc_line(irc_socket, f"PASS oauth:{token_for_irc}")
+					self._send_irc_line(irc_socket, f"NICK {bot_login}")
+					self._send_irc_line(irc_socket, "CAP REQ :twitch.tv/tags twitch.tv/commands")
+					joined_channels = set()
+					for channel_name in channels:
+						self._join_channel(irc_socket, channel_name)
+						joined_channels.add(channel_name.casefold())
 
-				self._last_status = "ready"
-				self._logger.info("connected to twitch irc for channels: %s", ", ".join(sorted(joined_channels)))
+					self._last_status = "ready"
+					self._logger.info("connected to twitch irc for channels: %s", ", ".join(sorted(joined_channels)))
 
-				while True:
-					try:
-						raw_line = irc_reader.readline()
-					except TimeoutError:
-						continue
-					if raw_line == "":
-						raise TwitchConnectionError("Twitch IRC connection closed")
+					while not self._stop_event.is_set():
+						try:
+							raw_line = irc_reader.readline()
+						except TimeoutError:
+							continue
+						except OSError:
+							if self._stop_event.is_set():
+								return
+							raise
+						if raw_line == "":
+							if self._stop_event.is_set():
+								return
+							raise TwitchConnectionError("Twitch IRC connection closed")
 
-					line = raw_line.rstrip("\r\n")
-					if not line:
-						continue
-					if line.startswith("PING "):
-						self._send_irc_line(irc_socket, line.replace("PING", "PONG", 1))
-						continue
+						line = raw_line.rstrip("\r\n")
+						if not line:
+							continue
+						if line.startswith("PING "):
+							self._send_irc_line(irc_socket, line.replace("PING", "PONG", 1))
+							continue
 
-					payload = parse_twitch_irc_message(line)
-					if payload is None:
-						continue
+						payload = parse_twitch_irc_message(line)
+						if payload is None:
+							continue
 
-					result = self.ingest_message(
-						payload,
-						reply_sink=lambda message: self._send_privmsg(
-							irc_socket,
-							str(payload["channel"]),
-							message,
-						),
-					)
-					self._logger.info(
-						"ingested twitch message channel=%s user=%s status=%s",
-						payload["channel"],
-						payload["username"],
-						result.status,
-					)
-
-					self._maybe_auto_moderate_streamboo_viewer_spam(
-						irc_socket,
-						payload,
-						result,
-					)
-
-					requested_channel = self._requested_join_channel_from_payload(payload)
-					if requested_channel and requested_channel not in joined_channels:
-						self._join_channel(irc_socket, requested_channel)
-						joined_channels.add(requested_channel)
-						self._mark_channel_active(requested_channel)
-						self._logger.info(
-							"joined requested twitch channel=%s from command channel=%s",
-							requested_channel,
-							payload["channel"],
+						result = self.ingest_message(
+							payload,
+							reply_sink=lambda message: self._send_privmsg(
+								irc_socket,
+								str(payload["channel"]),
+								message,
+							),
 						)
+						self._logger.info(
+							"ingested twitch message channel=%s user=%s status=%s",
+							payload["channel"],
+							payload["username"],
+							result.status,
+						)
+
+						self._maybe_auto_moderate_streamboo_viewer_spam(
+							irc_socket,
+							payload,
+							result,
+						)
+
+						requested_channel = self._requested_join_channel_from_payload(payload)
+						if requested_channel and requested_channel not in joined_channels:
+							self._join_channel(irc_socket, requested_channel)
+							joined_channels.add(requested_channel)
+							self._mark_channel_active(requested_channel)
+							self._logger.info(
+								"joined requested twitch channel=%s from command channel=%s",
+								requested_channel,
+								payload["channel"],
+							)
+				finally:
+					self._active_socket = None
 
 	def _seed_bootstrap_channels(self, connection: object) -> None:
 		for channel_name in self.bootstrap_channels:
@@ -299,23 +327,19 @@ class TwitchConnector:
 		)
 
 	def _validate_token_and_get_login(self, bot_token: str) -> str:
-		token = bot_token.removeprefix("oauth:")
-		request = Request(
-			"https://id.twitch.tv/oauth2/validate",
-			headers={"Authorization": f"OAuth {token}"},
-		)
-		try:
-			with urlopen(request, timeout=15) as response:
-				payload = json.loads(response.read().decode("utf-8"))
-		except HTTPError as exc:
-			raise TwitchConnectionError(f"Failed to validate Twitch token: HTTP {exc.code}") from exc
-		except URLError as exc:
-			raise TwitchConnectionError(f"Failed to validate Twitch token: {exc.reason}") from exc
+		if self._token_manager is None:
+			self._token_manager = TwitchTokenManager(
+				initial_access_token=bot_token,
+				logger=self._logger,
+			)
 
-		login = str(payload.get("login") or "").strip()
-		if not login:
-			raise TwitchConnectionError("Twitch token validation response did not include login")
-		return login
+		try:
+			validation = self._token_manager.validate_token()
+		except TwitchAuthError as exc:
+			raise TwitchConnectionError(str(exc)) from exc
+
+		self._active_irc_token = validation.access_token
+		return validation.login
 
 	def _send_irc_line(self, irc_socket: ssl.SSLSocket, line: str) -> None:
 		irc_socket.sendall(f"{line}\r\n".encode("utf-8"))

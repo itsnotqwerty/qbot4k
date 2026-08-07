@@ -112,8 +112,7 @@ def fetch_discord_identity(access_token: str) -> DiscordIdentity:
 def determine_operator_role(identity: DiscordIdentity, operator_guild_ids: tuple[str, ...]) -> str | None:
 	allowed = {guild_id.strip() for guild_id in operator_guild_ids if guild_id.strip()}
 	if not allowed:
-		# Development fallback: if no local allowlist is configured, admit authenticated users.
-		return "admin"
+		return None
 
 	for guild_id in identity.guild_ids:
 		if guild_id not in allowed:

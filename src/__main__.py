@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
 	from src.jobs import run_twitch_live_announcement_job
 	from src.logging_utils import configure_logging
 	from src.twitch import TwitchConnector
+	from src.twitch_auth import TwitchTokenManager
 else:
 	from .config import AppSettings, ConfigError
 	from .db import connect_database, initialize_database, list_tables
@@ -30,6 +31,36 @@ else:
 	from .jobs import run_twitch_live_announcement_job
 	from .logging_utils import configure_logging
 	from .twitch import TwitchConnector
+	from .twitch_auth import TwitchTokenManager
+
+
+def _install_shutdown_handlers(
+	shutdown_event: threading.Event,
+	logger: logging.Logger,
+) -> tuple[dict[int, object], object] | None:
+	if threading.current_thread() is not threading.main_thread():
+		return None
+
+	def _handle_shutdown(signum: int, _frame: object) -> None:
+		if not shutdown_event.is_set():
+			logger.info("received shutdown signal signal=%s", signum)
+		shutdown_event.set()
+
+	original_handlers = {
+		signal.SIGINT: signal.getsignal(signal.SIGINT),
+		signal.SIGTERM: signal.getsignal(signal.SIGTERM),
+	}
+	for sig in original_handlers:
+		signal.signal(sig, _handle_shutdown)
+	return original_handlers, _handle_shutdown
+
+
+def _restore_shutdown_handlers(handler_state: tuple[dict[int, object], object] | None) -> None:
+	if handler_state is None:
+		return
+	original_handlers, _handler = handler_state
+	for sig, original_handler in original_handlers.items():
+		signal.signal(sig, original_handler)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -97,7 +128,8 @@ def run_init_db() -> int:
 
 def run_application(once: bool) -> int:
 	settings = load_settings()
-	logging.getLogger("qbot4k.bootstrap").info(
+	bootstrap_logger = logging.getLogger("qbot4k.bootstrap")
+	bootstrap_logger.info(
 		"starting application",
 	)
 
@@ -120,10 +152,17 @@ def run_application(once: bool) -> int:
 		)
 		service_states["discord"] = discord_connector.health_snapshot().status
 	if "twitch" in settings.enabled_services:
+		twitch_token_manager = TwitchTokenManager(
+			initial_access_token=settings.twitch_bot_token or "",
+			refresh_token=settings.twitch_refresh_token,
+			client_id=settings.twitch_client_id,
+			client_secret=settings.twitch_client_secret,
+		)
 		twitch_connector = TwitchConnector(
 			settings.database_path,
 			join_command_channel=settings.twitch_join_command_channel,
 			bootstrap_channels=settings.twitch_channels,
+			token_manager=twitch_token_manager,
 		)
 		twitch_connector.configured_channels()
 		service_states["twitch"] = twitch_connector.health_snapshot().status
@@ -150,7 +189,10 @@ def run_application(once: bool) -> int:
 	server = None
 	server_thread = None
 	service_threads: list[threading.Thread] = []
+	managed_connectors: list[object] = []
 	health_logger = logging.getLogger("qbot4k.health")
+	shutdown_event = threading.Event()
+	handler_state = _install_shutdown_handlers(shutdown_event, health_logger)
 	if "web" in settings.enabled_services:
 		server = create_health_server(settings, service_states)
 		server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -159,7 +201,7 @@ def run_application(once: bool) -> int:
 
 	def job_loop() -> None:
 		jobs_logger = logging.getLogger("qbot4k.jobs")
-		while True:
+		while not shutdown_event.is_set():
 			try:
 				run_maintenance_jobs(settings)
 				jobs_logger.info("maintenance run complete")
@@ -169,7 +211,7 @@ def run_application(once: bool) -> int:
 						jobs_logger.info("sent twitch live announcements count=%s", announcements)
 			except Exception:
 				jobs_logger.exception("maintenance run failed")
-			time.sleep(300)
+			shutdown_event.wait(300)
 
 	if "jobs" in settings.enabled_services:
 		jobs_thread = threading.Thread(target=job_loop, name="maintenance-jobs", daemon=True)
@@ -182,6 +224,7 @@ def run_application(once: bool) -> int:
 			guild_ids=settings.discord_guild_ids,
 			allow_bot_messages=settings.discord_allow_bot_messages,
 		)
+		managed_connectors.append(discord_connector)
 		discord_thread = threading.Thread(
 			target=discord_connector.run_forever,
 			args=(settings.discord_bot_token or "",),
@@ -191,11 +234,19 @@ def run_application(once: bool) -> int:
 		service_threads.append(discord_thread)
 
 	if "twitch" in settings.enabled_services:
+		twitch_token_manager = TwitchTokenManager(
+			initial_access_token=settings.twitch_bot_token or "",
+			refresh_token=settings.twitch_refresh_token,
+			client_id=settings.twitch_client_id,
+			client_secret=settings.twitch_client_secret,
+		)
 		twitch_connector = TwitchConnector(
 			settings.database_path,
 			join_command_channel=settings.twitch_join_command_channel,
 			bootstrap_channels=settings.twitch_channels,
+			token_manager=twitch_token_manager,
 		)
+		managed_connectors.append(twitch_connector)
 		twitch_thread = threading.Thread(
 			target=twitch_connector.run_forever,
 			args=(settings.twitch_bot_token or "",),
@@ -206,21 +257,34 @@ def run_application(once: bool) -> int:
 
 	try:
 		if service_threads:
-			for thread in service_threads:
-				thread.join()
+			while any(thread.is_alive() for thread in service_threads):
+				for thread in service_threads:
+					thread.join(timeout=0.5)
+				if shutdown_event.is_set():
+					break
 		elif server is not None:
-			server_thread.join()
+			while server_thread.is_alive() and not shutdown_event.is_set():
+				server_thread.join(timeout=0.5)
 		else:
 			print(json.dumps(snapshot, indent=2, sort_keys=True))
 			return 0
 	except KeyboardInterrupt:
 		health_logger.info("application interrupted")
+		shutdown_event.set()
 	finally:
+		shutdown_event.set()
+		for connector in managed_connectors:
+			stop = getattr(connector, "stop", None)
+			if callable(stop):
+				stop()
 		if server is not None:
 			server.shutdown()
 			server.server_close()
 			if server_thread is not None:
 				server_thread.join(timeout=5)
+		for thread in service_threads:
+			thread.join(timeout=5)
+		_restore_shutdown_handlers(handler_state)
 
 	return 0
 

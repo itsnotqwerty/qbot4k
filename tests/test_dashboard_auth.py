@@ -58,7 +58,7 @@ class DashboardAuthTests(unittest.TestCase):
             body,
         )
 
-    def test_determine_operator_role_defaults_to_admin_without_allowlist(self) -> None:
+    def test_determine_operator_role_denies_without_allowlist(self) -> None:
         identity = DiscordIdentity(
             user_id="123",
             username="sam",
@@ -68,7 +68,7 @@ class DashboardAuthTests(unittest.TestCase):
 
         role = determine_operator_role(identity, ())
 
-        self.assertEqual(role, "admin")
+        self.assertIsNone(role)
 
 
 if __name__ == "__main__":

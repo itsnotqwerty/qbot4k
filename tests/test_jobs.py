@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.error import HTTPError
 from urllib.parse import urlparse, parse_qs
 from unittest import mock
 
@@ -150,6 +152,8 @@ class JobTests(unittest.TestCase):
 						]
 					}
 				)
+			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/users/@me/guilds":
+				return _FakeResponse([])
 			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/guilds/guild-1/channels":
 				return _FakeResponse(
 					[
@@ -163,8 +167,9 @@ class JobTests(unittest.TestCase):
 			raise AssertionError(f"Unexpected URL in test: {url}")
 
 		with mock.patch("src.jobs.urlopen", side_effect=_fake_urlopen):
-			first_count = run_twitch_live_announcement_job(settings)
-			second_count = run_twitch_live_announcement_job(settings)
+			with mock.patch("src.twitch_auth.urlopen", side_effect=_fake_urlopen):
+				first_count = run_twitch_live_announcement_job(settings)
+				second_count = run_twitch_live_announcement_job(settings)
 
 		self.assertEqual(first_count, 1)
 		self.assertEqual(second_count, 0)
@@ -186,3 +191,92 @@ class JobTests(unittest.TestCase):
 
 		self.assertEqual([(row[0], row[1]) for row in cache_rows], [("c-1", "general"), ("c-2", "coding")])
 		self.assertEqual([(row[0], row[1], row[2]) for row in announcement_rows], [("stream-1", "guild-1", "c-2")])
+
+	def test_twitch_live_announcement_refreshes_expired_access_token(self) -> None:
+		settings = AppSettings.from_env(
+			{
+				"QBOT_DATABASE_PATH": str(self.database_path),
+				"QBOT_BACKUP_DIR": str(self.backup_dir),
+				"QBOT_ENABLED_SERVICES": "jobs,twitch,discord",
+				"QBOT_MESSAGE_RETENTION_DAYS": "1",
+				"QBOT_AUDIT_RETENTION_DAYS": "1",
+				"QBOT_TWITCH_BOT_TOKEN": "oauth:expired-token",
+				"QBOT_TWITCH_REFRESH_TOKEN": "refresh-token",
+				"QBOT_TWITCH_CLIENT_ID": "configured-client-id",
+				"QBOT_TWITCH_CLIENT_SECRET": "configured-client-secret",
+				"QBOT_DISCORD_BOT_TOKEN": "discord-bot-token",
+				"QBOT_DISCORD_GUILD_IDS": "guild-1",
+			}
+		)
+
+		class _FakeResponse:
+			def __init__(self, payload: object) -> None:
+				self._payload = payload
+
+			def __enter__(self):
+				return self
+
+			def __exit__(self, exc_type, exc, tb) -> None:
+				return None
+
+			def read(self) -> bytes:
+				return json.dumps(self._payload).encode("utf-8")
+
+		refresh_posts = 0
+		helix_auth_headers: list[str] = []
+
+		def _fake_urlopen(request, timeout=15):
+			nonlocal refresh_posts
+			url = request.full_url
+			parsed = urlparse(url)
+			headers = dict(request.header_items())
+
+			if parsed.netloc == "id.twitch.tv" and parsed.path == "/oauth2/validate":
+				authorization = headers.get("Authorization", "")
+				if authorization == "OAuth expired-token":
+					raise HTTPError(url, 401, "Unauthorized", hdrs=None, fp=io.BytesIO(b"{}"))
+				if authorization == "OAuth refreshed-token":
+					return _FakeResponse({"client_id": "resolved-client-id", "login": "its_not_qwerty"})
+				raise AssertionError(f"Unexpected validate authorization header: {authorization}")
+
+			if parsed.netloc == "id.twitch.tv" and parsed.path == "/oauth2/token":
+				refresh_posts += 1
+				request_form = parse_qs((request.data or b"").decode("utf-8"))
+				self.assertEqual(request_form.get("grant_type", [""])[0], "refresh_token")
+				self.assertEqual(request_form.get("refresh_token", [""])[0], "refresh-token")
+				self.assertEqual(request_form.get("client_id", [""])[0], "configured-client-id")
+				self.assertEqual(request_form.get("client_secret", [""])[0], "configured-client-secret")
+				return _FakeResponse({"access_token": "refreshed-token", "refresh_token": "rotated-refresh-token"})
+
+			if parsed.netloc == "api.twitch.tv" and parsed.path == "/helix/streams":
+				helix_auth_headers.append(headers.get("Authorization", ""))
+				return _FakeResponse(
+					{
+						"data": [
+							{
+								"id": "stream-2",
+								"title": "Refreshed Session",
+								"game_name": "Software and Game Development",
+							}
+						]
+					}
+				)
+
+			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/users/@me/guilds":
+				return _FakeResponse([])
+
+			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/guilds/guild-1/channels":
+				return _FakeResponse([{"id": "c-1", "name": "general", "type": 0}])
+
+			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/channels/c-1/messages":
+				return _FakeResponse({"id": "discord-message-2"})
+
+			raise AssertionError(f"Unexpected URL in test: {url}")
+
+		with mock.patch("src.jobs.urlopen", side_effect=_fake_urlopen):
+			with mock.patch("src.twitch_auth.urlopen", side_effect=_fake_urlopen):
+				sent_count = run_twitch_live_announcement_job(settings)
+
+		self.assertEqual(sent_count, 1)
+		self.assertEqual(refresh_posts, 1)
+		self.assertEqual(helix_auth_headers, ["Bearer refreshed-token"])

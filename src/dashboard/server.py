@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import hashlib
 import hmac
 import json
@@ -7,7 +8,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Mapping
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from ..config import AppSettings
 from ..db import (
@@ -159,6 +160,9 @@ class DashboardApp:
 			return None
 		return f"{scheme}://{host}"
 
+	def _log_exception(self, message: str, exc: Exception) -> None:
+		logging.getLogger("qbot4k.dashboard").exception("%s: %s", message, exc)
+
 	def _build_oauth_state_token(self) -> str:
 		if not self.settings.dashboard_session_secret:
 			return build_oauth_state()
@@ -239,7 +243,8 @@ class DashboardApp:
 				self._send_text(handler, HTTPStatus.FORBIDDEN, "You are not authorized to access the dashboard")
 				return
 		except Exception as exc:
-			self._send_text(handler, HTTPStatus.BAD_GATEWAY, f"Discord OAuth failed: {exc}")
+			self._log_exception("discord oauth failed", exc)
+			self._send_text(handler, HTTPStatus.BAD_GATEWAY, "Discord OAuth failed")
 			return
 
 		connection = connect_database(self.settings.database_path)
@@ -308,7 +313,8 @@ class DashboardApp:
 		try:
 			announcements = send_manual_twitch_live_announcements(self.settings)
 		except Exception as exc:
-			self._redirect(handler, f"/dashboard?status={quote(f'Go Live failed: {exc}')}")
+			self._log_exception("manual go-live failed", exc)
+			self._redirect(handler, "/dashboard?status=Go%20Live%20failed")
 			return
 		if announcements <= 0:
 			self._redirect(handler, "/dashboard?status=Go%20Live%20sent%200%20pings")
@@ -320,6 +326,10 @@ class DashboardApp:
 		if session is None:
 			return
 		search = (query.get("q") or [""])[0]
+		sort_by, sort_dir = self._normalize_user_sort(
+			(query.get("sort") or ["score"])[0],
+			(query.get("dir") or [""])[0],
+		)
 		selected_user_id_raw = (query.get("link_user_id") or [""])[0].strip()
 		link_status = (query.get("link_status") or [""])[0].strip()
 		selected_user_id: int | None = None
@@ -331,10 +341,35 @@ class DashboardApp:
 		connection = connect_database(self.settings.database_path)
 		try:
 			initialize_database(connection)
-			users = search_users(connection, query=search)
+			users = search_users(connection, query=search, sort_by=sort_by, sort_dir=sort_dir)
 		finally:
 			connection.close()
 		selected_user = next((item for item in users if item.user_id == selected_user_id), None)
+
+		def _users_query(**overrides: object) -> str:
+			params: dict[str, str] = {
+				"q": search,
+				"sort": sort_by,
+				"dir": sort_dir,
+			}
+			if selected_user_id is not None:
+				params["link_user_id"] = str(selected_user_id)
+			for key, value in overrides.items():
+				if value is None:
+					params.pop(key, None)
+				else:
+					params[key] = str(value)
+			return urlencode(params)
+
+		def _sort_header(label: str, key: str) -> str:
+			is_current = sort_by == key
+			if is_current:
+				next_dir = "desc" if sort_dir == "asc" else "asc"
+				indicator = " (asc)" if sort_dir == "asc" else " (desc)"
+			else:
+				next_dir = "asc" if key == "name" else "desc"
+				indicator = ""
+			return f"<a href='/users?{_users_query(sort=key, dir=next_dir)}'>{self._escape(label + indicator)}</a>"
 
 		sticky_panel = ""
 		if selected_user is not None:
@@ -347,22 +382,34 @@ class DashboardApp:
 				+ "<form class='search' method='post' action='/users/link'>"
 				+ f"<input type='hidden' name='selected_user_id' value='{selected_user.user_id}'>"
 				+ f"<input type='hidden' name='q' value='{self._escape(search)}'>"
+				+ f"<input type='hidden' name='sort' value='{self._escape(sort_by)}'>"
+				+ f"<input type='hidden' name='dir' value='{self._escape(sort_dir)}'>"
 				+ "<input name='usernames' placeholder='username1, username2' required>"
 				+ "<select name='platform'><option value='any'>Any platform</option><option value='discord'>Discord</option><option value='twitch'>Twitch</option></select>"
 				+ "<button type='submit'>Tag Link</button>"
 				+ "</form></div></section>"
 			)
 		rows = "".join(
-			f"<tr><td><a href='/users/{item.user_id}'>{self._escape(item.primary_display_name)}</a></td><td>{item.current_reputation_score}</td><td>{'yes' if item.candidate_flag else 'no'}</td><td>{item.account_count}</td><td>{item.message_count}</td><td><a href='/users?link_user_id={item.user_id}&q={quote(search)}'>Link</a></td></tr>"
+			f"<tr><td><a href='/users/{item.user_id}'>{self._escape(item.primary_display_name)}</a></td><td>{item.current_reputation_score}</td><td>{'yes' if item.candidate_flag else 'no'}</td><td>{item.account_count}</td><td>{item.message_count}</td><td><a href='/users?{_users_query(link_user_id=item.user_id)}'>Link</a></td></tr>"
 			for item in users
+		)
+		headers = (
+			"<tr>"
+			+ f"<th>{_sort_header('Name', 'name')}</th>"
+			+ f"<th>{_sort_header('Score', 'score')}</th>"
+			+ f"<th>{_sort_header('PowerUser', 'poweruser')}</th>"
+			+ f"<th>{_sort_header('Accounts', 'accounts')}</th>"
+			+ f"<th>{_sort_header('Messages', 'messages')}</th>"
+			+ "<th>Link</th>"
+			+ "</tr>"
 		)
 		body = self._render_page(
 			"Users",
 			session,
 			"<section class='hero'><div><p class='eyebrow'>Users</p><h1>Canonical profiles</h1><p class='lede'>Search linked accounts, score bands, and recent activity.</p></div></section>"  # noqa: E501
 			+ sticky_panel
-			+ f"<form class='search' method='get'><input name='q' value='{self._escape(search)}' placeholder='Search users'><button type='submit'>Search</button></form>"
-			+ f"<table><thead><tr><th>Name</th><th>Score</th><th>PowerUser</th><th>Accounts</th><th>Messages</th><th>Link</th></tr></thead><tbody>{rows or '<tr><td colspan=6>No users found</td></tr>'}</tbody></table>"
+			+ f"<form class='search' method='get'><input type='hidden' name='sort' value='{self._escape(sort_by)}'><input type='hidden' name='dir' value='{self._escape(sort_dir)}'><input name='q' value='{self._escape(search)}' placeholder='Search users'><button type='submit'>Search</button></form>"
+			+ f"<table><thead>{headers}</thead><tbody>{rows or '<tr><td colspan=6>No users found</td></tr>'}</tbody></table>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -376,13 +423,30 @@ class DashboardApp:
 
 		selected_user_id_raw = (form.get("selected_user_id") or [""])[0].strip()
 		search = (form.get("q") or [""])[0].strip()
+		sort_by, sort_dir = self._normalize_user_sort(
+			(form.get("sort") or ["score"])[0],
+			(form.get("dir") or [""])[0],
+		)
+
+		def _users_url(*, selected: int | None = None, status: str | None = None) -> str:
+			params: dict[str, str] = {
+				"q": search,
+				"sort": sort_by,
+				"dir": sort_dir,
+			}
+			if selected is not None:
+				params["link_user_id"] = str(selected)
+			if status:
+				params["link_status"] = status
+			return f"/users?{urlencode(params)}"
+
 		platform = (form.get("platform") or ["any"])[0].strip().casefold()
 		if platform not in {"any", "discord", "twitch"}:
 			platform = "any"
 		try:
 			selected_user_id = int(selected_user_id_raw)
 		except ValueError:
-			self._redirect(handler, f"/users?q={quote(search)}&link_status={quote('Invalid selected user')}")
+			self._redirect(handler, _users_url(status="Invalid selected user"))
 			return
 
 		raw_usernames = (form.get("usernames") or [""])[0]
@@ -396,10 +460,7 @@ class DashboardApp:
 			if cleaned:
 				usernames.append(cleaned)
 		if not usernames:
-			self._redirect(
-				handler,
-				f"/users?link_user_id={selected_user_id}&q={quote(search)}&link_status={quote('No usernames provided')}",
-			)
+			self._redirect(handler, _users_url(selected=selected_user_id, status="No usernames provided"))
 			return
 
 		connection = connect_database(self.settings.database_path)
@@ -416,10 +477,7 @@ class DashboardApp:
 					(target_account_id,),
 				).fetchone()
 				if target_account is None:
-					self._redirect(
-						handler,
-						f"/users?q={quote(search)}&link_status={quote('Selected user not found')}",
-					)
+					self._redirect(handler, _users_url(status="Selected user not found"))
 					return
 
 				if target_account[4] is None:
@@ -442,10 +500,7 @@ class DashboardApp:
 				(selected_user_id,),
 			).fetchone()
 			if selected_user is None:
-				self._redirect(
-					handler,
-					f"/users?q={quote(search)}&link_status={quote('Selected user not found')}",
-				)
+				self._redirect(handler, _users_url(status="Selected user not found"))
 				return
 
 			linked_count = 0
@@ -515,10 +570,7 @@ class DashboardApp:
 			status_message += f" Missing: {', '.join(missing_usernames[:3])}"
 			if len(missing_usernames) > 3:
 				status_message += ", ..."
-		self._redirect(
-			handler,
-			f"/users?link_user_id={selected_user_id}&q={quote(search)}&link_status={quote(status_message)}",
-		)
+		self._redirect(handler, _users_url(selected=selected_user_id, status=status_message))
 
 	def _serve_user_messages(
 		self,
@@ -682,18 +734,18 @@ class DashboardApp:
 		finally:
 			connection.close()
 		review_rows = "".join(
-			f"<tr><td>{item.review_id}</td><td>{item.severity}</td><td>{item.reason_code}</td><td>{item.status}</td></tr>"
+			f"<tr><td>{item.review_id}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.severity)}</td><td>{self._escape(item.reason_code)}</td><td>{self._escape(item.status)}</td></tr>"
 			for item in reviews
 		)
 		action_rows = "".join(
-			f"<tr><td>{item.platform}</td><td>{item.action_type}</td><td>{item.status}</td><td>{item.reason or ''}</td></tr>"
+			f"<tr><td>{self._escape(item.platform)}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.action_type)}</td><td>{self._escape(item.status)}</td><td>{self._escape(item.reason or '')}</td></tr>"
 			for item in actions
 		)
 		body = self._render_page(
 			"Moderation",
 			session,
 			"<section class='hero'><div><p class='eyebrow'>Moderation</p><h1>Review and action queue</h1><p class='lede'>Open cases and recent actions are surfaced here for operators.</p></div></section>"  # noqa: E501
-			+ f"<div class='columns'><section><h2>Open reviews</h2><table><thead><tr><th>ID</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=4>No open reviews</td></tr>'}</tbody></table></section><section><h2>Recent actions</h2><table><thead><tr><th>Platform</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=4>No actions yet</td></tr>'}</tbody></table></section></div>"
+			+ f"<div class='columns'><section><h2>Open reviews</h2><table><thead><tr><th>ID</th><th>Target</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=5>No open reviews</td></tr>'}</tbody></table></section><section><h2>Recent actions</h2><table><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=5>No actions yet</td></tr>'}</tbody></table></section></div>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -852,13 +904,27 @@ class DashboardApp:
 		if session is None:
 			return
 		search = (query.get("q") or [""])[0]
+		sort_by, sort_dir = self._normalize_user_sort(
+			(query.get("sort") or ["score"])[0],
+			(query.get("dir") or [""])[0],
+		)
 		connection = connect_database(self.settings.database_path)
 		try:
 			initialize_database(connection)
-			users = search_users(connection, query=search)
+			users = search_users(connection, query=search, sort_by=sort_by, sort_dir=sort_dir)
 		finally:
 			connection.close()
 		self._send_json(handler, HTTPStatus.OK, {"items": [item.__dict__ for item in users]})
+
+	def _normalize_user_sort(self, sort_by_raw: str, sort_dir_raw: str) -> tuple[str, str]:
+		sort_by = (sort_by_raw or "score").strip().casefold()
+		if sort_by not in {"score", "messages", "poweruser", "accounts", "name"}:
+			sort_by = "score"
+		sort_dir = (sort_dir_raw or "").strip().casefold()
+		default_dir = "asc" if sort_by == "name" else "desc"
+		if sort_dir not in {"asc", "desc"}:
+			sort_dir = default_dir
+		return sort_by, sort_dir
 
 	def _serve_api_user_detail(self, handler: BaseHTTPRequestHandler, path: str) -> None:
 		session = self._require_session(handler)

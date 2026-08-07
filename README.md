@@ -76,15 +76,18 @@ QBOT_DISCORD_OAUTH_CLIENT_SECRET=replace-me
 # Optional; if omitted the app infers callback URL from request host
 QBOT_DISCORD_OAUTH_REDIRECT_URI=http://127.0.0.1:8080/oauth/discord/callback
 
-# Optional: restrict dashboard login to Discord guild members
-# If empty, authenticated users are admitted as admin (development fallback)
-QBOT_OPERATOR_GUILD_IDS=
+# Required when web is enabled: restrict dashboard login to approved Discord guilds
+QBOT_OPERATOR_GUILD_IDS=replace-with-guild-id
 
 # Twitch options
 QBOT_TWITCH_CHANNELS=its_not_qwerty
 QBOT_TWITCH_JOIN_COMMAND_CHANNEL=its_not_qwerty
 # Required only when twitch service is enabled
 QBOT_TWITCH_BOT_TOKEN=
+# Optional: token refresh support for long-running Twitch service/jobs
+QBOT_TWITCH_REFRESH_TOKEN=
+QBOT_TWITCH_CLIENT_ID=
+QBOT_TWITCH_CLIENT_SECRET=
 
 # Discord options
 QBOT_DISCORD_GUILD_IDS=
@@ -186,7 +189,7 @@ Auth model:
 
 - Dashboard uses Discord OAuth and a signed session cookie.
 - Role assignment is based on configured operator guild IDs and guild permissions.
-- If QBOT_OPERATOR_GUILD_IDS is empty, the current implementation admits authenticated users as admin for development convenience.
+- QBOT_OPERATOR_GUILD_IDS must be configured when the web service is enabled; users outside those guilds are denied access.
 
 Command templates:
 

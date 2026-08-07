@@ -23,6 +23,7 @@ from .db import (
 	record_twitch_live_announcement,
 	upsert_discord_channel,
 )
+from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
 
 JobConnectionFactory = Callable[[Path], sqlite3.Connection]
@@ -111,7 +112,8 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 		JOBS_LOGGER.warning("skipping twitch live announcements: no connected Discord guilds discovered")
 		return 0
 
-	stream = _fetch_twitch_live_stream("its_not_qwerty", settings.twitch_bot_token)
+	twitch_token_manager = _build_twitch_token_manager(settings)
+	stream = _fetch_twitch_live_stream("its_not_qwerty", twitch_token_manager)
 	if stream is None:
 		JOBS_LOGGER.info("no active twitch stream detected for channel=%s", "its_not_qwerty")
 		return 0
@@ -185,7 +187,8 @@ def send_manual_twitch_live_announcements(settings: AppSettings) -> int:
 		JOBS_LOGGER.warning("manual go-live skipped: no connected Discord guilds discovered")
 		return 0
 
-	stream = _fetch_twitch_live_stream("its_not_qwerty", settings.twitch_bot_token)
+	twitch_token_manager = _build_twitch_token_manager(settings)
+	stream = _fetch_twitch_live_stream("its_not_qwerty", twitch_token_manager)
 	if stream is None:
 		JOBS_LOGGER.info("manual go-live skipped: no active twitch stream for channel=%s", "its_not_qwerty")
 		return 0
@@ -336,34 +339,57 @@ def _sha256sum(path: Path) -> str:
 	return hasher.hexdigest()
 
 
-def _fetch_twitch_live_stream(channel_name: str, twitch_bot_token: str) -> TwitchLiveStream | None:
-	access_token = twitch_bot_token.removeprefix("oauth:").strip()
-	validate_request = Request(
-		"https://id.twitch.tv/oauth2/validate",
-		headers={"Authorization": f"OAuth {access_token}"},
+
+def _build_twitch_token_manager(settings: AppSettings) -> TwitchTokenManager:
+	return TwitchTokenManager(
+		initial_access_token=settings.twitch_bot_token or "",
+		refresh_token=settings.twitch_refresh_token,
+		client_id=settings.twitch_client_id,
+		client_secret=settings.twitch_client_secret,
+		logger=JOBS_LOGGER,
 	)
+
+
+def _fetch_twitch_live_stream(channel_name: str, token_manager: TwitchTokenManager) -> TwitchLiveStream | None:
 	try:
-		with urlopen(validate_request, timeout=15) as response:
-			validate_payload = json.loads(response.read().decode("utf-8"))
-	except (HTTPError, URLError):
+		validation = token_manager.validate_token()
+	except TwitchAuthError:
 		return None
 
-	client_id = str(validate_payload.get("client_id") or "").strip()
-	if not client_id:
-		return None
+	access_token = validation.access_token
+	client_id = validation.client_id
 
 	query = urlencode({"user_login": channel_name.strip().casefold()})
-	streams_request = Request(
-		f"https://api.twitch.tv/helix/streams?{query}",
-		headers={
-			"Authorization": f"Bearer {access_token}",
-			"Client-Id": client_id,
-		},
-	)
+
+	def _build_streams_request(token: str, validated_client_id: str) -> Request:
+		return Request(
+			f"https://api.twitch.tv/helix/streams?{query}",
+			headers={
+				"Authorization": f"Bearer {token}",
+				"Client-Id": validated_client_id,
+			},
+		)
+
+	streams_request = _build_streams_request(access_token, client_id)
 	try:
 		with urlopen(streams_request, timeout=15) as response:
 			streams_payload = json.loads(response.read().decode("utf-8"))
-	except (HTTPError, URLError):
+	except HTTPError as exc:
+		if exc.code == 401 and token_manager.can_refresh():
+			try:
+				token_manager.refresh_access_token()
+				validation = token_manager.validate_token()
+			except TwitchAuthError:
+				return None
+			streams_request = _build_streams_request(validation.access_token, validation.client_id)
+			try:
+				with urlopen(streams_request, timeout=15) as response:
+					streams_payload = json.loads(response.read().decode("utf-8"))
+			except (HTTPError, URLError):
+				return None
+		else:
+			return None
+	except URLError:
 		return None
 
 	items = streams_payload.get("data")

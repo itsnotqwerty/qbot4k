@@ -121,7 +121,97 @@ class IdentityTests(unittest.TestCase):
 		self.assertEqual(len(history_rows), 2)
 		self.assertEqual(history_rows[0][3], 220)
 		self.assertEqual(history_rows[1][3], -500)
-		self.assertEqual(audit_count, 2)
+		self.assertEqual(audit_count, 3)
+
+	def test_reaching_score_floor_bans_linked_accounts_and_deletes_messages(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			user_id = create_canonical_user(connection, primary_display_name="sam", current_reputation_score=400)
+			twitch_account_id = ensure_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-1",
+				username="sam_twitch",
+				guild_or_channel_context="its_not_qwerty",
+			)
+			discord_account_id = ensure_platform_account(
+				connection,
+				platform="discord",
+				platform_user_id="discord-user-1",
+				username="sam_discord",
+				guild_or_channel_context="guild-1",
+			)
+			link_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-1",
+				user_id=user_id,
+			)
+			link_platform_account(
+				connection,
+				platform="discord",
+				platform_user_id="discord-user-1",
+				user_id=user_id,
+			)
+			with connection:
+				connection.execute(
+					"""
+					INSERT INTO messages (
+						platform,
+						platform_message_id,
+						platform_account_id,
+						channel_id,
+						content_raw,
+						content_normalized,
+						sent_at
+					) VALUES ('twitch', 'msg-1', ?, 'channel-1', 'hello', 'hello', '2026-08-01T00:00:00+00:00')
+					""",
+					(twitch_account_id,),
+				)
+				connection.execute(
+					"""
+					INSERT INTO messages (
+						platform,
+						platform_message_id,
+						platform_account_id,
+						channel_id,
+						content_raw,
+						content_normalized,
+						sent_at
+					) VALUES ('discord', 'msg-2', ?, 'channel-2', 'hello', 'hello', '2026-08-01T00:00:00+00:00')
+					""",
+					(discord_account_id,),
+				)
+
+			update = apply_reputation_event(
+				connection,
+				user_id=user_id,
+				delta=-50,
+				reason_code="rule_violation",
+				source_type="moderation_action",
+			)
+
+			message_count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+			actions = connection.execute(
+				"SELECT platform, action_type, status, reason FROM moderation_actions ORDER BY id"
+			).fetchall()
+			audit_row = connection.execute(
+				"SELECT action_type, payload_json FROM audit_log WHERE entity_type = 'user' AND entity_id = ? ORDER BY id DESC LIMIT 1",
+				(user_id,),
+			).fetchone()
+		finally:
+			connection.close()
+
+		self.assertEqual(update.current_score, 350)
+		self.assertFalse(update.candidate_flag)
+		self.assertEqual(message_count, 0)
+		self.assertEqual(len(actions), 2)
+		self.assertEqual({row[0] for row in actions}, {"discord", "twitch"})
+		self.assertTrue(all(row[1] == "ban" for row in actions))
+		self.assertTrue(all(row[2] == "completed" for row in actions))
+		self.assertTrue(all(row[3] == "social_score_floor_reached:350" for row in actions))
+		self.assertEqual(audit_row[0], "user_reputation_update")
 
 	def test_linking_account_from_other_user_averages_social_score(self) -> None:
 		connection = connect_database(self.database_path)

@@ -100,6 +100,24 @@ class DashboardTests(unittest.TestCase):
 		self.assertIn("QBot4K dashboard", body)
 		self.assertIn("sam", body)
 
+	def test_oauth_callback_hides_upstream_error_details(self) -> None:
+		with mock.patch(
+			"src.dashboard.server.exchange_discord_code_for_token",
+			side_effect=ValueError("Discord token exchange failed: HTTP 401 - invalid_client"),
+		):
+			with self.assertRaises(HTTPError) as error:
+				self.opener.open(
+					Request(
+						f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+						headers={"Cookie": "qbot4k_oauth_state=state-1"},
+					)
+				)
+			body = error.exception.read().decode("utf-8")
+			error.exception.close()
+
+		self.assertEqual(error.exception.code, 502)
+		self.assertEqual(body, "Discord OAuth failed")
+
 	def test_oauth_callback_accepts_signed_state_without_cookie(self) -> None:
 		with self.assertRaises(HTTPError) as login_error:
 			self.opener.open(Request(f"{self.base_url}/login"))
@@ -177,6 +195,158 @@ class DashboardTests(unittest.TestCase):
 			body = response.read().decode("utf-8")
 
 		self.assertIn("viewer_one", body)
+
+	def test_users_api_supports_sorting_by_requested_fields(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		connector.ingest_message(
+			{
+				"id": "discord-sort-anna-1",
+				"timestamp": "2026-08-06T05:00:00Z",
+				"channel_id": "channel-sort",
+				"guild_id": "guild-1",
+				"content": "anna one",
+				"author": {
+					"id": "sort-anna",
+					"username": "anna",
+					"bot": False,
+				},
+			}
+		)
+		connector.ingest_message(
+			{
+				"id": "discord-sort-anna-2",
+				"timestamp": "2026-08-06T05:01:00Z",
+				"channel_id": "channel-sort",
+				"guild_id": "guild-1",
+				"content": "anna two",
+				"author": {
+					"id": "sort-anna",
+					"username": "anna",
+					"bot": False,
+				},
+			}
+		)
+		connector.ingest_message(
+			{
+				"id": "discord-sort-anna-3",
+				"timestamp": "2026-08-06T05:02:00Z",
+				"channel_id": "channel-sort",
+				"guild_id": "guild-1",
+				"content": "anna three",
+				"author": {
+					"id": "sort-anna",
+					"username": "anna",
+					"bot": False,
+				},
+			}
+		)
+		connector.ingest_message(
+			{
+				"id": "discord-sort-brad-1",
+				"timestamp": "2026-08-06T05:03:00Z",
+				"channel_id": "channel-sort",
+				"guild_id": "guild-1",
+				"content": "brad one",
+				"author": {
+					"id": "sort-brad",
+					"username": "brad",
+					"bot": False,
+				},
+			}
+		)
+		connector.ingest_message(
+			{
+				"id": "discord-sort-carl-1",
+				"timestamp": "2026-08-06T05:04:00Z",
+				"channel_id": "channel-sort",
+				"guild_id": "guild-1",
+				"content": "carl one",
+				"author": {
+					"id": "sort-carl",
+					"username": "carl",
+					"bot": False,
+				},
+			}
+		)
+		connector.ingest_message(
+			{
+				"id": "discord-sort-carl-2",
+				"timestamp": "2026-08-06T05:05:00Z",
+				"channel_id": "channel-sort",
+				"guild_id": "guild-1",
+				"content": "carl two",
+				"author": {
+					"id": "sort-carl",
+					"username": "carl",
+					"bot": False,
+				},
+			}
+		)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			with connection:
+				connection.execute(
+					"UPDATE users SET current_reputation_score = 100, candidate_flag = 0 WHERE primary_display_name = 'anna'"
+				)
+				connection.execute(
+					"UPDATE users SET current_reputation_score = 900, candidate_flag = 1 WHERE primary_display_name = 'brad'"
+				)
+				connection.execute(
+					"UPDATE users SET current_reputation_score = 500, candidate_flag = 0 WHERE primary_display_name = 'carl'"
+				)
+				brad_id_row = connection.execute(
+					"SELECT id FROM users WHERE primary_display_name = 'brad'"
+				).fetchone()
+				self.assertIsNotNone(brad_id_row)
+				connection.execute(
+					"""
+					INSERT INTO platform_accounts (platform, platform_user_id, username, user_id)
+					VALUES ('twitch', 'sort-brad-alt', 'brad_alt', ?)
+					""",
+					(int(brad_id_row[0]),),
+				)
+		finally:
+			connection.close()
+
+		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+			with mock.patch(
+				"src.dashboard.server.fetch_discord_identity",
+				return_value=DiscordIdentity(
+					user_id="123",
+					username="sam",
+					guild_ids=("guild-1",),
+					permissions={"guild-1": "8"},
+				),
+			):
+				request = Request(
+					f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+					headers={"Cookie": "qbot4k_oauth_state=state-1"},
+				)
+				with self.assertRaises(HTTPError) as callback_error:
+					self.opener.open(request)
+				callback_error.exception.close()
+
+		cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+		cookie_value = session_cookie.split(";", 1)[0]
+
+		def fetch_sorted_names(sort: str, direction: str = "desc") -> list[str]:
+			with self.opener.open(
+				Request(
+					f"{self.base_url}/api/users?sort={sort}&dir={direction}",
+					headers={"Cookie": cookie_value},
+				)
+			) as response:
+				payload = json.loads(response.read().decode("utf-8"))
+			return [item["primary_display_name"] for item in payload["items"]]
+
+		self.assertEqual(fetch_sorted_names("name", "asc")[:3], ["anna", "brad", "carl"])
+		self.assertEqual(fetch_sorted_names("score", "desc")[0], "brad")
+		self.assertEqual(fetch_sorted_names("messages", "desc")[0], "anna")
+		self.assertEqual(fetch_sorted_names("accounts", "desc")[0], "brad")
+		self.assertEqual(fetch_sorted_names("poweruser", "desc")[0], "brad")
 
 	def test_user_detail_page_shows_recent_messages(self) -> None:
 		connector = DiscordConnector(self.database_path)
@@ -352,6 +522,20 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
+		connector.ingest_message(
+			{
+				"id": "discord-msg-review-1",
+				"timestamp": "2026-08-06T05:12:00Z",
+				"channel_id": "channel-review-1",
+				"guild_id": "guild-1",
+				"content": "review me",
+				"author": {
+					"id": "user-review-1",
+					"username": "viewer_review",
+					"bot": False,
+				},
+			}
+		)
 
 		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
 			with mock.patch(
@@ -417,6 +601,40 @@ class DashboardTests(unittest.TestCase):
 		self.assertEqual(action_row[3], "operator")
 		self.assertEqual(action_row[4], "repeat spam")
 		self.assertEqual(action_row[5], "completed")
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			review_message_row = connection.execute(
+				"SELECT id FROM messages WHERE platform_message_id = ?",
+				("discord-msg-review-1",),
+			).fetchone()
+			self.assertIsNotNone(review_message_row)
+			with connection:
+				connection.execute(
+					"""
+					INSERT INTO review_queue (
+						message_id,
+						status,
+						severity,
+						queue_reason_code,
+						assigned_operator_id,
+						created_at,
+						resolved_at
+					) VALUES (?, 'open', ?, ?, NULL, CURRENT_TIMESTAMP, NULL)
+					""",
+					(int(review_message_row[0]), "high", "rule_spam"),
+				)
+		finally:
+			connection.close()
+
+		with self.opener.open(Request(f"{self.base_url}/moderation", headers={"Cookie": cookie_value})) as response:
+			moderation_body = response.read().decode("utf-8")
+
+		self.assertIn("Recent actions", moderation_body)
+		self.assertIn("viewer_mod", moderation_body)
+		self.assertIn("Open reviews", moderation_body)
+		self.assertIn("viewer_review", moderation_body)
 
 	def test_users_page_link_button_relinks_tagged_username(self) -> None:
 		connector = DiscordConnector(self.database_path)

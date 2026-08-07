@@ -70,6 +70,9 @@ class AppSettings:
     message_retention_days: int
     audit_retention_days: int
     twitch_bot_token: str | None
+    twitch_refresh_token: str | None
+    twitch_client_id: str | None
+    twitch_client_secret: str | None
     discord_bot_token: str | None
     discord_oauth_client_id: str | None
     discord_oauth_client_secret: str | None
@@ -144,6 +147,9 @@ class AppSettings:
                 365,
             ),
             twitch_bot_token=env_map.get("QBOT_TWITCH_BOT_TOKEN"),
+            twitch_refresh_token=env_map.get("QBOT_TWITCH_REFRESH_TOKEN"),
+            twitch_client_id=env_map.get("QBOT_TWITCH_CLIENT_ID"),
+            twitch_client_secret=env_map.get("QBOT_TWITCH_CLIENT_SECRET"),
             discord_bot_token=env_map.get("QBOT_DISCORD_BOT_TOKEN"),
             discord_oauth_client_id=env_map.get("QBOT_DISCORD_OAUTH_CLIENT_ID"),
             discord_oauth_client_secret=env_map.get(
@@ -179,6 +185,10 @@ class AppSettings:
                 raise ConfigError(
                     f"Missing web configuration: {', '.join(missing_web_values)}"
                 )
+            if not self.operator_guild_ids:
+                raise ConfigError(
+                    "QBOT_OPERATOR_GUILD_IDS is required when web service is enabled"
+                )
 
         if "twitch" in self.enabled_services:
             if not self.twitch_bot_token:
@@ -189,11 +199,32 @@ class AppSettings:
                 raise ConfigError(
                     "QBOT_TWITCH_JOIN_COMMAND_CHANNEL must not be empty when twitch service is enabled"
                 )
+            if self.twitch_refresh_token:
+                required_refresh_values = {
+                    "QBOT_TWITCH_CLIENT_ID": self.twitch_client_id,
+                    "QBOT_TWITCH_CLIENT_SECRET": self.twitch_client_secret,
+                }
+                missing_refresh_values = [
+                    key for key, value in required_refresh_values.items() if not value
+                ]
+                if missing_refresh_values:
+                    raise ConfigError(
+                        "Missing Twitch refresh configuration: "
+                        f"{', '.join(missing_refresh_values)}"
+                    )
 
         if "discord" in self.enabled_services:
             if not self.discord_bot_token:
                 raise ConfigError(
                     "QBOT_DISCORD_BOT_TOKEN is required when discord service is enabled"
+                )
+            if (
+                "jobs" in self.enabled_services
+                and "twitch" in self.enabled_services
+                and not self.discord_guild_ids
+            ):
+                raise ConfigError(
+                    "QBOT_DISCORD_GUILD_IDS is required when jobs, twitch, and discord services are enabled"
                 )
 
     def safe_summary(self) -> dict[str, object]:
@@ -217,5 +248,10 @@ class AppSettings:
                 and self.discord_oauth_client_secret
             ),
             "twitch_configured": bool(self.twitch_bot_token),
+            "twitch_refresh_configured": bool(
+                self.twitch_refresh_token
+                and self.twitch_client_id
+                and self.twitch_client_secret
+            ),
             "discord_configured": bool(self.discord_bot_token),
         }
