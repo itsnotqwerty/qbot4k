@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import json
+import random
+import re
 import sqlite3
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
 from typing import Callable
+from urllib.parse import quote_plus
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from .db import (
 	delete_simple_command_definition,
@@ -17,6 +23,13 @@ from .intelligence.userprofiles import get_canonical_user_profile_for_platform_a
 
 
 RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom"}
+_HTTP_TEMPLATE_CALL_PATTERN = re.compile(
+	r"\{(GET|POST|PUT|DELETE)\}\((https?://[^\s)]+)\)(?:\[([^\]]+)\])?",
+	re.IGNORECASE,
+)
+_RANDOM_RANGE_PATTERN = re.compile(r"\{(-?\d+|\{query\})\.\.(-?\d+|\{query\})\}")
+_SANITIZED_RANGE_MIN = -1_000_000
+_SANITIZED_RANGE_MAX = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -328,6 +341,7 @@ def _simple_command(context: CommandContext, definition: sqlite3.Row) -> Command
 		linked_accounts=_context_values(context)["linked_accounts"],
 		latest_note=_context_values(context)["latest_note"],
 		command_name=context.command_name,
+		query=" ".join(context.command_args).strip(),
 	)
 	card = CommandCard(
 		title=f"!{context.command_name}",
@@ -428,11 +442,117 @@ def _context_values(context: CommandContext) -> dict[str, object]:
 		"power_user": power_user,
 		"linked_accounts": linked_accounts,
 		"latest_note": latest_note,
+		"query": " ".join(context.command_args).strip(),
 	}
 
 
 def _format_command_template(template: str, **values: object) -> str:
+	resolved_template = _resolve_random_range_templates(template, values)
+	resolved_template = _resolve_http_template_calls(resolved_template, values)
 	try:
-		return template.format(**values)
+		return resolved_template.format(**values)
 	except Exception:
-		return template
+		return resolved_template
+
+
+def _resolve_random_range_templates(template: str, values: dict[str, object]) -> str:
+	def _replace(match: re.Match[str]) -> str:
+		lower_bound = _resolve_range_bound(match.group(1), values)
+		upper_bound = _resolve_range_bound(match.group(2), values)
+		if lower_bound > upper_bound:
+			lower_bound, upper_bound = upper_bound, lower_bound
+		return str(random.randint(lower_bound, upper_bound))
+
+	return _RANDOM_RANGE_PATTERN.sub(_replace, template)
+
+
+def _resolve_range_bound(raw_bound: str, values: dict[str, object]) -> int:
+	binding = raw_bound.strip()
+	if binding == "{query}":
+		query_value = str(values.get("query") or "")
+		number_match = re.search(r"-?\d+", query_value)
+		if number_match is None:
+			return 0
+		parsed = int(number_match.group(0))
+		return max(_SANITIZED_RANGE_MIN, min(_SANITIZED_RANGE_MAX, parsed))
+
+	parsed = int(binding)
+	return max(_SANITIZED_RANGE_MIN, min(_SANITIZED_RANGE_MAX, parsed))
+
+
+def _resolve_http_template_calls(template: str, values: dict[str, object]) -> str:
+	def _replace(match: re.Match[str]) -> str:
+		method = match.group(1).upper()
+		url = _substitute_http_url_template(match.group(2), values)
+		json_path = (match.group(3) or "").strip()
+		try:
+			request = Request(
+				url,
+				headers={
+					"Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+					"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+				},
+				method=method,
+			)
+			with urlopen(request, timeout=5) as response:
+				body = response.read()
+		except (URLError, ValueError):
+			return ""
+
+		decoded_body = body.decode("utf-8", errors="replace").strip()
+		if not json_path:
+			return _escape_format_braces(decoded_body)
+
+		try:
+			json_payload = json.loads(decoded_body)
+		except json.JSONDecodeError:
+			return ""
+
+		extracted_value = _extract_json_path_value(json_payload, json_path)
+		if extracted_value is None:
+			return ""
+		return _escape_format_braces(_render_extracted_json_value(extracted_value))
+
+	return _HTTP_TEMPLATE_CALL_PATTERN.sub(_replace, template)
+
+
+def _substitute_http_url_template(url_template: str, values: dict[str, object]) -> str:
+	query_value = str(values.get("query") or "").strip()
+	return url_template.replace("{query}", quote_plus(query_value))
+
+
+def _extract_json_path_value(payload: object, path: str) -> object | None:
+	segments = [segment.strip() for segment in path.split(".") if segment.strip()]
+	if not segments:
+		return None
+
+	current: object = payload
+	for segment in segments:
+		if isinstance(current, dict):
+			if segment not in current:
+				return None
+			current = current[segment]
+			continue
+		if isinstance(current, list) and segment.isdigit():
+			index = int(segment)
+			if index < 0 or index >= len(current):
+				return None
+			current = current[index]
+			continue
+		return None
+
+	return current
+
+
+def _render_extracted_json_value(value: object) -> str:
+	if value is None:
+		return ""
+	if isinstance(value, str):
+		return value
+	if isinstance(value, (dict, list, bool, int, float)):
+		return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+	return str(value)
+
+
+def _escape_format_braces(value: str) -> str:
+	return value.replace("{", "{{").replace("}", "}}")

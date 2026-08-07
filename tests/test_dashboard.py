@@ -285,6 +285,88 @@ class DashboardTests(unittest.TestCase):
 
 		self.assertIn("#lounge", body)
 
+	def test_user_detail_page_supports_operator_moderation_actions(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		connector.ingest_message(
+			{
+				"id": "discord-msg-mod-1",
+				"timestamp": "2026-08-06T05:11:00Z",
+				"channel_id": "channel-mod-1",
+				"guild_id": "guild-1",
+				"content": "moderation check",
+				"author": {
+					"id": "user-mod-1",
+					"username": "viewer_mod",
+					"bot": False,
+				},
+			}
+		)
+
+		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+			with mock.patch(
+				"src.dashboard.server.fetch_discord_identity",
+				return_value=DiscordIdentity(
+					user_id="123",
+					username="sam",
+					guild_ids=("guild-1",),
+					permissions={"guild-1": "8"},
+				),
+			):
+				request = Request(
+					f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+					headers={"Cookie": "qbot4k_oauth_state=state-1"},
+				)
+				with self.assertRaises(HTTPError) as callback_error:
+					self.opener.open(request)
+				callback_error.exception.close()
+
+		cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+		cookie_value = session_cookie.split(";", 1)[0]
+
+		with self.opener.open(Request(f"{self.base_url}/users/1", headers={"Cookie": cookie_value})) as response:
+			body = response.read().decode("utf-8")
+
+		self.assertIn("Moderation status", body)
+		self.assertIn("Apply Action", body)
+
+		request = Request(
+			f"{self.base_url}/users/1/moderation",
+			data=b"target_platform_account_id=1&action_type=timeout&reason=repeat+spam",
+			headers={
+				"Cookie": cookie_value,
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as mod_error:
+			self.opener.open(request)
+		mod_error.exception.close()
+
+		self.assertEqual(mod_error.exception.code, 302)
+		self.assertIn("mod_status=", mod_error.exception.headers["Location"])
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			action_row = connection.execute(
+				"""
+				SELECT platform, target_platform_account_id, action_type, actor_type, reason, status
+				FROM moderation_actions
+				ORDER BY id DESC
+				LIMIT 1
+				"""
+			).fetchone()
+		finally:
+			connection.close()
+
+		self.assertEqual(action_row[0], "discord")
+		self.assertEqual(action_row[1], 1)
+		self.assertEqual(action_row[2], "timeout")
+		self.assertEqual(action_row[3], "operator")
+		self.assertEqual(action_row[4], "repeat spam")
+		self.assertEqual(action_row[5], "completed")
+
 	def test_users_page_link_button_relinks_tagged_username(self) -> None:
 		connector = DiscordConnector(self.database_path)
 		connector.ingest_message(

@@ -14,6 +14,7 @@ from ..db import (
     connect_database,
 	delete_simple_command_definition,
     initialize_database,
+	record_moderation_action,
     upsert_operator_account,
 	list_command_definitions,
 	list_simple_command_definitions,
@@ -41,7 +42,13 @@ from .auth import (
 )
 from .moderation import list_open_reviews, list_recent_actions
 from .overview import load_overview_snapshot
-from .users import list_recent_user_messages, search_users
+from .users import (
+	get_user_moderation_status,
+	list_recent_user_messages,
+	list_recent_user_moderation_actions,
+	list_user_platform_accounts,
+	search_users,
+)
 
 
 @dataclass(frozen=True)
@@ -73,8 +80,11 @@ class DashboardApp:
 		if handler.command == "POST" and path == "/users/link":
 			self._serve_users_link(handler)
 			return True
+		if handler.command == "POST" and path.startswith("/users/") and path.endswith("/moderation"):
+			self._serve_user_moderation_action(handler, path)
+			return True
 		if handler.command == "GET" and path.startswith("/users/"):
-			self._serve_user_messages(handler, path)
+			self._serve_user_messages(handler, path, parse_qs(parsed.query))
 			return True
 		if handler.command == "GET" and path == "/moderation":
 			self._serve_moderation(handler)
@@ -510,10 +520,16 @@ class DashboardApp:
 			f"/users?link_user_id={selected_user_id}&q={quote(search)}&link_status={quote(status_message)}",
 		)
 
-	def _serve_user_messages(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+	def _serve_user_messages(
+		self,
+		handler: BaseHTTPRequestHandler,
+		path: str,
+		query: Mapping[str, list[str]],
+	) -> None:
 		session = self._require_session(handler)
 		if session is None:
 			return
+		moderation_status_message = (query.get("mod_status") or [""])[0].strip()
 		parts = [part for part in path.split("/") if part]
 		if len(parts) != 2:
 			self._send_text(handler, HTTPStatus.NOT_FOUND, "Not found")
@@ -530,6 +546,9 @@ class DashboardApp:
 			users = search_users(connection, limit=500)
 			selected_user = next((item for item in users if item.user_id == user_id), None)
 			recent_messages = list_recent_user_messages(connection, user_id)
+			platform_accounts = list_user_platform_accounts(connection, user_id)
+			moderation_status = get_user_moderation_status(connection, user_id)
+			recent_moderation_actions = list_recent_user_moderation_actions(connection, user_id)
 		finally:
 			connection.close()
 
@@ -541,6 +560,31 @@ class DashboardApp:
 			f"<tr><td>{self._escape(item.sent_at)}</td><td>{self._escape(item.platform)}</td><td>{self._escape(item.channel_id)}</td><td>{self._escape(item.content_raw)}</td></tr>"
 			for item in recent_messages
 		)
+		action_rows = "".join(
+			f"<tr><td>{self._escape(item.created_at)}</td><td>{self._escape(item.platform)}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.action_type)}</td><td>{self._escape(item.status)}</td><td>{self._escape(item.reason or '')}</td></tr>"
+			for item in recent_moderation_actions
+		)
+		account_options = "".join(
+			f"<option value='{item.platform_account_id}'>{self._escape(item.platform)} · {self._escape(item.username)} ({self._escape(item.platform_user_id)})</option>"
+			for item in platform_accounts
+		)
+		moderation_form = ""
+		if platform_accounts:
+			moderation_form = (
+				f"<form class='search' method='post' action='/users/{user_id}/moderation'>"
+				+ "<select name='target_platform_account_id' required>"
+				+ account_options
+				+ "</select>"
+				+ "<select name='action_type'><option value='warn'>warn</option><option value='timeout'>timeout</option><option value='ban'>ban</option><option value='review'>review</option></select>"
+				+ "<input name='reason' placeholder='Reason (required)' required>"
+				+ "<button type='submit'>Apply Action</button>"
+				+ "</form>"
+			)
+		else:
+			moderation_form = "<p class='muted'>No linked platform accounts available for moderation.</p>"
+		moderation_notice = (
+			f"<p class='status-banner'>{self._escape(moderation_status_message)}</p>" if moderation_status_message else ""
+		)
 		body = self._render_page(
 			"User Messages",
 			session,
@@ -549,9 +593,82 @@ class DashboardApp:
 			+ "<p class='lede'>Recent messages from this profile.</p>"
 			+ "</div></section>"
 			+ "<p><a href='/users'>&larr; Back to users</a></p>"
+			+ "<section class='card'>"
+			+ "<h2>Moderation status</h2>"
+			+ moderation_notice
+			+ f"<div class='grid'><div class='metric'><div class='label'>Open reviews</div><div class='value'>{moderation_status.open_reviews}</div></div><div class='metric'><div class='label'>Pending actions</div><div class='value'>{moderation_status.pending_actions}</div></div><div class='metric'><div class='label'>Completed actions</div><div class='value'>{moderation_status.completed_actions}</div></div><div class='metric'><div class='label'>Total actions</div><div class='value'>{moderation_status.recent_actions}</div></div></div>"
+			+ "<p class='lede'>Operators can record moderation actions directly from this user page.</p>"
+			+ moderation_form
+			+ "</section>"
+			+ f"<table><thead><tr><th>Action At</th><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=6>No moderation actions found</td></tr>'}</tbody></table>"
 			+ f"<table><thead><tr><th>Sent</th><th>Platform</th><th>Channel</th><th>Message</th></tr></thead><tbody>{message_rows or '<tr><td colspan=4>No messages found</td></tr>'}</tbody></table>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_user_moderation_action(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+
+		parts = [part for part in path.split("/") if part]
+		if len(parts) != 3 or parts[2] != "moderation":
+			self._send_text(handler, HTTPStatus.NOT_FOUND, "Not found")
+			return
+		try:
+			user_id = int(parts[1])
+		except ValueError:
+			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Invalid user id")
+			return
+
+		target_platform_account_id_raw = (form.get("target_platform_account_id") or [""])[0].strip()
+		action_type = (form.get("action_type") or [""])[0].strip().casefold()
+		reason = (form.get("reason") or [""])[0].strip()
+		if action_type not in {"warn", "timeout", "ban", "review"}:
+			self._redirect(handler, f"/users/{user_id}?mod_status={quote('Invalid action type')}")
+			return
+		if not reason:
+			self._redirect(handler, f"/users/{user_id}?mod_status={quote('Reason is required')}")
+			return
+
+		try:
+			target_platform_account_id = int(target_platform_account_id_raw)
+		except ValueError:
+			self._redirect(handler, f"/users/{user_id}?mod_status={quote('Invalid platform account')}")
+			return
+
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			allowed_accounts = {account.platform_account_id for account in list_user_platform_accounts(connection, user_id)}
+			if target_platform_account_id not in allowed_accounts:
+				self._redirect(handler, f"/users/{user_id}?mod_status={quote('Platform account does not belong to this user')}")
+				return
+			platform_row = connection.execute(
+				"SELECT platform FROM platform_accounts WHERE id = ?",
+				(target_platform_account_id,),
+			).fetchone()
+			if platform_row is None:
+				self._redirect(handler, f"/users/{user_id}?mod_status={quote('Platform account not found')}")
+				return
+
+			record_moderation_action(
+				connection,
+				platform=str(platform_row[0]),
+				message_id=None,
+				target_platform_account_id=target_platform_account_id,
+				action_type=action_type,
+				reason=reason,
+				status="completed",
+				actor_type="operator",
+				actor_id=int(session.user_id),
+			)
+		finally:
+			connection.close()
+
+		self._redirect(handler, f"/users/{user_id}?mod_status={quote(f'Moderation action {action_type} recorded')}")
 
 	def _serve_moderation(self, handler: BaseHTTPRequestHandler) -> None:
 		session = self._require_session(handler)
@@ -695,9 +812,16 @@ class DashboardApp:
 			("linked_accounts", "A newline-separated list of linked platform accounts."),
 			("latest_note", "The most recent operator note, if one exists."),
 			("command_name", "The normalized command name that triggered the response."),
+			("query", "Everything after the command name, useful for API query parameters."),
+			("0..49", "Generates a random integer using an inclusive range, e.g. {0..49}."),
+			("0..{query}", "Uses a sanitized integer parsed from {query} as a range bound, e.g. {0..{query}}."),
+			("{GET}(url)[path.to.value]", "Performs an HTTP GET request and injects the JSON value at the path."),
+			("{POST}(url)[path.to.value]", "Performs an HTTP POST request and injects the JSON value at the path."),
+			("{PUT}(url)[path.to.value]", "Performs an HTTP PUT request and injects the JSON value at the path."),
+			("{DELETE}(url)[path.to.value]", "Performs an HTTP DELETE request and injects the JSON value at the path."),
 		]
 		rows = "".join(
-			f"<tr><td><code>{{{self._escape(name)}}}</code></td><td>{self._escape(description)}</td></tr>"
+			f"<tr><td><code>{self._escape(name if name.startswith('{') else '{' + name + '}')}</code></td><td>{self._escape(description)}</td></tr>"
 			for name, description in items
 		)
 		return (

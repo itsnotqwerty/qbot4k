@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import socket
 import ssl
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from .db import (
 	initialize_database,
 	list_twitch_channels,
 	persist_normalized_message,
+	record_moderation_action,
 	update_twitch_channel_status,
 	upsert_twitch_channel,
 )
@@ -146,6 +148,7 @@ class TwitchConnector:
 		self._command_registry = command_registry or build_default_command_registry()
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.twitch")
+		self._streamboo_term_pattern = re.compile(r"(?<!\\w)viewers(?!\\w)", re.IGNORECASE)
 
 	def ingest_message(
 		self,
@@ -236,6 +239,12 @@ class TwitchConnector:
 						payload["channel"],
 						payload["username"],
 						result.status,
+					)
+
+					self._maybe_auto_moderate_streamboo_viewer_spam(
+						irc_socket,
+						payload,
+						result,
 					)
 
 					requested_channel = self._requested_join_channel_from_payload(payload)
@@ -360,6 +369,76 @@ class TwitchConnector:
 				connection,
 				channel_name=channel_name,
 				status="active",
+			)
+		finally:
+			connection.close()
+
+	def _maybe_auto_moderate_streamboo_viewer_spam(
+		self,
+		irc_socket: ssl.SSLSocket,
+		payload: Mapping[str, object],
+		result: IngestionResult,
+	) -> None:
+		if result.status != "persisted":
+			return
+		if result.message_id is None or result.platform_account_id is None:
+			return
+		if bool(payload.get("is_moderator")):
+			return
+
+		content = str(payload.get("content") or "")
+		if not self._contains_streamboo_viewer_spam(content):
+			return
+
+		target_username = str(payload.get("username") or payload.get("display_name") or "").strip()
+		channel_name = str(payload.get("channel") or "").strip()
+		if not target_username or not channel_name:
+			return
+
+		reason = "streamboo_viewer_spam"
+		self._send_privmsg(
+			irc_socket,
+			channel_name,
+			f"/timeout {target_username} 600 Streamboo viewer-buying spam",
+		)
+		self._record_moderation_action(
+			message_id=result.message_id,
+			target_platform_account_id=result.platform_account_id,
+			action_type="timeout",
+			reason=reason,
+		)
+		self._logger.warning(
+			"auto-moderated twitch message channel=%s user=%s reason=%s",
+			channel_name,
+			target_username,
+			reason,
+		)
+
+	def _contains_streamboo_viewer_spam(self, content: str) -> bool:
+		normalized = content.casefold()
+		if "streamboo" not in normalized:
+			return False
+		return self._streamboo_term_pattern.search(normalized) is not None
+
+	def _record_moderation_action(
+		self,
+		*,
+		message_id: int,
+		target_platform_account_id: int,
+		action_type: str,
+		reason: str,
+	) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			record_moderation_action(
+				connection,
+				platform="twitch",
+				message_id=message_id,
+				target_platform_account_id=target_platform_account_id,
+				action_type=action_type,
+				reason=reason,
+				status="completed",
 			)
 		finally:
 			connection.close()

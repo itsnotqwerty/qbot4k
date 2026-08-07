@@ -1012,6 +1012,46 @@ def record_moderation_findings(
             )
 
 
+def record_moderation_action(
+    connection: sqlite3.Connection,
+    *,
+    platform: str,
+    message_id: int | None,
+    target_platform_account_id: int,
+    action_type: str,
+    reason: str,
+    status: str = "pending",
+    actor_type: str = "system",
+    actor_id: int | None = None,
+) -> int:
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO moderation_actions (
+                platform,
+                message_id,
+                target_platform_account_id,
+                action_type,
+                actor_type,
+                actor_id,
+                reason,
+                status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                platform,
+                message_id,
+                target_platform_account_id,
+                action_type,
+                actor_type,
+                actor_id,
+                reason,
+                status,
+            ),
+        )
+    return int(cursor.lastrowid)
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 

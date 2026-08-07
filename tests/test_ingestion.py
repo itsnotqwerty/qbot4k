@@ -665,6 +665,57 @@ class IngestionTests(unittest.TestCase):
 
         self.assertEqual(channels[0]["status"], "active")
 
+    def test_streamboo_viewers_detection_requires_both_terms(self) -> None:
+        connector = TwitchConnector(self.database_path)
+
+        self.assertTrue(connector._contains_streamboo_viewer_spam("Get viewers from streamboo now"))
+        self.assertFalse(connector._contains_streamboo_viewer_spam("Get viewers now"))
+        self.assertFalse(connector._contains_streamboo_viewer_spam("streamboo is bad"))
+
+    def test_record_moderation_action_persists_completed_twitch_action(self) -> None:
+        connector = TwitchConnector(self.database_path)
+
+        result = connector.ingest_message(
+            {
+                "message_id": "twitch-msg-streamboo-1",
+                "timestamp": "2026-08-06T05:30:00Z",
+                "channel": "its_not_qwerty",
+                "content": "buy viewers from streamboo",
+                "user_id": "viewer-streamboo-1",
+                "username": "spam_viewer",
+            }
+        )
+        self.assertEqual(result.status, "persisted")
+        assert result.message_id is not None
+        assert result.platform_account_id is not None
+
+        connector._record_moderation_action(
+            message_id=result.message_id,
+            target_platform_account_id=result.platform_account_id,
+            action_type="timeout",
+            reason="streamboo_viewer_spam",
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            action_row = connection.execute(
+                """
+                SELECT platform, message_id, action_type, reason, status
+                FROM moderation_actions
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(action_row[0], "twitch")
+        self.assertEqual(action_row[1], result.message_id)
+        self.assertEqual(action_row[2], "timeout")
+        self.assertEqual(action_row[3], "streamboo_viewer_spam")
+        self.assertEqual(action_row[4], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

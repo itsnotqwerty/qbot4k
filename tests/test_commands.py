@@ -15,7 +15,7 @@ from src.db import (
 	upsert_simple_command_definition,
 )
 from src.discord import DiscordConnector
-from src.commands import CommandContext, build_default_command_registry, render_command_reply
+from src.commands import CommandContext, _format_command_template, build_default_command_registry, render_command_reply
 from src.twitch import TwitchConnector, TwitchConnectionError
 from src.intelligence.userprofiles import create_canonical_user, link_platform_account
 
@@ -29,6 +29,20 @@ class _FakeResponse:
 
 	def read(self) -> bytes:
 		return b"{}"
+
+
+class _FakeHttpTemplateResponse:
+	def __init__(self, body: bytes) -> None:
+		self._body = body
+
+	def __enter__(self) -> _FakeHttpTemplateResponse:
+		return self
+
+	def __exit__(self, exc_type, exc, tb) -> None:
+		return None
+
+	def read(self, _size: int = -1) -> bytes:
+		return self._body
 
 
 class DiscordCommandTests(unittest.TestCase):
@@ -247,6 +261,357 @@ class DiscordCommandTests(unittest.TestCase):
 		self.assertIsInstance(discord_payload, dict)
 		self.assertEqual(discord_payload["content"], "Hello sam from twitch")
 		self.assertNotIn("embeds", discord_payload)
+
+	def test_template_http_macros_support_all_methods(self) -> None:
+		captured_methods: list[str] = []
+
+		def _fake_urlopen(request, timeout=5):
+			captured_methods.append(str(getattr(request, "method", "")))
+			return _FakeHttpTemplateResponse(f"ok-{request.method}".encode("utf-8"))
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="httpcheck",
+				response_template=(
+					"{GET}(https://example.test/get) "
+					"{POST}(https://example.test/post) "
+					"{PUT}(https://example.test/put) "
+					"{DELETE}(https://example.test/delete)"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-1",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-1",
+				content="!httpcheck",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!httpcheck", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(
+			render_command_reply(reply, "twitch"),
+			"ok-GET ok-POST ok-PUT ok-DELETE",
+		)
+		self.assertEqual(captured_methods, ["GET", "POST", "PUT", "DELETE"])
+
+	def test_template_http_macro_failure_returns_empty_string(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="httpfallback",
+				response_template="prefix {GET}(https://example.test/fail) suffix",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-2",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-2",
+				content="!httpfallback",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=ValueError("boom")):
+				reply = registry.dispatch("!httpfallback", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "prefix  suffix")
+
+	def test_template_http_macro_extracts_json_path_value(self) -> None:
+		def _fake_urlopen(_request, timeout=5):
+			return _FakeHttpTemplateResponse(
+				b'{"data":{"profile":{"name":"sam","scores":[5,7,9]}}}'
+			)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="jsonpath",
+				response_template=(
+					"name={GET}(https://example.test/user)[data.profile.name] "
+					"score={GET}(https://example.test/user)[data.profile.scores.1]"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-3",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-3",
+				content="!jsonpath",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!jsonpath", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "name=sam score=7")
+
+	def test_template_http_macro_missing_json_path_returns_empty_string(self) -> None:
+		def _fake_urlopen(_request, timeout=5):
+			return _FakeHttpTemplateResponse(b'{"data":{"profile":{"name":"sam"}}}')
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="jsonmissing",
+				response_template="value={GET}(https://example.test/user)[data.profile.missing]",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-4",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-4",
+				content="!jsonmissing",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!jsonmissing", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "value=")
+
+	def test_template_http_macro_substitutes_query_in_url(self) -> None:
+		captured_urls: list[str] = []
+
+		def _fake_urlopen(request, timeout=5):
+			captured_urls.append(str(request.full_url))
+			return _FakeHttpTemplateResponse(b'{"data":{"ok":true}}')
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="lookup",
+				response_template="{GET}(https://example.test/search?q={query})[data.ok]",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-5",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-5",
+				content="!lookup who is sam?",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!lookup who is sam?", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "true")
+		self.assertEqual(captured_urls, ["https://example.test/search?q=who+is+sam%3F"])
+
+	def test_template_http_macro_sends_user_agent_header(self) -> None:
+		captured_user_agent: list[str] = []
+
+		def _fake_urlopen(request, timeout=5):
+			captured_user_agent.append(str(request.get_header("User-agent") or ""))
+			return _FakeHttpTemplateResponse(b'{"data":{"ok":true}}')
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="useragent",
+				response_template="{GET}(https://example.test/ok)[data.ok]",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-6",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-6",
+				content="!useragent",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!useragent", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "true")
+		self.assertEqual(captured_user_agent, ["qbot4k/1.0 (+https://example.invalid/qbot4k)"])
+
+	def test_template_http_macro_extracts_json_path_from_large_payload(self) -> None:
+		payload_items = [{"q": "filler"} for _ in range(120)]
+		payload_items[119]["q"] = "tail-value"
+		large_payload = json.dumps(payload_items, separators=(",", ":")).encode("utf-8")
+
+		def _fake_urlopen(_request, timeout=5):
+			return _FakeHttpTemplateResponse(large_payload)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="largejson",
+				response_template="{GET}(https://example.test/quotes)[119.q]",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-7",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-7",
+				content="!largejson",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!largejson", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "tail-value")
+
+	def test_template_random_range_supports_inclusive_bounds(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="rng",
+				response_template="roll={0..49}",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-rng-1",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-rng-1",
+				content="!rng",
+			)
+			with mock.patch("src.commands.random.randint", return_value=49) as randint_mock:
+				reply = registry.dispatch("!rng", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "roll=49")
+		randint_mock.assert_called_once_with(0, 49)
+
+	def test_template_random_range_handles_reversed_bounds(self) -> None:
+		with mock.patch("src.commands.random.randint", return_value=3) as randint_mock:
+			rendered = _format_command_template("value={5..1}")
+
+		self.assertEqual(rendered, "value=3")
+		randint_mock.assert_called_once_with(1, 5)
+
+	def test_template_random_range_supports_query_bound(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="randq",
+				response_template="idx={0..{query}}",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-rng-2",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-rng-2",
+				content="!randq 49",
+			)
+			with mock.patch("src.commands.random.randint", return_value=17) as randint_mock:
+				reply = registry.dispatch("!randq 49", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "idx=17")
+		randint_mock.assert_called_once_with(0, 49)
+
+	def test_template_random_range_query_bound_sanitizes_non_numeric(self) -> None:
+		with mock.patch("src.commands.random.randint", return_value=0) as randint_mock:
+			rendered = _format_command_template("idx={0..{query}}", query="oops")
+
+		self.assertEqual(rendered, "idx=0")
+		randint_mock.assert_called_once_with(0, 0)
 
 	def test_reserved_command_names_are_rejected(self) -> None:
 		connection = connect_database(self.database_path)
