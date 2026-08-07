@@ -14,7 +14,7 @@ def persist_refreshed_twitch_tokens(access_token: str, refresh_token: str | None
 		return
 
 	updates = {
-		"QBOT_TWITCH_BOT_TOKEN": f"oauth:{normalized_access_token}",
+		"QBOT_TWITCH_BOT_TOKEN": normalized_access_token,
 	}
 	if refresh_token and refresh_token.strip():
 		updates["QBOT_TWITCH_REFRESH_TOKEN"] = refresh_token.strip()

@@ -183,7 +183,7 @@ class FoundationTests(unittest.TestCase):
 
                 contents = dotenv_path.read_text(encoding="utf-8")
 
-        self.assertIn("QBOT_TWITCH_BOT_TOKEN=oauth:refreshed-token", contents)
+        self.assertIn("QBOT_TWITCH_BOT_TOKEN=refreshed-token", contents)
         self.assertIn("QBOT_TWITCH_REFRESH_TOKEN=rotated-refresh", contents)
         self.assertIn("QBOT_DATABASE_PATH=./var/qbot4k.sqlite3", contents)
 
