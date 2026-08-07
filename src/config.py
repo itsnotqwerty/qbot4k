@@ -42,6 +42,17 @@ def _parse_int(name: str, raw_value: str | None, default: int) -> int:
         raise ConfigError(f"{name} must be an integer") from exc
 
 
+def _parse_bool(raw_value: str | None, default: bool = False) -> bool:
+    if raw_value is None or raw_value == "":
+        return default
+    normalized = raw_value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 @dataclass(frozen=True)
 class AppSettings:
     database_path: Path
@@ -54,6 +65,7 @@ class AppSettings:
     twitch_channels: tuple[str, ...]
     twitch_join_command_channel: str
     discord_guild_ids: tuple[str, ...]
+    discord_allow_bot_messages: bool
     operator_guild_ids: tuple[str, ...]
     message_retention_days: int
     audit_retention_days: int
@@ -116,6 +128,10 @@ class AppSettings:
                 "its_not_qwerty",
             ).strip(),
             discord_guild_ids=_parse_csv(env_map.get("QBOT_DISCORD_GUILD_IDS")),
+            discord_allow_bot_messages=_parse_bool(
+                env_map.get("QBOT_DISCORD_ALLOW_BOT_MESSAGES"),
+                default=False,
+            ),
             operator_guild_ids=_parse_csv(env_map.get("QBOT_OPERATOR_GUILD_IDS")),
             message_retention_days=_parse_int(
                 "QBOT_MESSAGE_RETENTION_DAYS",
@@ -191,6 +207,7 @@ class AppSettings:
             "twitch_channels": list(self.twitch_channels),
             "twitch_join_command_channel": self.twitch_join_command_channel,
             "discord_guild_ids": list(self.discord_guild_ids),
+            "discord_allow_bot_messages": self.discord_allow_bot_messages,
             "operator_guild_ids": list(self.operator_guild_ids),
             "message_retention_days": self.message_retention_days,
             "audit_retention_days": self.audit_retention_days,

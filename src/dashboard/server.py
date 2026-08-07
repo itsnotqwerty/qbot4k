@@ -557,7 +557,7 @@ class DashboardApp:
 			return
 
 		message_rows = "".join(
-			f"<tr><td>{self._escape(item.sent_at)}</td><td>{self._escape(item.platform)}</td><td>{self._escape(item.channel_id)}</td><td>{self._escape(item.content_raw)}</td></tr>"
+			f"<tr><td>{self._escape(item.sent_at)}</td><td>{self._escape(item.platform)}</td><td>{self._escape(item.channel_id)}</td><td>{self._render_message_with_attachments(item.content_raw, item.attachment_urls)}</td></tr>"
 			for item in recent_messages
 		)
 		action_rows = "".join(
@@ -1142,3 +1142,15 @@ button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--
 			.replace(">", "&gt;")
 			.replace('"', "&quot;")
 		)
+
+	def _render_message_with_attachments(self, content_raw: str, attachment_urls: tuple[str, ...]) -> str:
+		rendered_content = self._escape(content_raw)
+		if not attachment_urls:
+			return rendered_content
+		links = " ".join(
+			f"<a href='{self._escape(url)}' target='_blank' rel='noopener noreferrer'>[{index}]</a>"
+			for index, url in enumerate(attachment_urls, start=1)
+		)
+		if rendered_content:
+			return f"{rendered_content} <span class='muted'>{links}</span>"
+		return f"<span class='muted'>{links}</span>"

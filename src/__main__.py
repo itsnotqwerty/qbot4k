@@ -116,6 +116,7 @@ def run_application(once: bool) -> int:
 		discord_connector = DiscordConnector(
 			settings.database_path,
 			guild_ids=settings.discord_guild_ids,
+			allow_bot_messages=settings.discord_allow_bot_messages,
 		)
 		service_states["discord"] = discord_connector.health_snapshot().status
 	if "twitch" in settings.enabled_services:
@@ -179,6 +180,7 @@ def run_application(once: bool) -> int:
 		discord_connector = DiscordConnector(
 			settings.database_path,
 			guild_ids=settings.discord_guild_ids,
+			allow_bot_messages=settings.discord_allow_bot_messages,
 		)
 		discord_thread = threading.Thread(
 			target=discord_connector.run_forever,

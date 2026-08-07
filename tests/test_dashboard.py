@@ -285,6 +285,57 @@ class DashboardTests(unittest.TestCase):
 
 		self.assertIn("#lounge", body)
 
+	def test_user_detail_page_renders_discord_attachments_as_numbered_links(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		connector.ingest_message(
+			{
+				"id": "discord-msg-attach-1",
+				"timestamp": "2026-08-06T05:10:00Z",
+				"channel_id": "channel-55",
+				"guild_id": "guild-1",
+				"content": "check this",
+				"author": {
+					"id": "user-55",
+					"username": "viewer_attach",
+					"bot": False,
+				},
+				"attachments": [
+					"https://cdn.discordapp.com/attachments/a/file1.png",
+					"https://cdn.discordapp.com/attachments/a/file2.png",
+				],
+			}
+		)
+
+		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+			with mock.patch(
+				"src.dashboard.server.fetch_discord_identity",
+				return_value=DiscordIdentity(
+					user_id="123",
+					username="sam",
+					guild_ids=("guild-1",),
+					permissions={"guild-1": "8"},
+				),
+			):
+				request = Request(
+					f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+					headers={"Cookie": "qbot4k_oauth_state=state-1"},
+				)
+				with self.assertRaises(HTTPError) as callback_error:
+					self.opener.open(request)
+				callback_error.exception.close()
+
+		cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+		cookie_value = session_cookie.split(";", 1)[0]
+
+		with self.opener.open(Request(f"{self.base_url}/users/1", headers={"Cookie": cookie_value})) as response:
+			body = response.read().decode("utf-8")
+
+		self.assertIn("[1]</a>", body)
+		self.assertIn("[2]</a>", body)
+		self.assertIn("https://cdn.discordapp.com/attachments/a/file1.png", body)
+		self.assertIn("https://cdn.discordapp.com/attachments/a/file2.png", body)
+
 	def test_user_detail_page_supports_operator_moderation_actions(self) -> None:
 		connector = DiscordConnector(self.database_path)
 		connector.ingest_message(

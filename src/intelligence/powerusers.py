@@ -30,6 +30,52 @@ _POSITIVE_TERMS = {
 	"well done",
 }
 
+# Slurs and explicit ToS violations that warrant automatic moderation in addition to a
+# reputation penalty. All terms here are also present in _VERY_NEGATIVE_TERMS so that
+# reputation scoring requires no separate check.
+_EGREGIOUS_TERMS = {
+	"alligatorbait", "gatorbait",
+	"beaner", "bohunk",
+	"boong", "boonga", "boonie", "bountybar",
+	"cameljockey",
+	"chink", "chinky",
+	"coon", "coondog",
+	"dago", "darkie", "darky", "datnigga",
+	"faggot", "fagot",
+	"gook", "greaseball",
+	"hebe", "heeb", "honkey", "honky", "hymie",
+	"ikey",
+	"jap",
+	"jiga", "jigaboo", "jigg", "jigga", "jiggabo", "jigger", "jijjiboo",
+	"junglebunny",
+	"kaffer", "kaffir", "kaffre", "kafir", "kanake", "kigger",
+	"kike", "kyke", "kkk",
+	"lynch",
+	"macaca", "mgger", "mggor", "mooncricket", "mulatto", "munt",
+	"nazi",
+	"negro", "negroes", "negroid", "negro's",
+	"nig", "nigg", "nigga", "niggah", "niggaracci", "niggaz",
+	"nigger", "niggerhead", "niggerhole", "niggers", "nigger's",
+	"niggor", "niggur", "niglet", "nignog", "nigr", "nigra", "nigre",
+	"nlgger", "nlggor",
+	"nip",
+	"paki", "palesimian",
+	"pickaninny", "picaninny", "piccaninny",
+	"piker", "pikey", "piky",
+	"polack", "porchmonkey",
+	"raghead",
+	"rape", "raped", "raper", "rapist",
+	"roundeye",
+	"sandnigger", "slant", "slanteye", "snownigger",
+	"spaghettibender", "spaghettinigger",
+	"spic", "spick", "spig", "spigotty", "spik",
+	"swastika",
+	"tarbaby", "timbernigger", "towelhead",
+	"wetback", "whigger", "wigger",
+	"wog", "wop",
+	"yellowman", "zigabo", "zipperhead",
+}
+
 _VERY_NEGATIVE_TERMS = {
 	"abbo", "abo", "abortion", "abuse", "addict", "addicts", "adult", "africa",
 	"african", "alla", "allah", "alligatorbait", "amateur", "american", "anal", "analannie",
@@ -249,6 +295,11 @@ def score_delta_for_message(content_raw: str) -> tuple[int, str] | None:
 			return (1, "positive_message")
 
 	return (1, "message_sent")
+
+
+def is_egregious_content(content: str) -> bool:
+	normalized = content.casefold().strip()
+	return any(term in normalized for term in _EGREGIOUS_TERMS)
 
 
 def score_delta_for_moderation(*, severity: str, action_type: str | None = None) -> tuple[int, str]:

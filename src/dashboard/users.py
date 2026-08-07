@@ -16,11 +16,13 @@ class UserListItem:
 
 @dataclass(frozen=True)
 class UserRecentMessage:
+	message_id: int
 	platform: str
 	username: str
 	channel_id: str
 	content_raw: str
 	sent_at: str
+	attachment_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,7 @@ def list_recent_user_messages(
 		rows = connection.execute(
 			"""
 			SELECT
+				messages.id,
 				messages.platform,
 				platform_accounts.username,
 				CASE
@@ -150,6 +153,7 @@ def list_recent_user_messages(
 		rows = connection.execute(
 			"""
 			SELECT
+				messages.id,
 				messages.platform,
 				platform_accounts.username,
 				CASE
@@ -171,13 +175,35 @@ def list_recent_user_messages(
 			(platform_account_id, limit),
 		).fetchall()
 
+	message_ids = tuple(int(row[0]) for row in rows)
+	attachment_map: dict[int, tuple[str, ...]] = {}
+	if message_ids:
+		placeholders = ",".join("?" for _ in message_ids)
+		attachment_rows = connection.execute(
+			f"""
+			SELECT message_id, attachment_url
+			FROM message_attachments
+			WHERE message_id IN ({placeholders})
+			ORDER BY message_id, attachment_index
+			""",
+			message_ids,
+		).fetchall()
+		buffer: dict[int, list[str]] = {}
+		for row in attachment_rows:
+			message_id = int(row[0])
+			url = str(row[1])
+			buffer.setdefault(message_id, []).append(url)
+		attachment_map = {message_id: tuple(urls) for message_id, urls in buffer.items()}
+
 	return [
 		UserRecentMessage(
-			platform=str(row[0]),
-			username=str(row[1]),
-			channel_id=str(row[2]),
-			content_raw=str(row[3]),
-			sent_at=str(row[4]),
+			message_id=int(row[0]),
+			platform=str(row[1]),
+			username=str(row[2]),
+			channel_id=str(row[3]),
+			content_raw=str(row[4]),
+			sent_at=str(row[5]),
+			attachment_urls=attachment_map.get(int(row[0]), ()),
 		)
 		for row in rows
 	]

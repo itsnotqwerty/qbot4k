@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
+from .intelligence.powerusers import is_egregious_content
 from .models import NormalizedMessage
 
 
@@ -29,6 +30,18 @@ class ModerationFinding:
 	severity: str
 	reason_code: str
 	auto_enforce_action: str | None = None
+
+
+def evaluate_egregious_content(
+	message: NormalizedMessage,
+	rule: ModerationRule,
+) -> list[ModerationFinding]:
+	"""Return an auto-enforceable finding when the message contains a slur or ToS violation."""
+	if message.is_moderator:
+		return []
+	if not is_egregious_content(message.content_raw):
+		return []
+	return [_build_finding(rule)]
 
 
 def evaluate_message_moderation(

@@ -57,6 +57,34 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 	else:
 		normalized_roles = ()
 
+	mentioned_user_ids: tuple[str, ...] = ()
+	mentions = payload.get("mentions")
+	if isinstance(mentions, (list, tuple)):
+		collected_ids: list[str] = []
+		for mention in mentions:
+			if isinstance(mention, Mapping):
+				target = str(mention.get("id") or "").strip()
+			else:
+				target = str(mention).strip()
+			if not target:
+				continue
+			collected_ids.append(target)
+		mentioned_user_ids = tuple(collected_ids)
+
+	attachment_urls: tuple[str, ...] = ()
+	attachments = payload.get("attachments")
+	if isinstance(attachments, (list, tuple)):
+		collected_urls: list[str] = []
+		for attachment in attachments:
+			if isinstance(attachment, Mapping):
+				url = str(attachment.get("url") or "").strip()
+			else:
+				url = str(attachment).strip()
+			if not url:
+				continue
+			collected_urls.append(url)
+		attachment_urls = tuple(collected_urls)
+
 	guild_id = payload.get("guild_id")
 	is_moderator = bool(payload.get("author_is_moderator", False))
 	if not is_moderator and normalized_roles:
@@ -66,6 +94,8 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 	metadata = {
 		"guild_id": str(guild_id) if guild_id is not None else None,
 		"author_is_bot": bool(author.get("bot", False)),
+		"mentioned_user_ids": mentioned_user_ids,
+		"attachment_urls": attachment_urls,
 	}
 
 	return NormalizedMessage(
@@ -107,6 +137,16 @@ def build_discord_message_payload(payload: Mapping[str, object]) -> dict[str, ob
 			"global_name": author.get("global_name"),
 			"bot": bool(author.get("bot", False)),
 		},
+		"mentions": tuple(
+			str(mention.get("id") or "").strip()
+			for mention in payload.get("mentions", ())
+			if isinstance(mention, Mapping) and str(mention.get("id") or "").strip()
+		),
+		"attachments": tuple(
+			str(attachment.get("url") or "").strip()
+			for attachment in payload.get("attachments", ())
+			if isinstance(attachment, Mapping) and str(attachment.get("url") or "").strip()
+		),
 		"role_names": role_names,
 		"author_is_moderator": bool(payload.get("author_is_moderator", False)),
 	}
@@ -128,6 +168,7 @@ class DiscordConnector:
 		self._bot_token = bot_token.strip() if bot_token else ""
 		self._command_registry = command_registry or build_default_command_registry()
 		self._last_status = "idle"
+		self._guild_filter_warned_guilds: set[str] = set()
 		self._logger = logging.getLogger("qbot4k.discord")
 
 	def run_forever(self, bot_token: str) -> None:
@@ -343,6 +384,25 @@ class DiscordConnector:
 				if event_type == "READY":
 					self._last_status = "ready"
 					self._logger.info("connected to discord gateway")
+					if self.guild_ids:
+						self._logger.info(
+							"discord subscribed guild filter active guild_ids=%s",
+							",".join(self.guild_ids),
+						)
+						available_guild_ids = {
+							str(item.get("id") or "").strip()
+							for item in data.get("guilds", ())
+							if isinstance(item, Mapping) and str(item.get("id") or "").strip()
+						}
+						missing_guild_ids = [guild_id for guild_id in self.guild_ids if guild_id not in available_guild_ids]
+						if missing_guild_ids:
+							self._logger.warning(
+								"configured discord guild IDs not present in READY payload missing=%s available_count=%s",
+								",".join(missing_guild_ids),
+								len(available_guild_ids),
+							)
+					else:
+						self._logger.info("discord subscribed guild filter inactive processing all guilds")
 					self._logger.info(
 						"discord gateway intents guilds=%s guild_messages=%s message_content=%s",
 						bool(self._gateway_intents() & (1 << 0)),
@@ -355,6 +415,14 @@ class DiscordConnector:
 
 				guild_id = str(data.get("guild_id") or "").strip()
 				if self.guild_ids and guild_id not in self.guild_ids:
+					if guild_id not in self._guild_filter_warned_guilds:
+						self._guild_filter_warned_guilds.add(guild_id)
+						self._logger.warning(
+							"skipping discord messages for unsubscribed guild guild=%s channel=%s subscribed_guild_ids=%s",
+							guild_id,
+							str(data.get("channel_id") or "").strip(),
+							",".join(self.guild_ids),
+						)
 					continue
 
 				payload = build_discord_message_payload(data)

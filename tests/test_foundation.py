@@ -32,6 +32,15 @@ class FoundationTests(unittest.TestCase):
             self.assertEqual(settings.dashboard_port, 8080)
             self.assertEqual(settings.enabled_services, ("web", "jobs"))
             self.assertEqual(settings.twitch_channels, ("its_not_qwerty",))
+            self.assertFalse(settings.discord_allow_bot_messages)
+
+    def test_settings_can_enable_discord_bot_message_ingestion(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            settings = AppSettings.from_env(
+                self.build_env(tmpdir, QBOT_DISCORD_ALLOW_BOT_MESSAGES="true")
+            )
+
+        self.assertTrue(settings.discord_allow_bot_messages)
 
     def test_settings_fail_fast_when_web_auth_missing(self) -> None:
         with TemporaryDirectory() as tmpdir:

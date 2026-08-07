@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,9 +14,15 @@ from .intelligence.powerusers import (
     score_delta_for_moderation,
 )
 from .models import IngestionResult, NormalizedMessage
-from .moderation import ModerationFinding, ModerationRule, evaluate_message_moderation
+from .moderation import ModerationFinding, ModerationRule, evaluate_egregious_content, evaluate_message_moderation
 
+BUILTIN_EGREGIOUS_RULE_NAME = "builtin:egregious_content"
 RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom"}
+WELCOME_DUPLICATE_WINDOW_MINUTES = 10
+WELCOME_BONUS_DELTA = 1
+WELCOME_DUPLICATE_PENALTY_DELTA = -3
+_WELCOME_TARGET_MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
+_WELCOME_TARGET_HANDLE_PATTERN = re.compile(r"@([a-zA-Z0-9_]{2,64})")
 
 
 SCHEMA_SQL = """
@@ -60,6 +67,22 @@ CREATE TABLE IF NOT EXISTS messages (
     sent_at TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(platform, platform_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS message_attachments (
+    id INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    attachment_index INTEGER NOT NULL,
+    attachment_url TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS welcome_events (
+    id INTEGER PRIMARY KEY,
+    sender_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    target_identifier TEXT NOT NULL,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS twitch_channels (
@@ -216,6 +239,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_sent_at
     ON messages(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_platform_account
     ON messages(platform_account_id);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message_id
+    ON message_attachments(message_id, attachment_index);
+CREATE INDEX IF NOT EXISTS idx_welcome_events_sender_target_created_at
+    ON welcome_events(sender_platform_account_id, target_identifier, created_at);
 CREATE INDEX IF NOT EXISTS idx_twitch_channels_status
     ON twitch_channels(status, channel_name);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_rules_name
@@ -269,6 +296,18 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         connection.executescript(SCHEMA_SQL)
         _backfill_fixed_social_scores(connection)
         _seed_default_command_definitions(connection)
+        _seed_builtin_moderation_rules(connection)
+
+
+def _seed_builtin_moderation_rules(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        INSERT INTO moderation_rules (name, rule_type, pattern, severity, auto_enforce_action, enabled)
+        VALUES (?, 'egregious_term', '*', 'high', 'timeout', 1)
+        ON CONFLICT(name) DO NOTHING
+        """,
+        (BUILTIN_EGREGIOUS_RULE_NAME,),
+    )
 
 
 def _backfill_fixed_social_scores(connection: sqlite3.Connection) -> None:
@@ -630,6 +669,11 @@ def persist_normalized_message(
                 ),
             )
             message_id = int(cursor.lastrowid)
+            _persist_message_attachments(
+                connection,
+                message_id=message_id,
+                attachments=message.metadata.get("attachment_urls"),
+            )
             canonical_user_id = _ensure_canonical_user_for_platform_account(
                 connection,
                 platform_account_id=platform_account_id,
@@ -648,7 +692,28 @@ def persist_normalized_message(
                     source_id=message_id,
                 )
 
+            welcome_delta = _score_delta_for_welcome_message(
+                connection,
+                message=message,
+                platform_account_id=platform_account_id,
+                message_id=message_id,
+            )
+            if welcome_delta is not None:
+                delta, reason_code = welcome_delta
+                apply_reputation_event(
+                    connection,
+                    user_id=canonical_user_id,
+                    delta=delta,
+                    reason_code=reason_code,
+                    source_type="message",
+                    source_id=message_id,
+                )
+
             moderation_rules = load_enabled_moderation_rules(connection)
+            builtin_egregious_rule = next(
+                (r for r in moderation_rules if r.name == BUILTIN_EGREGIOUS_RULE_NAME),
+                None,
+            )
             if moderation_rules:
                 findings = evaluate_message_moderation(message, moderation_rules)
                 record_moderation_findings(
@@ -671,6 +736,29 @@ def persist_normalized_message(
                         source_type="moderation",
                         source_id=message_id,
                     )
+
+            if builtin_egregious_rule is not None:
+                egregious_findings = evaluate_egregious_content(message, builtin_egregious_rule)
+                if egregious_findings:
+                    record_moderation_findings(
+                        connection,
+                        message_id=message_id,
+                        platform=message.platform,
+                        findings=egregious_findings,
+                    )
+                    for finding in egregious_findings:
+                        penalty_delta, penalty_reason = score_delta_for_moderation(
+                            severity=finding.severity,
+                            action_type=finding.auto_enforce_action,
+                        )
+                        apply_reputation_event(
+                            connection,
+                            user_id=canonical_user_id,
+                            delta=penalty_delta,
+                            reason_code=penalty_reason,
+                            source_type="moderation",
+                            source_id=message_id,
+                        )
         return IngestionResult(
             status="persisted",
             platform=message.platform,
@@ -699,6 +787,110 @@ def persist_normalized_message(
             message_id=int(row[0]),
             reason="message_already_ingested",
         )
+
+
+def _persist_message_attachments(
+    connection: sqlite3.Connection,
+    *,
+    message_id: int,
+    attachments: object,
+) -> None:
+    if not isinstance(attachments, (list, tuple)):
+        return
+
+    attachment_rows: list[tuple[int, int, str]] = []
+    for index, raw_attachment in enumerate(attachments, start=1):
+        url = str(raw_attachment).strip()
+        if not url:
+            continue
+        attachment_rows.append((message_id, index, url))
+
+    if not attachment_rows:
+        return
+
+    connection.executemany(
+        """
+        INSERT INTO message_attachments (
+            message_id,
+            attachment_index,
+            attachment_url
+        ) VALUES (?, ?, ?)
+        """,
+        attachment_rows,
+    )
+
+
+def _score_delta_for_welcome_message(
+    connection: sqlite3.Connection,
+    *,
+    message: NormalizedMessage,
+    platform_account_id: int,
+    message_id: int,
+) -> tuple[int, str] | None:
+    target_identifier = _extract_welcome_target_identifier(message)
+    if target_identifier is None:
+        return None
+
+    message_time = datetime.fromisoformat(message.sent_at).astimezone(timezone.utc)
+    duplicate_cutoff = (message_time - timedelta(minutes=WELCOME_DUPLICATE_WINDOW_MINUTES)).isoformat()
+    duplicate_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM welcome_events
+            WHERE sender_platform_account_id = ?
+              AND target_identifier = ?
+              AND created_at >= ?
+            """,
+            (platform_account_id, target_identifier, duplicate_cutoff),
+        ).fetchone()[0]
+    )
+
+    connection.execute(
+        """
+        INSERT INTO welcome_events (
+            sender_platform_account_id,
+            target_identifier,
+            message_id,
+            created_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (platform_account_id, target_identifier, message_id, message.sent_at),
+    )
+
+    if duplicate_count > 0:
+        return (WELCOME_DUPLICATE_PENALTY_DELTA, "welcome_spam_duplicate")
+    return (WELCOME_BONUS_DELTA, "welcome_new_user")
+
+
+def _extract_welcome_target_identifier(message: NormalizedMessage) -> str | None:
+    normalized = message.content_normalized
+    if "welcome" not in normalized:
+        return None
+
+    mentioned_user_ids = message.metadata.get("mentioned_user_ids")
+    if isinstance(mentioned_user_ids, (list, tuple)):
+        for raw_id in mentioned_user_ids:
+            target = str(raw_id).strip()
+            if not target:
+                continue
+            if target == message.platform_user_id:
+                continue
+            return f"id:{target}"
+
+    mention_match = _WELCOME_TARGET_MENTION_PATTERN.search(message.content_raw)
+    if mention_match is not None:
+        target_id = mention_match.group(1).strip()
+        if target_id and target_id != message.platform_user_id:
+            return f"id:{target_id}"
+
+    handle_match = _WELCOME_TARGET_HANDLE_PATTERN.search(message.content_raw)
+    if handle_match is not None:
+        handle = handle_match.group(1).strip().casefold()
+        if handle and handle != message.username.casefold():
+            return f"handle:{handle}"
+
+    return None
 
 
 def _ensure_canonical_user_for_platform_account(

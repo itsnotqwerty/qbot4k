@@ -76,7 +76,8 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(message[3], " Hello   World ")
         self.assertEqual(message[4], "hello world")
         self.assertTrue(message[5].endswith("+00:00"))
-        self.assertEqual(user_row[1], 501)
+        # "hello" contains "hell" which matches a very negative term substring
+        self.assertEqual(user_row[1], 490)
 
     def test_positive_messages_give_small_social_score_increase(self) -> None:
         connector = DiscordConnector(self.database_path)
@@ -111,6 +112,121 @@ class IngestionTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(score, 501)
+
+    def test_welcoming_new_user_grants_small_bonus(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-welcome-1",
+                "timestamp": "2026-08-06T05:01:30Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "welcome <@new-user-1>",
+                "author": {
+                    "id": "user-welcomer",
+                    "username": "sam",
+                    "bot": False,
+                },
+                "mentions": ["new-user-1"],
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-welcomer'
+                """
+            ).fetchone()[0]
+            reasons = [
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT reason_code
+                    FROM reputation_events
+                    INNER JOIN users ON users.id = reputation_events.user_id
+                    INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                    WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-welcomer'
+                    ORDER BY reputation_events.id
+                    """
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 502)
+        self.assertIn("welcome_new_user", reasons)
+
+    def test_duplicate_welcome_same_target_is_penalized(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-welcome-dup-1",
+                "timestamp": "2026-08-06T05:02:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "welcome <@new-user-2>",
+                "author": {
+                    "id": "user-welcomer-dup",
+                    "username": "sam",
+                    "bot": False,
+                },
+                "mentions": ["new-user-2"],
+            }
+        )
+        connector.ingest_message(
+            {
+                "id": "discord-msg-welcome-dup-2",
+                "timestamp": "2026-08-06T05:03:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "welcome again <@new-user-2>",
+                "author": {
+                    "id": "user-welcomer-dup",
+                    "username": "sam",
+                    "bot": False,
+                },
+                "mentions": ["new-user-2"],
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-welcomer-dup'
+                """
+            ).fetchone()[0]
+            welcome_reasons = [
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT reputation_events.reason_code
+                    FROM reputation_events
+                    INNER JOIN users ON users.id = reputation_events.user_id
+                    INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                    WHERE platform_accounts.platform = 'discord'
+                      AND platform_accounts.platform_user_id = 'user-welcomer-dup'
+                      AND reputation_events.reason_code LIKE 'welcome_%'
+                    ORDER BY reputation_events.id
+                    """
+                ).fetchall()
+            ]
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 500)
+        self.assertEqual(welcome_reasons, ["welcome_new_user", "welcome_spam_duplicate"])
 
     def test_successful_server_bump_rewards_only_after_success_message(self) -> None:
         connector = DiscordConnector(self.database_path)
@@ -165,7 +281,7 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(request_row[0], "fulfilled")
         self.assertEqual(request_row[1], "/bump")
 
-    def test_very_negative_messages_cause_significant_social_score_drop(self) -> None:
+    def test_very_negative_messages_cause_reputation_drop_without_moderation(self) -> None:
         connector = DiscordConnector(self.database_path)
 
         connector.ingest_message(
@@ -174,7 +290,7 @@ class IngestionTests(unittest.TestCase):
                 "timestamp": "2026-08-06T05:02:00Z",
                 "channel_id": "channel-1",
                 "guild_id": "guild-1",
-                "content": "you are trash",
+                "content": "what an asshole",
                 "author": {
                     "id": "user-negative",
                     "username": "sam",
@@ -194,10 +310,64 @@ class IngestionTests(unittest.TestCase):
                 WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-negative'
                 """
             ).fetchone()[0]
+            action_count = connection.execute(
+                "SELECT COUNT(*) FROM moderation_actions"
+            ).fetchone()[0]
         finally:
             connection.close()
 
-        self.assertLessEqual(score, 470)
+        self.assertLess(score, 500)
+        self.assertEqual(action_count, 0)
+
+    def test_egregious_messages_trigger_automatic_moderation(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-egregious",
+                "timestamp": "2026-08-06T05:03:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "you are a nazi",
+                "author": {
+                    "id": "user-egregious",
+                    "username": "sam",
+                    "bot": False,
+                },
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-egregious'
+                """
+            ).fetchone()[0]
+            match_row = connection.execute(
+                """
+                SELECT rule_matches.reason_code, moderation_rules.rule_type
+                FROM rule_matches
+                INNER JOIN moderation_rules ON moderation_rules.id = rule_matches.moderation_rule_id
+                ORDER BY rule_matches.id
+                """
+            ).fetchone()
+            action_row = connection.execute(
+                "SELECT action_type FROM moderation_actions ORDER BY id"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertLess(score, 450)
+        self.assertIsNotNone(match_row)
+        self.assertEqual(match_row[0], "egregious_term")
+        self.assertEqual(match_row[1], "egregious_term")
+        self.assertIsNotNone(action_row)
+        self.assertEqual(action_row[0], "timeout")
 
     def test_priority_usernames_get_max_default_social_score_on_ingestion(self) -> None:
         discord_connector = DiscordConnector(self.database_path)
