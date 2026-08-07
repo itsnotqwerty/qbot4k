@@ -214,7 +214,9 @@ class TwitchConnector:
 			with ssl_context.wrap_socket(raw_socket, server_hostname="irc.chat.twitch.tv") as irc_socket:
 				self._active_socket = irc_socket
 				try:
-					irc_socket.settimeout(1.0)
+					# Avoid timed file reads; Python file wrappers over timed sockets can raise
+					# "cannot read from timed out object" and break the connector loop.
+					irc_socket.settimeout(None)
 					irc_reader = irc_socket.makefile("r", encoding="utf-8", newline="\r\n")
 					self._send_irc_line(irc_socket, f"PASS oauth:{token_for_irc}")
 					self._send_irc_line(irc_socket, f"NICK {bot_login}")
@@ -230,8 +232,6 @@ class TwitchConnector:
 					while not self._stop_event.is_set():
 						try:
 							raw_line = irc_reader.readline()
-						except TimeoutError:
-							continue
 						except OSError:
 							if self._stop_event.is_set():
 								return

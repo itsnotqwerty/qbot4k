@@ -20,6 +20,7 @@ if __package__ in {None, ""}:
 	from src.jobs import run_maintenance_jobs
 	from src.jobs import run_twitch_live_announcement_job
 	from src.logging_utils import configure_logging
+	from src.token_store import persist_refreshed_twitch_tokens
 	from src.twitch import TwitchConnector
 	from src.twitch_auth import TwitchTokenManager
 else:
@@ -30,8 +31,12 @@ else:
 	from .jobs import run_maintenance_jobs
 	from .jobs import run_twitch_live_announcement_job
 	from .logging_utils import configure_logging
+	from .token_store import persist_refreshed_twitch_tokens
 	from .twitch import TwitchConnector
 	from .twitch_auth import TwitchTokenManager
+
+def _persist_refreshed_twitch_tokens(access_token: str, refresh_token: str | None) -> None:
+	persist_refreshed_twitch_tokens(access_token, refresh_token)
 
 
 def _install_shutdown_handlers(
@@ -157,6 +162,7 @@ def run_application(once: bool) -> int:
 			refresh_token=settings.twitch_refresh_token,
 			client_id=settings.twitch_client_id,
 			client_secret=settings.twitch_client_secret,
+			on_token_refresh=_persist_refreshed_twitch_tokens,
 		)
 		twitch_connector = TwitchConnector(
 			settings.database_path,
@@ -239,6 +245,7 @@ def run_application(once: bool) -> int:
 			refresh_token=settings.twitch_refresh_token,
 			client_id=settings.twitch_client_id,
 			client_secret=settings.twitch_client_secret,
+			on_token_refresh=_persist_refreshed_twitch_tokens,
 		)
 		twitch_connector = TwitchConnector(
 			settings.database_path,

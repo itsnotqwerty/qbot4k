@@ -23,6 +23,7 @@ from .db import (
 	record_twitch_live_announcement,
 	upsert_discord_channel,
 )
+from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
 
@@ -346,6 +347,7 @@ def _build_twitch_token_manager(settings: AppSettings) -> TwitchTokenManager:
 		refresh_token=settings.twitch_refresh_token,
 		client_id=settings.twitch_client_id,
 		client_secret=settings.twitch_client_secret,
+		on_token_refresh=persist_refreshed_twitch_tokens,
 		logger=JOBS_LOGGER,
 	)
 

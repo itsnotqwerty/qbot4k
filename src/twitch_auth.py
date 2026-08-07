@@ -4,6 +4,7 @@ import json
 import logging
 from dataclasses import dataclass
 from threading import Lock
+from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -28,6 +29,7 @@ class TwitchTokenManager:
 		refresh_token: str | None = None,
 		client_id: str | None = None,
 		client_secret: str | None = None,
+		on_token_refresh: Callable[[str, str | None], None] | None = None,
 		logger: logging.Logger | None = None,
 	) -> None:
 		self._lock = Lock()
@@ -35,6 +37,7 @@ class TwitchTokenManager:
 		self._refresh_token = (refresh_token or "").strip()
 		self._client_id = (client_id or "").strip()
 		self._client_secret = (client_secret or "").strip()
+		self._on_token_refresh = on_token_refresh
 		self._logger = logger or logging.getLogger("qbot4k.twitch.auth")
 
 	def can_refresh(self) -> bool:
@@ -132,6 +135,12 @@ class TwitchTokenManager:
 		new_refresh_token = str(payload.get("refresh_token") or "").strip()
 		if new_refresh_token:
 			self._refresh_token = new_refresh_token
+
+		if self._on_token_refresh is not None:
+			try:
+				self._on_token_refresh(self._access_token, self._refresh_token or None)
+			except Exception as exc:
+				self._logger.warning("failed to persist refreshed twitch tokens: %s", exc)
 
 		self._logger.info("refreshed twitch access token")
 

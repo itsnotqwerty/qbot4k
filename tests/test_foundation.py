@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import signal
 import threading
 import unittest
@@ -9,11 +10,16 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from urllib.request import urlopen
+from unittest import mock
 
 from src.config import AppSettings, ConfigError
-from src.__main__ import _install_shutdown_handlers, _restore_shutdown_handlers
+from src.__main__ import (
+    _install_shutdown_handlers,
+    _restore_shutdown_handlers,
+)
 from src.db import connect_database, initialize_database, list_tables
 from src.health import create_health_server
+from src.token_store import persist_refreshed_twitch_tokens
 
 
 class FoundationTests(unittest.TestCase):
@@ -160,6 +166,26 @@ class FoundationTests(unittest.TestCase):
         self.assertTrue(shutdown_event.is_set())
 
         _restore_shutdown_handlers(handler_state)
+
+    def test_refresh_persistence_updates_dotenv_tokens(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            dotenv_path = Path(tmpdir) / ".env"
+            dotenv_path.write_text(
+                "QBOT_TWITCH_BOT_TOKEN=oauth:old-token\n"
+                "QBOT_TWITCH_REFRESH_TOKEN=old-refresh\n"
+                "QBOT_DATABASE_PATH=./var/qbot4k.sqlite3\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(os.environ, {}, clear=False):
+                with mock.patch("src.token_store._DOTENV_PATH", dotenv_path):
+                    persist_refreshed_twitch_tokens("refreshed-token", "rotated-refresh")
+
+                contents = dotenv_path.read_text(encoding="utf-8")
+
+        self.assertIn("QBOT_TWITCH_BOT_TOKEN=oauth:refreshed-token", contents)
+        self.assertIn("QBOT_TWITCH_REFRESH_TOKEN=rotated-refresh", contents)
+        self.assertIn("QBOT_DATABASE_PATH=./var/qbot4k.sqlite3", contents)
 
 
 if __name__ == "__main__":
