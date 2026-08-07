@@ -263,6 +263,28 @@ def get_canonical_user_profile(
 	)
 
 
+def get_canonical_user_profile_for_platform_account(
+	connection: sqlite3.Connection,
+	*,
+	platform: str,
+	platform_user_id: str,
+) -> CanonicalUserProfile | None:
+	row = connection.execute(
+		"""
+		SELECT users.id
+		FROM users
+		INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+		WHERE platform_accounts.platform = ?
+		  AND platform_accounts.platform_user_id = ?
+		""",
+		(platform, platform_user_id),
+	).fetchone()
+	if row is None:
+		return None
+
+	return get_canonical_user_profile(connection, int(row[0]))
+
+
 def add_user_note(
 	connection: sqlite3.Connection,
 	*,

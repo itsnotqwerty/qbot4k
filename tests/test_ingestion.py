@@ -76,7 +76,7 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(message[3], " Hello   World ")
         self.assertEqual(message[4], "hello world")
         self.assertTrue(message[5].endswith("+00:00"))
-        self.assertEqual(user_row[1], 500)
+        self.assertEqual(user_row[1], 501)
 
     def test_positive_messages_give_small_social_score_increase(self) -> None:
         connector = DiscordConnector(self.database_path)
@@ -111,6 +111,59 @@ class IngestionTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(score, 501)
+
+    def test_successful_server_bump_rewards_only_after_success_message(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-bump-1",
+                "timestamp": "2026-08-06T05:01:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "/bump",
+                "author": {
+                    "id": "user-bump",
+                    "username": "sam",
+                    "bot": False,
+                },
+            }
+        )
+        connector.ingest_message(
+            {
+                "id": "discord-msg-bump-2",
+                "timestamp": "2026-08-06T05:02:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "Bump done!",
+                "author": {
+                    "id": "bump-bot",
+                    "username": "bumpbot",
+                    "bot": True,
+                },
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-bump'
+                """
+            ).fetchone()[0]
+            request_row = connection.execute(
+                "SELECT status, command_name FROM server_boost_requests ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 502)
+        self.assertEqual(request_row[0], "fulfilled")
+        self.assertEqual(request_row[1], "/bump")
 
     def test_very_negative_messages_cause_significant_social_score_drop(self) -> None:
         connector = DiscordConnector(self.database_path)
@@ -429,7 +482,7 @@ class IngestionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertLessEqual(score, 430)
+        self.assertLessEqual(score, 431)
 
     def test_twitch_message_ingestion_persists_normalized_fields(self) -> None:
         connector = TwitchConnector(self.database_path)

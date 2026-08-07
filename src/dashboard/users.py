@@ -100,11 +100,18 @@ def list_recent_user_messages(
 			SELECT
 				messages.platform,
 				platform_accounts.username,
-				messages.channel_id,
+				CASE
+					WHEN messages.platform = 'discord' AND discord_channels.channel_name IS NOT NULL THEN '#' || discord_channels.channel_name
+					ELSE messages.channel_id
+				END AS channel_display,
 				messages.content_raw,
 				messages.sent_at
 			FROM messages
 			INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+			LEFT JOIN discord_channels ON (
+				discord_channels.channel_id = messages.channel_id
+				AND messages.platform = 'discord'
+			)
 			WHERE platform_accounts.user_id = ?
 			ORDER BY messages.sent_at DESC, messages.id DESC
 			LIMIT ?
@@ -118,11 +125,18 @@ def list_recent_user_messages(
 			SELECT
 				messages.platform,
 				platform_accounts.username,
-				messages.channel_id,
+				CASE
+					WHEN messages.platform = 'discord' AND discord_channels.channel_name IS NOT NULL THEN '#' || discord_channels.channel_name
+					ELSE messages.channel_id
+				END AS channel_display,
 				messages.content_raw,
 				messages.sent_at
 			FROM messages
 			INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+			LEFT JOIN discord_channels ON (
+				discord_channels.channel_id = messages.channel_id
+				AND messages.platform = 'discord'
+			)
 			WHERE platform_accounts.id = ?
 			ORDER BY messages.sent_at DESC, messages.id DESC
 			LIMIT ?

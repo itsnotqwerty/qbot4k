@@ -11,7 +11,14 @@ from urllib.request import Request, urlopen
 from websocket import ABNF, WebSocket, create_connection
 from websocket._exceptions import WebSocketTimeoutException
 
-from .db import connect_database, initialize_database, persist_normalized_message
+from .db import (
+	connect_database,
+	initialize_database,
+	persist_normalized_message,
+	record_server_boost_request,
+	reward_server_boost_request,
+)
+from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp
 
 
@@ -112,14 +119,19 @@ class DiscordConnector:
 		*,
 		guild_ids: tuple[str, ...] = (),
 		allow_bot_messages: bool = False,
+		command_registry: CommandRegistry | None = None,
+		bot_token: str | None = None,
 	) -> None:
 		self.database_path = Path(database_path)
 		self.guild_ids = tuple(guild_id.strip() for guild_id in guild_ids if guild_id.strip())
 		self.allow_bot_messages = allow_bot_messages
+		self._bot_token = bot_token.strip() if bot_token else ""
+		self._command_registry = command_registry or build_default_command_registry()
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.discord")
 
 	def run_forever(self, bot_token: str) -> None:
+		self._bot_token = bot_token.strip()
 		while True:
 			try:
 				self._connect_and_listen(bot_token)
@@ -137,22 +149,141 @@ class DiscordConnector:
 
 	def ingest_message(self, payload: Mapping[str, object]) -> IngestionResult:
 		normalized = normalize_discord_message(payload)
-		if normalized.metadata.get("author_is_bot") and not self.allow_bot_messages:
-			self._last_status = "ready"
-			return IngestionResult(
-				status="ignored",
-				platform="discord",
-				reason="bot_authored_message",
-			)
+		if normalized.metadata.get("author_is_bot"):
+			boost_command = self._detect_server_boost_success(normalized.content_raw)
+			if boost_command is not None:
+				connection = connect_database(self.database_path)
+				try:
+					initialize_database(connection)
+					rewarded_request_id = reward_server_boost_request(
+						connection,
+						platform="discord",
+						channel_id=normalized.channel_id,
+						command_names=(boost_command,),
+					)
+					if rewarded_request_id is not None:
+						self._last_status = "ready"
+						return IngestionResult(
+							status="rewarded",
+							platform="discord",
+							reason="server_boost_success",
+						)
+				finally:
+					connection.close()
+			if not self.allow_bot_messages:
+				self._last_status = "ready"
+				return IngestionResult(
+					status="ignored",
+					platform="discord",
+					reason="bot_authored_message",
+				)
 
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
 			result = persist_normalized_message(connection, normalized)
+			if result.status == "persisted":
+				self._maybe_record_server_boost_request(connection, normalized, result)
+				self._dispatch_registered_command(connection, normalized)
 			self._last_status = "ready"
 			return result
 		finally:
 			connection.close()
+
+	def _maybe_record_server_boost_request(
+		self,
+		connection,
+		normalized: NormalizedMessage,
+		result: IngestionResult,
+	) -> None:
+		command_name = self._server_boost_command_name(normalized.content_raw)
+		if command_name is None or result.platform_account_id is None:
+			return
+
+		record_server_boost_request(
+			connection,
+			platform="discord",
+			channel_id=normalized.channel_id,
+			requester_platform_account_id=result.platform_account_id,
+			command_name=command_name,
+		)
+
+	def _server_boost_command_name(self, content: str) -> str | None:
+		normalized = content.casefold().strip()
+		if not normalized:
+			return None
+		first_token = normalized.split(None, 1)[0]
+		if first_token in {"/bump", "/boop"}:
+			return first_token
+		return None
+
+	def _detect_server_boost_success(self, content: str) -> str | None:
+		normalized = content.casefold()
+		success_signals = {
+			"/bump": ("bump done", "bumped successfully", "server bumped"),
+			"/boop": ("boop done", "booped successfully", "server booped"),
+		}
+		for command_name, phrases in success_signals.items():
+			if any(phrase in normalized for phrase in phrases):
+				return command_name
+		return None
+
+	def _dispatch_registered_command(
+		self,
+		connection,
+		normalized: NormalizedMessage,
+	) -> None:
+		if not self._bot_token:
+			return
+
+		context = CommandContext(
+			platform="discord",
+			database_path=self.database_path,
+			connection=connection,
+			author_platform_user_id=normalized.platform_user_id,
+			author_username=normalized.username,
+			channel_id=normalized.channel_id,
+			guild_id=str(normalized.metadata.get("guild_id")) if normalized.metadata.get("guild_id") else None,
+			message_id=normalized.platform_message_id,
+			content=normalized.content_raw,
+		)
+		try:
+			response = self._command_registry.dispatch(normalized.content_raw, context)
+		except Exception as exc:
+			self._logger.warning("discord command dispatch failed: %s", exc)
+			return
+
+		if response is None:
+			return
+
+		try:
+			self._send_discord_message(normalized.channel_id, render_command_reply(response, "discord"))
+		except Exception as exc:
+			self._logger.warning("discord command response failed: %s", exc)
+
+	def _send_discord_message(self, channel_id: str, payload: Mapping[str, object]) -> None:
+		token = self._bot_token.removeprefix("Bot ").strip()
+		request = Request(
+			f"https://discord.com/api/v10/channels/{channel_id}/messages",
+			data=json.dumps(payload).encode("utf-8"),
+			headers={
+				"Authorization": f"Bot {token}",
+				"Accept": "application/json",
+				"Content-Type": "application/json",
+				"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+			},
+			method="POST",
+		)
+		try:
+			with urlopen(request, timeout=15) as response:
+				response.read()
+		except HTTPError as exc:
+			message = self._read_http_error_body(exc)
+			raise DiscordConnectionError(
+				f"Discord message send failed for channel {channel_id}: HTTP {exc.code}{f' - {message}' if message else ''}"
+			) from exc
+		except URLError as exc:
+			raise DiscordConnectionError(f"Discord message send failed for channel {channel_id}: {exc.reason}") from exc
 
 	def _connect_and_listen(self, bot_token: str) -> None:
 		gateway_url = self._fetch_gateway_url(bot_token)

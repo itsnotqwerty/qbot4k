@@ -228,6 +228,63 @@ class DashboardTests(unittest.TestCase):
 		self.assertIn("viewer_two", body)
 		self.assertIn("this is my latest message", body)
 
+	def test_user_detail_page_resolves_discord_channel_name(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		connector.ingest_message(
+			{
+				"id": "discord-msg-resolve-1",
+				"timestamp": "2026-08-06T05:10:00Z",
+				"channel_id": "channel-99",
+				"guild_id": "guild-1",
+				"content": "resolve this channel",
+				"author": {
+					"id": "user-99",
+					"username": "viewer_three",
+					"bot": False,
+				},
+			}
+		)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			with connection:
+				connection.execute(
+					"""
+					INSERT INTO discord_channels (channel_id, guild_id, channel_name, channel_type)
+					VALUES ('channel-99', 'guild-1', 'lounge', 0)
+					"""
+				)
+		finally:
+			connection.close()
+
+		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+			with mock.patch(
+				"src.dashboard.server.fetch_discord_identity",
+				return_value=DiscordIdentity(
+					user_id="123",
+					username="sam",
+					guild_ids=("guild-1",),
+					permissions={"guild-1": "8"},
+				),
+			):
+				request = Request(
+					f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+					headers={"Cookie": "qbot4k_oauth_state=state-1"},
+				)
+				with self.assertRaises(HTTPError) as callback_error:
+					self.opener.open(request)
+				callback_error.exception.close()
+
+		cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+		cookie_value = session_cookie.split(";", 1)[0]
+
+		with self.opener.open(Request(f"{self.base_url}/users/1", headers={"Cookie": cookie_value})) as response:
+			body = response.read().decode("utf-8")
+
+		self.assertIn("#lounge", body)
+
 	def test_users_page_link_button_relinks_tagged_username(self) -> None:
 		connector = DiscordConnector(self.database_path)
 		connector.ingest_message(
@@ -321,6 +378,177 @@ class DashboardTests(unittest.TestCase):
 		self.assertEqual(owner_rows[0][1], 1)
 		self.assertEqual(owner_rows[1][0], "user-link-2")
 		self.assertEqual(owner_rows[1][1], 1)
+
+	def test_commands_page_updates_credit_template_for_twitch_and_discord(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			connection.execute(
+				"""
+				INSERT INTO command_definitions (command_name, title, description_template, footer_template, enabled)
+				VALUES ('addcom', 'Add Command', 'ignored', NULL, 1)
+				"""
+			)
+			connection.execute(
+				"""
+				INSERT INTO simple_command_definitions (command_name, response_template, enabled)
+				VALUES ('delcom', 'ignored', 1)
+				"""
+			)
+		finally:
+			connection.close()
+
+		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+			with mock.patch(
+				"src.dashboard.server.fetch_discord_identity",
+				return_value=DiscordIdentity(
+					user_id="123",
+					username="sam",
+					guild_ids=("guild-1",),
+					permissions={"guild-1": "8"},
+				),
+			):
+				request = Request(
+					f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+					headers={"Cookie": "qbot4k_oauth_state=state-1"},
+				)
+				with self.assertRaises(HTTPError) as callback_error:
+					self.opener.open(request)
+				callback_error.exception.close()
+
+		cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+		cookie_value = session_cookie.split(";", 1)[0]
+
+		with self.opener.open(Request(f"{self.base_url}/commands", headers={"Cookie": cookie_value})) as response:
+			body = response.read().decode("utf-8")
+
+		self.assertIn("Command menu", body)
+		self.assertIn("<main class='main command-page'>", body)
+		self.assertIn("New Command", body)
+		self.assertIn("Built-Ins", body)
+		self.assertIn("Plaintext Commands", body)
+		self.assertIn("Templating Information", body)
+		self.assertIn("credit", body)
+		self.assertNotIn("!new", body)
+		self.assertNotIn("addcom", body)
+		self.assertNotIn("delcom", body)
+		self.assertNotIn("editcom", body)
+
+		request = Request(
+			f"{self.base_url}/commands",
+			data=b"command_name=credit&title=Credit+Ledger&description_template=Profile+for+%7Bdisplay_name%7D&footer_template=Twitch+profile+for+%7Bauthor_username%7D&enabled=1",
+			headers={
+				"Cookie": cookie_value,
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as save_error:
+			self.opener.open(request)
+		save_error.exception.close()
+		self.assertEqual(save_error.exception.code, 302)
+		self.assertIn("/commands?status=Saved%20builtin%20command%20credit", save_error.exception.headers["Location"])
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			command_row = connection.execute(
+				"SELECT title, description_template, footer_template, enabled FROM command_definitions WHERE command_name = 'credit'"
+			).fetchone()
+		finally:
+			connection.close()
+
+		self.assertEqual(command_row[0], "Credit Ledger")
+		self.assertEqual(command_row[1], "Profile for {display_name}")
+		self.assertEqual(command_row[2], "Twitch profile for {author_username}")
+		self.assertEqual(command_row[3], 1)
+
+		request = Request(
+			f"{self.base_url}/commands",
+			data=b"record_type=simple&command_name=wave&response_template=Hello+%7Bauthor_username%7D+from+%7Bplatform%7D&enabled=1",
+			headers={
+				"Cookie": cookie_value,
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as simple_save_error:
+			self.opener.open(request)
+		simple_save_error.exception.close()
+		self.assertEqual(simple_save_error.exception.code, 302)
+		self.assertIn("/commands?status=Saved%20simple%20command%20wave", simple_save_error.exception.headers["Location"])
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			simple_row = connection.execute(
+				"SELECT response_template, enabled FROM simple_command_definitions WHERE command_name = 'wave'"
+			).fetchone()
+		finally:
+			connection.close()
+
+		self.assertEqual(simple_row[0], "Hello {author_username} from {platform}")
+		self.assertEqual(simple_row[1], 1)
+
+		reply_lines: list[str] = []
+		TwitchConnector(self.database_path).ingest_message(
+			{
+				"message_id": "twitch-credit-live-1",
+				"timestamp": "2026-08-06T05:40:00Z",
+				"channel": "its_not_qwerty",
+				"content": "!credit",
+				"user_id": "twitch-user-live-1",
+				"username": "sam",
+			},
+			reply_sink=reply_lines.append,
+		)
+
+		self.assertEqual(len(reply_lines), 1)
+		self.assertIn("Credit Ledger", reply_lines[0])
+		self.assertIn("Twitch profile for sam", reply_lines[0])
+
+		simple_reply_lines: list[str] = []
+		TwitchConnector(self.database_path).ingest_message(
+			{
+				"message_id": "twitch-wave-live-1",
+				"timestamp": "2026-08-06T05:41:00Z",
+				"channel": "its_not_qwerty",
+				"content": "!wave",
+				"user_id": "twitch-user-live-1",
+				"username": "sam",
+			},
+			reply_sink=simple_reply_lines.append,
+		)
+
+		self.assertEqual(len(simple_reply_lines), 1)
+		self.assertEqual(simple_reply_lines[0], "Hello sam from twitch")
+
+		request = Request(
+			f"{self.base_url}/commands",
+			data=b"record_type=simple&action=delete&command_name=wave",
+			headers={
+				"Cookie": cookie_value,
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as simple_delete_error:
+			self.opener.open(request)
+		simple_delete_error.exception.close()
+		self.assertEqual(simple_delete_error.exception.code, 302)
+		self.assertIn("/commands?status=Deleted%20simple%20command%20wave", simple_delete_error.exception.headers["Location"])
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			simple_row = connection.execute(
+				"SELECT response_template, enabled FROM simple_command_definitions WHERE command_name = 'wave'"
+			).fetchone()
+		finally:
+			connection.close()
+
+		self.assertIsNone(simple_row)
 
 	def test_users_link_by_username_links_all_matching_accounts(self) -> None:
 		discord_connector = DiscordConnector(self.database_path)

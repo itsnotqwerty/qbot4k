@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .intelligence.powerusers import (
@@ -13,6 +14,8 @@ from .intelligence.powerusers import (
 )
 from .models import IngestionResult, NormalizedMessage
 from .moderation import ModerationFinding, ModerationRule, evaluate_message_moderation
+
+RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom"}
 
 
 SCHEMA_SQL = """
@@ -135,6 +138,56 @@ CREATE TABLE IF NOT EXISTS review_queue (
     resolved_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS server_boost_requests (
+    id INTEGER PRIMARY KEY,
+    platform TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    requester_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    requester_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    command_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    requested_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    fulfilled_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS command_definitions (
+    command_name TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description_template TEXT NOT NULL,
+    footer_template TEXT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS simple_command_definitions (
+    command_name TEXT PRIMARY KEY,
+    response_template TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS discord_channels (
+    channel_id TEXT PRIMARY KEY,
+    guild_id TEXT NOT NULL,
+    channel_name TEXT NOT NULL,
+    channel_type INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS twitch_live_announcements (
+    id INTEGER PRIMARY KEY,
+    twitch_channel_name TEXT NOT NULL,
+    twitch_stream_id TEXT NOT NULL,
+    discord_guild_id TEXT NOT NULL,
+    discord_channel_id TEXT NOT NULL,
+    announced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(twitch_channel_name, twitch_stream_id, discord_guild_id)
+);
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY,
     actor_type TEXT NOT NULL,
@@ -175,7 +228,29 @@ CREATE INDEX IF NOT EXISTS idx_review_queue_status_created_at
     ON review_queue(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_created_at
     ON audit_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_server_boost_requests_lookup
+    ON server_boost_requests(platform, channel_id, command_name, status, requested_at);
+CREATE INDEX IF NOT EXISTS idx_server_boost_requests_expires_at
+    ON server_boost_requests(expires_at);
+CREATE INDEX IF NOT EXISTS idx_command_definitions_enabled
+    ON command_definitions(enabled, command_name);
+CREATE INDEX IF NOT EXISTS idx_simple_command_definitions_enabled
+    ON simple_command_definitions(enabled, command_name);
+CREATE INDEX IF NOT EXISTS idx_discord_channels_guild_name
+    ON discord_channels(guild_id, channel_name);
+CREATE INDEX IF NOT EXISTS idx_twitch_live_announcements_lookup
+    ON twitch_live_announcements(twitch_channel_name, twitch_stream_id, discord_guild_id);
 """
+
+DEFAULT_COMMAND_DEFINITIONS = (
+    {
+        "command_name": "credit",
+        "title": "Social Credit Profile",
+        "description_template": "Profile for {display_name}",
+        "footer_template": "{platform} user: {author_username}",
+        "enabled": 1,
+    },
+)
 
 
 def connect_database(database_path: Path) -> sqlite3.Connection:
@@ -193,6 +268,7 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     with connection:
         connection.executescript(SCHEMA_SQL)
         _backfill_fixed_social_scores(connection)
+        _seed_default_command_definitions(connection)
 
 
 def _backfill_fixed_social_scores(connection: sqlite3.Connection) -> None:
@@ -221,6 +297,106 @@ def _backfill_fixed_social_scores(connection: sqlite3.Connection) -> None:
             """,
             (enforced_score, enforced_candidate_flag, user_id),
         )
+
+
+def _seed_default_command_definitions(connection: sqlite3.Connection) -> None:
+    for definition in DEFAULT_COMMAND_DEFINITIONS:
+        connection.execute(
+            """
+            INSERT INTO command_definitions (
+                command_name,
+                title,
+                description_template,
+                footer_template,
+                enabled
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(command_name) DO NOTHING
+            """,
+            (
+                definition["command_name"],
+                definition["title"],
+                definition["description_template"],
+                definition["footer_template"],
+                definition["enabled"],
+            ),
+        )
+
+
+def list_simple_command_definitions(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        """
+        SELECT command_name, response_template, enabled, created_at, updated_at
+        FROM simple_command_definitions
+        WHERE command_name NOT IN ('addcom', 'delcom', 'editcom')
+        ORDER BY command_name
+        """
+    ).fetchall()
+    return list(rows)
+
+
+def get_simple_command_definition(connection: sqlite3.Connection, command_name: str) -> sqlite3.Row | None:
+    command_key = command_name.strip().casefold()
+    if command_key in RESERVED_COMMAND_NAMES:
+        return None
+    return connection.execute(
+        """
+        SELECT command_name, response_template, enabled, created_at, updated_at
+        FROM simple_command_definitions
+        WHERE command_name = ?
+        """,
+        (command_key,),
+    ).fetchone()
+
+
+def upsert_simple_command_definition(
+    connection: sqlite3.Connection,
+    *,
+    command_name: str,
+    response_template: str,
+    enabled: bool,
+) -> None:
+    command_key = command_name.strip().casefold()
+    if not command_key:
+        raise ValueError("command_name must not be empty")
+    if command_key in RESERVED_COMMAND_NAMES:
+        raise ValueError(f"{command_key} is reserved")
+    if not response_template.strip():
+        raise ValueError("response_template must not be empty")
+
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO simple_command_definitions (
+                command_name,
+                response_template,
+                enabled
+            ) VALUES (?, ?, ?)
+            ON CONFLICT(command_name)
+            DO UPDATE SET
+                response_template = excluded.response_template,
+                enabled = excluded.enabled,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                command_key,
+                response_template.strip(),
+                int(enabled),
+            ),
+        )
+
+
+def delete_simple_command_definition(connection: sqlite3.Connection, command_name: str) -> bool:
+    command_key = command_name.strip().casefold().lstrip("!")
+    if not command_key:
+        raise ValueError("command_name must not be empty")
+    if command_key in RESERVED_COMMAND_NAMES:
+        raise ValueError(f"{command_key} is reserved")
+    with connection:
+        result = connection.execute(
+            "DELETE FROM simple_command_definitions WHERE command_name = ?",
+            (command_key,),
+        )
+    return result.rowcount > 0
 
 
 def list_tables(connection: sqlite3.Connection) -> list[str]:
@@ -342,6 +518,79 @@ def get_operator_account_by_discord_user_id(
         """,
         (discord_user_id,),
     ).fetchone()
+
+
+def list_command_definitions(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        """
+        SELECT command_name, title, description_template, footer_template, enabled, created_at, updated_at
+        FROM command_definitions
+        WHERE command_name NOT IN ('addcom', 'delcom', 'editcom')
+        ORDER BY command_name
+        """
+    ).fetchall()
+    return list(rows)
+
+
+def get_command_definition(connection: sqlite3.Connection, command_name: str) -> sqlite3.Row | None:
+    command_key = command_name.strip().casefold()
+    if command_key in RESERVED_COMMAND_NAMES:
+        return None
+    return connection.execute(
+        """
+        SELECT command_name, title, description_template, footer_template, enabled, created_at, updated_at
+        FROM command_definitions
+        WHERE command_name = ?
+        """,
+        (command_key,),
+    ).fetchone()
+
+
+def upsert_command_definition(
+    connection: sqlite3.Connection,
+    *,
+    command_name: str,
+    title: str,
+    description_template: str,
+    footer_template: str | None,
+    enabled: bool,
+) -> None:
+    command_key = command_name.strip().casefold()
+    if not command_key:
+        raise ValueError("command_name must not be empty")
+    if command_key in RESERVED_COMMAND_NAMES:
+        raise ValueError(f"{command_key} is reserved")
+    if not title.strip():
+        raise ValueError("title must not be empty")
+    if not description_template.strip():
+        raise ValueError("description_template must not be empty")
+
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO command_definitions (
+                command_name,
+                title,
+                description_template,
+                footer_template,
+                enabled
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(command_name)
+            DO UPDATE SET
+                title = excluded.title,
+                description_template = excluded.description_template,
+                footer_template = excluded.footer_template,
+                enabled = excluded.enabled,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                command_key,
+                title.strip(),
+                description_template.strip(),
+                footer_template.strip() if footer_template and footer_template.strip() else None,
+                int(enabled),
+            ),
+        )
 
 
 def persist_normalized_message(
@@ -761,3 +1010,252 @@ def record_moderation_findings(
                 """,
                 (message_id, finding.severity, finding.reason_code),
             )
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_server_boost_request(
+    connection: sqlite3.Connection,
+    *,
+    platform: str,
+    channel_id: str,
+    requester_platform_account_id: int,
+    command_name: str,
+    requested_at: str | None = None,
+    expires_in_minutes: int = 30,
+) -> int:
+    account = connection.execute(
+        """
+        SELECT user_id
+        FROM platform_accounts
+        WHERE id = ?
+        """,
+        (requester_platform_account_id,),
+    ).fetchone()
+    if account is None or account[0] is None:
+        raise ValueError("requesting platform account is not linked to a canonical user")
+
+    now = requested_at or _utcnow_iso()
+    expires_at = (datetime.fromisoformat(now).astimezone(timezone.utc) + timedelta(minutes=expires_in_minutes)).isoformat()
+    requester_user_id = int(account[0])
+    with connection:
+        row = connection.execute(
+            """
+            SELECT id
+            FROM server_boost_requests
+            WHERE platform = ?
+              AND channel_id = ?
+              AND requester_user_id = ?
+              AND command_name = ?
+              AND status = 'pending'
+            ORDER BY requested_at DESC, id DESC
+            LIMIT 1
+            """,
+            (platform, channel_id, requester_user_id, command_name),
+        ).fetchone()
+        if row is None:
+            cursor = connection.execute(
+                """
+                INSERT INTO server_boost_requests (
+                    platform,
+                    channel_id,
+                    requester_user_id,
+                    requester_platform_account_id,
+                    command_name,
+                    status,
+                    requested_at,
+                    expires_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+                """,
+                (
+                    platform,
+                    channel_id,
+                    requester_user_id,
+                    requester_platform_account_id,
+                    command_name,
+                    now,
+                    expires_at,
+                ),
+            )
+            request_id = int(cursor.lastrowid)
+        else:
+            request_id = int(row[0])
+            connection.execute(
+                """
+                UPDATE server_boost_requests
+                SET requested_at = ?,
+                    expires_at = ?,
+                    status = 'pending',
+                    fulfilled_at = NULL
+                WHERE id = ?
+                """,
+                (now, expires_at, request_id),
+            )
+
+    return request_id
+
+
+def reward_server_boost_request(
+    connection: sqlite3.Connection,
+    *,
+    platform: str,
+    channel_id: str,
+    command_names: tuple[str, ...],
+    reward_delta: int = 2,
+    reason_code: str = "server_boost_success",
+) -> int | None:
+    command_names = tuple(command_name.strip().casefold() for command_name in command_names if command_name.strip())
+    if not command_names:
+        return None
+
+    now = _utcnow_iso()
+    row = connection.execute(
+        f"""
+        SELECT id, requester_user_id, command_name
+        FROM server_boost_requests
+        WHERE platform = ?
+          AND channel_id = ?
+          AND status = 'pending'
+          AND expires_at > ?
+          AND command_name IN ({','.join('?' for _ in command_names)})
+        ORDER BY requested_at ASC, id ASC
+        LIMIT 1
+        """,
+        (platform, channel_id, now, *command_names),
+    ).fetchone()
+    if row is None:
+        return None
+
+    request_id = int(row[0])
+    requester_user_id = int(row[1])
+    command_name = str(row[2])
+    apply_reputation_event(
+        connection,
+        user_id=requester_user_id,
+        delta=reward_delta,
+        reason_code=reason_code,
+        source_type="server_boost",
+        source_id=request_id,
+    )
+    with connection:
+        connection.execute(
+            """
+            UPDATE server_boost_requests
+            SET status = 'fulfilled',
+                fulfilled_at = ?
+            WHERE id = ?
+            """,
+            (now, request_id),
+        )
+
+    return request_id
+
+
+def upsert_discord_channel(
+    connection: sqlite3.Connection,
+    *,
+    guild_id: str,
+    channel_id: str,
+    channel_name: str,
+    channel_type: int,
+) -> None:
+    guild_key = guild_id.strip()
+    channel_key = channel_id.strip()
+    channel_label = channel_name.strip()
+    if not guild_key or not channel_key or not channel_label:
+        raise ValueError("guild_id, channel_id, and channel_name must not be empty")
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO discord_channels (
+                channel_id,
+                guild_id,
+                channel_name,
+                channel_type
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(channel_id)
+            DO UPDATE SET
+                guild_id = excluded.guild_id,
+                channel_name = excluded.channel_name,
+                channel_type = excluded.channel_type,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (channel_key, guild_key, channel_label, int(channel_type)),
+        )
+
+
+def get_discord_channel_name(connection: sqlite3.Connection, channel_id: str) -> str | None:
+    channel_key = channel_id.strip()
+    if not channel_key:
+        return None
+    row = connection.execute(
+        """
+        SELECT channel_name
+        FROM discord_channels
+        WHERE channel_id = ?
+        """,
+        (channel_key,),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def has_twitch_live_announcement(
+    connection: sqlite3.Connection,
+    *,
+    twitch_channel_name: str,
+    twitch_stream_id: str,
+    discord_guild_id: str,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM twitch_live_announcements
+        WHERE twitch_channel_name = ?
+          AND twitch_stream_id = ?
+          AND discord_guild_id = ?
+        LIMIT 1
+        """,
+        (
+            twitch_channel_name.strip().casefold(),
+            twitch_stream_id.strip(),
+            discord_guild_id.strip(),
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def record_twitch_live_announcement(
+    connection: sqlite3.Connection,
+    *,
+    twitch_channel_name: str,
+    twitch_stream_id: str,
+    discord_guild_id: str,
+    discord_channel_id: str,
+    announced_at: str | None = None,
+) -> None:
+    timestamp = announced_at or _utcnow_iso()
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO twitch_live_announcements (
+                twitch_channel_name,
+                twitch_stream_id,
+                discord_guild_id,
+                discord_channel_id,
+                announced_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(twitch_channel_name, twitch_stream_id, discord_guild_id)
+            DO NOTHING
+            """,
+            (
+                twitch_channel_name.strip().casefold(),
+                twitch_stream_id.strip(),
+                discord_guild_id.strip(),
+                discord_channel_id.strip(),
+                timestamp,
+            ),
+        )

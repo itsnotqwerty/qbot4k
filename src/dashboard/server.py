@@ -12,8 +12,13 @@ from urllib.parse import parse_qs, quote, urlparse
 from ..config import AppSettings
 from ..db import (
     connect_database,
+	delete_simple_command_definition,
     initialize_database,
     upsert_operator_account,
+	list_command_definitions,
+	list_simple_command_definitions,
+	upsert_command_definition,
+	upsert_simple_command_definition,
 )
 from ..intelligence.userprofiles import (
     add_user_note,
@@ -22,6 +27,7 @@ from ..intelligence.userprofiles import (
     link_platform_account,
     unlink_platform_account,
 )
+from ..jobs import send_manual_twitch_live_announcements
 from .auth import (
     DashboardSession,
     build_discord_oauth_url,
@@ -56,7 +62,10 @@ class DashboardApp:
 		path = parsed.path
 
 		if handler.command == "GET" and path in {"/", "/dashboard"}:
-			self._serve_dashboard(handler)
+			self._serve_dashboard(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "POST" and path == "/dashboard/go-live":
+			self._serve_dashboard_go_live(handler)
 			return True
 		if handler.command == "GET" and path == "/users":
 			self._serve_users(handler, parse_qs(parsed.query))
@@ -69,6 +78,12 @@ class DashboardApp:
 			return True
 		if handler.command == "GET" and path == "/moderation":
 			self._serve_moderation(handler)
+			return True
+		if handler.command == "GET" and path == "/commands":
+			self._serve_commands(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "POST" and path == "/commands":
+			self._serve_commands_update(handler)
 			return True
 		if handler.command == "GET" and path == "/login":
 			self._serve_login(handler)
@@ -247,23 +262,48 @@ class DashboardApp:
 			cookies=("qbot4k_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",),
 		)
 
-	def _serve_dashboard(self, handler: BaseHTTPRequestHandler) -> None:
+	def _serve_dashboard(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
 		if session is None:
 			return
+		status_message = (query.get("status") or [""])[0].strip()
 		connection = connect_database(self.settings.database_path)
 		try:
 			initialize_database(connection)
 			overview = load_overview_snapshot(connection)
 		finally:
 			connection.close()
+		status_html = f"<p class='status-banner'>{self._escape(status_message)}</p>" if status_message else ""
+		go_live_action = (
+			"<form method='post' action='/dashboard/go-live'>"
+			+ "<button type='submit'>Go Live</button>"
+			+ "</form>"
+			if session.role == "admin"
+			else ""
+		)
+		toolbar_html = f"<div class='toolbar'>{go_live_action}{status_html}</div>"
 		body = self._render_page(
 			"Dashboard",
 			session,
 			f"<section class='hero'><div><p class='eyebrow'>Overview</p><h1>QBot4K dashboard</h1><p class='lede'>Messages processed: {overview.messages_total}. Open reviews: {overview.open_reviews}. Pending actions: {overview.pending_actions}.</p></div></section>"  # noqa: E501
+			+ toolbar_html
 			+ self._render_metric_grid(overview),
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_dashboard_go_live(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		try:
+			announcements = send_manual_twitch_live_announcements(self.settings)
+		except Exception as exc:
+			self._redirect(handler, f"/dashboard?status={quote(f'Go Live failed: {exc}')}")
+			return
+		if announcements <= 0:
+			self._redirect(handler, "/dashboard?status=Go%20Live%20sent%200%20pings")
+			return
+		self._redirect(handler, f"/dashboard?status={quote(f'Go Live sent {announcements} pings')}")
 
 	def _serve_users(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
@@ -540,6 +580,137 @@ class DashboardApp:
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
+	def _serve_commands(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		status_message = (query.get("status") or [""])[0].strip()
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			command_rows = list_command_definitions(connection)
+			simple_rows = list_simple_command_definitions(connection)
+		finally:
+			connection.close()
+		builtin_rows = []
+		for row in command_rows:
+			command_name = self._escape(row[0])
+			enabled_checked = "checked" if row[4] else ""
+			builtin_rows.append(
+				"<tr>"
+				+ f"<td><code>!{command_name}</code><input form='builtin-{command_name}' type='hidden' name='record_type' value='builtin'><input form='builtin-{command_name}' type='hidden' name='command_name' value='{command_name}'></td>"
+				+ f"<td><input form='builtin-{command_name}' name='title' value='{self._escape(row[1])}' required></td>"
+				+ f"<td><textarea form='builtin-{command_name}' name='description_template' rows='3' required>{self._escape(row[2])}</textarea></td>"
+				+ f"<td><textarea form='builtin-{command_name}' name='footer_template' rows='3' placeholder='{{platform}} user: {{author_username}}'>{self._escape(row[3] or '')}</textarea></td>"
+				+ f"<td><label class='checkbox'><input form='builtin-{command_name}' type='checkbox' name='enabled' value='1' {enabled_checked}> Enabled</label></td>"
+				+ f"<td><form id='builtin-{command_name}' method='post' action='/commands'><button type='submit'>Save</button></form></td>"
+				+ "</tr>"
+			)
+		simple_rows_html = []
+		for row in simple_rows:
+			command_name = self._escape(row[0])
+			enabled_checked = "checked" if row[2] else ""
+			simple_rows_html.append(
+				"<tr>"
+				+ f"<td><code>!{command_name}</code><input form='simple-{command_name}' type='hidden' name='record_type' value='simple'><input form='simple-{command_name}' type='hidden' name='command_name' value='{command_name}'></td>"
+				+ f"<td><input form='simple-{command_name}' name='response_template' value='{self._escape(row[1])}' required></td>"
+				+ f"<td><label class='checkbox'><input form='simple-{command_name}' type='checkbox' name='enabled' value='1' {enabled_checked}> Enabled</label></td>"
+				+ f"<td><div class='row-actions'><form id='simple-{command_name}' method='post' action='/commands'><button type='submit'>Save</button></form><form id='simple-delete-{command_name}' method='post' action='/commands'><input type='hidden' name='record_type' value='simple'><input type='hidden' name='action' value='delete'><input type='hidden' name='command_name' value='{command_name}'><button type='submit'>Delete</button></form></div></td>"
+				+ "</tr>"
+			)
+		status_html = f"<p class='status-banner'>{self._escape(status_message)}</p>" if status_message else ""
+		body = self._render_page(
+			"Commands",
+			session,
+			"<section class='hero'><div><p class='eyebrow'>Commands</p><h1>Command menu</h1><p class='lede'>Edit builtin command templates, add new simple commands, and keep Discord and Twitch output in sync.</p></div>"
+			+ "<div class='toolbar'>"
+			+ "<button type='button' onclick=\"document.getElementById('templating-information').showModal()\">Templating Information</button>"
+			+ status_html
+			+ "</div></section>"
+			+ self._render_template_info_dialog()
+			+ "<section class='card'><h2>Built-Ins</h2><p class='muted'>Builtins are the commands that ship with the bot.</p><table><thead><tr><th>Command</th><th>Title</th><th>Description template</th><th>Footer template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
+			+ ("".join(builtin_rows) or "<tr><td colspan='6'>No builtin commands found</td></tr>")
+			+ "</tbody></table></section>"
+			+ "<section class='card'><h2>Plaintext Commands</h2><p class='muted'>Insert quick text replies or update existing simple commands.</p><form id='simple-new' method='post' action='/commands' class='new-command-form'><input type='hidden' name='record_type' value='simple'><input class='new-command-name' name='command_name' placeholder='Command name (without !) e.g. website' required><input class='new-command-response' name='response_template' placeholder='Plain text response with {display_name}' required><label class='checkbox new-command-enabled'><input type='checkbox' name='enabled' value='1' checked> Enabled</label><button type='submit'>New Command</button></form><table><thead><tr><th>Command</th><th>Response template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
+			+ "".join(simple_rows_html)
+			+ "</tbody></table></section>"
+		)
+		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_commands_update(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+		command_name = next((value.strip().casefold() for value in (form.get("command_name") or []) if value.strip()), "")
+		record_type = (form.get("record_type") or ["builtin"])[0].strip().casefold() or "builtin"
+		action = (form.get("action") or ["save"])[0].strip().casefold() or "save"
+		title = (form.get("title") or [""])[0].strip()
+		description_template = (form.get("description_template") or [""])[0].strip()
+		footer_template = (form.get("footer_template") or [""])[0].strip()
+		response_template = (form.get("response_template") or [""])[0].strip()
+		enabled = (form.get("enabled") or [""])[0].strip() == "1"
+		if not command_name:
+			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Missing command name")
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			if record_type == "simple":
+				if action == "delete":
+					delete_simple_command_definition(connection, command_name)
+				else:
+					upsert_simple_command_definition(
+						connection,
+						command_name=command_name,
+						response_template=response_template,
+						enabled=enabled,
+					)
+			else:
+				upsert_command_definition(
+					connection,
+					command_name=command_name,
+					title=title,
+					description_template=description_template,
+					footer_template=footer_template or None,
+					enabled=enabled,
+				)
+		finally:
+			connection.close()
+		if record_type == "simple" and action == "delete":
+			self._redirect(handler, f"/commands?status={quote(f'Deleted simple command {command_name}')}")
+			return
+		label = "simple command" if record_type == "simple" else "builtin command"
+		self._redirect(handler, f"/commands?status={quote(f'Saved {label} {command_name}')}")
+
+	def _render_template_info_dialog(self) -> str:
+		items = [
+			("display_name", "Linked canonical display name for the invoking user."),
+			("author_username", "The platform username that invoked the command."),
+			("platform", "The source platform name such as discord or twitch."),
+			("score", "Current reputation score for the linked profile."),
+			("power_user", "Yes or No depending on whether the profile is flagged as a power user."),
+			("linked_accounts", "A newline-separated list of linked platform accounts."),
+			("latest_note", "The most recent operator note, if one exists."),
+			("command_name", "The normalized command name that triggered the response."),
+		]
+		rows = "".join(
+			f"<tr><td><code>{{{self._escape(name)}}}</code></td><td>{self._escape(description)}</td></tr>"
+			for name, description in items
+		)
+		return (
+			"<dialog id='templating-information' class='template-dialog'>"
+			+ "<form method='dialog' class='template-dialog-inner'>"
+			+ "<div class='template-dialog-header'><h2>Templating Information</h2><button value='cancel' aria-label='Close dialogue'>Close</button></div>"
+			+ "<p class='lede'>Templates use Python-style replacement fields. If a value is unavailable, it falls back to an empty string or a safe default.</p>"
+			+ "<table><thead><tr><th>Value</th><th>Meaning</th></tr></thead><tbody>"
+			+ rows
+			+ "</tbody></table>"
+			+ "</form></dialog>"
+		)
+
 	def _serve_api_overview(self, handler: BaseHTTPRequestHandler) -> None:
 		session = self._require_session(handler)
 		if session is None:
@@ -682,6 +853,7 @@ class DashboardApp:
 		self._send_json(handler, HTTPStatus.OK, {"status": "ready", "table_count": int(database_state), "services": dict(self.service_states)})
 
 	def _render_page(self, title: str, session: DashboardSession, content: str) -> str:
+		page_class = " command-page" if title.casefold() == "commands" else ""
 		return f"""<!doctype html>
 <html lang='en'>
 <head>
@@ -707,16 +879,40 @@ h1, h2 {{ margin: 0 0 10px; }}
 .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 18px 0; }}
 .metric {{ background: var(--panel); border: 1px solid var(--border); border-radius: 18px; padding: 18px; }}
 .metric .value {{ font-size: 30px; font-weight: 800; }}
+.toolbar {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0 20px; }}
+.status-banner {{ margin: 0; padding: 10px 14px; border-radius: 999px; background: rgba(120,220,202,.12); color: var(--accent); border: 1px solid rgba(120,220,202,.25); }}
 table {{ width: 100%; border-collapse: collapse; margin-top: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }}
 th, td {{ padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: left; }}
 th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
 form.search {{ display: flex; gap: 10px; margin: 18px 0; }}
 input {{ flex: 1; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
+textarea {{ width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); resize: vertical; }}
 select {{ padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
 button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--accent); color: #041014; font-weight: 700; }}
 .columns {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
 .sticky-link-panel {{ position: sticky; top: 12px; z-index: 5; margin-bottom: 18px; }}
-@media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ border-right: 0; border-bottom: 1px solid var(--border); }} .columns {{ grid-template-columns: 1fr; }} }}
+.checkbox {{ display: inline-flex; align-items: center; gap: 8px; }}
+.checkbox input {{ width: auto; flex: none; }}
+.template-dialog {{ width: min(920px, calc(100vw - 32px)); border: 1px solid var(--border); border-radius: 24px; background: var(--panel); color: var(--text); padding: 0; box-shadow: 0 30px 80px rgba(0,0,0,.45); }}
+.template-dialog::backdrop {{ background: rgba(0,0,0,.6); backdrop-filter: blur(6px); }}
+.template-dialog-inner {{ padding: 22px; }}
+.template-dialog-header {{ display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 10px; }}
+.template-dialog-header h2 {{ margin: 0; }}
+.template-dialog table {{ margin-top: 16px; }}
+.template-dialog code {{ color: var(--accent); }}
+.command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 100%; }}
+.command-page .new-command-form {{ display: flex; align-items: center; gap: 12px; margin: 14px 0 10px; }}
+.command-page .new-command-form .new-command-name {{ flex: 1 1 240px; min-width: 210px; }}
+.command-page .new-command-form .new-command-response {{ flex: 2 1 380px; min-width: 260px; }}
+.command-page .new-command-form .new-command-enabled {{ margin-left: 8px; margin-right: 2px; white-space: nowrap; }}
+.command-page .new-command-form button {{ white-space: nowrap; }}
+.command-page table td .checkbox {{ display: inline-flex; justify-content: flex-start; margin: 0; }}
+.command-page table td .checkbox input {{ margin: 0; }}
+.command-page .row-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+.command-page .row-actions form {{ margin: 0; }}
+.command-page .insert-row td {{ background: rgba(120,220,202,.04); }}
+.command-page .insert-row code {{ color: var(--accent); }}
+@media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ border-right: 0; border-bottom: 1px solid var(--border); }} .columns {{ grid-template-columns: 1fr; }} .command-page .new-command-form {{ flex-wrap: wrap; }} .command-page .new-command-form button {{ width: 100%; }} }}
 </style>
 </head>
 <body>
@@ -728,10 +924,11 @@ button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--
 <a href='/dashboard'>Overview</a>
 <a href='/users'>Users</a>
 <a href='/moderation'>Moderation</a>
+		<a href='/commands'>Commands</a>
 <form method='post' action='/logout'><button type='submit'>Logout</button></form>
 </nav>
 </aside>
-<main class='main'>{content}</main>
+<main class='main{page_class}'>{content}</main>
 </div>
 </body>
 </html>"""

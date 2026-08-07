@@ -2,19 +2,50 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import sqlite3
 import time
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from .config import AppSettings
-from .db import connect_database, initialize_database
+from .db import (
+	connect_database,
+	has_twitch_live_announcement,
+	initialize_database,
+	record_twitch_live_announcement,
+	upsert_discord_channel,
+)
 
 
 JobConnectionFactory = Callable[[Path], sqlite3.Connection]
+JOBS_LOGGER = logging.getLogger("qbot4k.jobs")
+_CHANNEL_MATCH_STOPWORDS = {
+	"and",
+	"for",
+	"the",
+	"this",
+	"that",
+	"with",
+	"from",
+	"into",
+	"your",
+	"our",
+	"are",
+	"was",
+	"were",
+	"live",
+	"stream",
+	"working",
+	"giving",
+}
 
 
 @dataclass(frozen=True)
@@ -25,6 +56,14 @@ class MaintenanceReport:
 	backup_metadata_path: str
 	backup_sha256: str
 	rollup_rows: int
+
+
+@dataclass(frozen=True)
+class TwitchLiveStream:
+	stream_id: str
+	title: str
+	url: str
+	game_name: str
 
 
 def run_maintenance_jobs(
@@ -56,6 +95,161 @@ def run_maintenance_jobs(
 		backup_sha256=backup_sha256,
 		rollup_rows=rollup_rows,
 	)
+
+
+def run_twitch_live_announcement_job(settings: AppSettings) -> int:
+	if not settings.discord_bot_token or not settings.twitch_bot_token:
+		JOBS_LOGGER.warning(
+			"skipping twitch live announcements: missing bot token discord=%s twitch=%s",
+			bool(settings.discord_bot_token),
+			bool(settings.twitch_bot_token),
+		)
+		return 0
+
+	guild_ids = _resolve_target_discord_guild_ids(settings.discord_bot_token, settings.discord_guild_ids)
+	if not guild_ids:
+		JOBS_LOGGER.warning("skipping twitch live announcements: no connected Discord guilds discovered")
+		return 0
+
+	stream = _fetch_twitch_live_stream("its_not_qwerty", settings.twitch_bot_token)
+	if stream is None:
+		JOBS_LOGGER.info("no active twitch stream detected for channel=%s", "its_not_qwerty")
+		return 0
+
+	announcements_sent = 0
+	for guild_id in guild_ids:
+		guild_channels = _fetch_discord_guild_channels(guild_id, settings.discord_bot_token)
+		if not guild_channels:
+			continue
+
+		connection = connect_database(settings.database_path)
+		try:
+			initialize_database(connection)
+			for channel in guild_channels:
+				upsert_discord_channel(
+					connection,
+					guild_id=guild_id,
+					channel_id=str(channel.get("id") or "").strip(),
+					channel_name=str(channel.get("name") or "").strip(),
+					channel_type=int(channel.get("type") or 0),
+				)
+
+			if has_twitch_live_announcement(
+				connection,
+				twitch_channel_name="its_not_qwerty",
+				twitch_stream_id=stream.stream_id,
+				discord_guild_id=guild_id,
+			):
+				continue
+		finally:
+			connection.close()
+
+		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name)
+		if not target_channel_id:
+			continue
+
+		_send_discord_here_announcement(
+			bot_token=settings.discord_bot_token,
+			channel_id=target_channel_id,
+			stream=stream,
+		)
+
+		connection = connect_database(settings.database_path)
+		try:
+			initialize_database(connection)
+			record_twitch_live_announcement(
+				connection,
+				twitch_channel_name="its_not_qwerty",
+				twitch_stream_id=stream.stream_id,
+				discord_guild_id=guild_id,
+				discord_channel_id=target_channel_id,
+			)
+		finally:
+			connection.close()
+		announcements_sent += 1
+
+	return announcements_sent
+
+
+def send_manual_twitch_live_announcements(settings: AppSettings) -> int:
+	if not settings.discord_bot_token or not settings.twitch_bot_token:
+		JOBS_LOGGER.warning(
+			"manual go-live skipped: missing bot token discord=%s twitch=%s",
+			bool(settings.discord_bot_token),
+			bool(settings.twitch_bot_token),
+		)
+		return 0
+
+	guild_ids = _resolve_target_discord_guild_ids(settings.discord_bot_token, settings.discord_guild_ids)
+	if not guild_ids:
+		JOBS_LOGGER.warning("manual go-live skipped: no connected Discord guilds discovered")
+		return 0
+
+	stream = _fetch_twitch_live_stream("its_not_qwerty", settings.twitch_bot_token)
+	if stream is None:
+		JOBS_LOGGER.info("manual go-live skipped: no active twitch stream for channel=%s", "its_not_qwerty")
+		return 0
+
+	announcements_sent = 0
+	for guild_id in guild_ids:
+		guild_channels = _fetch_discord_guild_channels(guild_id, settings.discord_bot_token)
+		if not guild_channels:
+			continue
+
+		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name)
+		if not target_channel_id:
+			continue
+
+		_send_discord_here_announcement(
+			bot_token=settings.discord_bot_token,
+			channel_id=target_channel_id,
+			stream=stream,
+		)
+		announcements_sent += 1
+
+	return announcements_sent
+
+
+def _resolve_target_discord_guild_ids(discord_bot_token: str, configured_guild_ids: tuple[str, ...]) -> tuple[str, ...]:
+	resolved_ids: list[str] = []
+	seen_ids: set[str] = set()
+
+	for guild_id in configured_guild_ids:
+		cleaned_id = guild_id.strip()
+		if not cleaned_id or cleaned_id in seen_ids:
+			continue
+		resolved_ids.append(cleaned_id)
+		seen_ids.add(cleaned_id)
+
+	discovered_ids = _fetch_discord_bot_guild_ids(discord_bot_token)
+	for guild_id in discovered_ids:
+		cleaned_id = guild_id.strip()
+		if not cleaned_id or cleaned_id in seen_ids:
+			continue
+		resolved_ids.append(cleaned_id)
+		seen_ids.add(cleaned_id)
+
+	return tuple(resolved_ids)
+
+
+def _fetch_discord_bot_guild_ids(discord_bot_token: str) -> tuple[str, ...]:
+	token = discord_bot_token.removeprefix("Bot ").strip()
+	request = Request(
+		"https://discord.com/api/v10/users/@me/guilds",
+		headers={
+			"Authorization": f"Bot {token}",
+			"Accept": "application/json",
+			"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+		},
+	)
+	try:
+		with urlopen(request, timeout=15) as response:
+			payload = json.loads(response.read().decode("utf-8"))
+	except (HTTPError, URLError):
+		return ()
+	if not isinstance(payload, list):
+		return ()
+	return tuple(str(item.get("id") or "").strip() for item in payload if isinstance(item, dict) and str(item.get("id") or "").strip())
 
 
 def purge_expired_messages(
@@ -140,3 +334,154 @@ def _sha256sum(path: Path) -> str:
 		for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
 			hasher.update(chunk)
 	return hasher.hexdigest()
+
+
+def _fetch_twitch_live_stream(channel_name: str, twitch_bot_token: str) -> TwitchLiveStream | None:
+	access_token = twitch_bot_token.removeprefix("oauth:").strip()
+	validate_request = Request(
+		"https://id.twitch.tv/oauth2/validate",
+		headers={"Authorization": f"OAuth {access_token}"},
+	)
+	try:
+		with urlopen(validate_request, timeout=15) as response:
+			validate_payload = json.loads(response.read().decode("utf-8"))
+	except (HTTPError, URLError):
+		return None
+
+	client_id = str(validate_payload.get("client_id") or "").strip()
+	if not client_id:
+		return None
+
+	query = urlencode({"user_login": channel_name.strip().casefold()})
+	streams_request = Request(
+		f"https://api.twitch.tv/helix/streams?{query}",
+		headers={
+			"Authorization": f"Bearer {access_token}",
+			"Client-Id": client_id,
+		},
+	)
+	try:
+		with urlopen(streams_request, timeout=15) as response:
+			streams_payload = json.loads(response.read().decode("utf-8"))
+	except (HTTPError, URLError):
+		return None
+
+	items = streams_payload.get("data")
+	if not isinstance(items, list) or not items:
+		return None
+	item = items[0] if isinstance(items[0], dict) else {}
+	stream_id = str(item.get("id") or "").strip()
+	title = str(item.get("title") or "").strip()
+	if not stream_id:
+		return None
+	return TwitchLiveStream(
+		stream_id=stream_id,
+		title=title,
+		url=f"https://www.twitch.tv/{channel_name.strip().casefold()}",
+		game_name=str(item.get("game_name") or "").strip(),
+	)
+
+
+def _fetch_discord_guild_channels(guild_id: str, discord_bot_token: str) -> list[dict[str, object]]:
+	token = discord_bot_token.removeprefix("Bot ").strip()
+	request = Request(
+		f"https://discord.com/api/v10/guilds/{guild_id}/channels",
+		headers={
+			"Authorization": f"Bot {token}",
+			"Accept": "application/json",
+			"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+		},
+	)
+	try:
+		with urlopen(request, timeout=15) as response:
+			payload = json.loads(response.read().decode("utf-8"))
+	except (HTTPError, URLError):
+		return []
+	if not isinstance(payload, list):
+		return []
+	channels: list[dict[str, object]] = []
+	for item in payload:
+		if not isinstance(item, dict):
+			continue
+		channel_type = int(item.get("type") or 0)
+		if channel_type not in {0, 5}:
+			continue
+		channel_id = str(item.get("id") or "").strip()
+		channel_name = str(item.get("name") or "").strip()
+		if channel_id and channel_name:
+			channels.append(item)
+	return channels
+
+
+def _pick_best_discord_channel_for_stream(
+	channels: list[dict[str, object]],
+	stream_title: str,
+	game_name: str,
+) -> str | None:
+	title_tokens = _tokenize(stream_title)
+	game_tokens = _tokenize(game_name)
+
+	best_channel_id: str | None = None
+	best_score = -1
+	for channel in channels:
+		channel_id = str(channel.get("id") or "").strip()
+		channel_name = str(channel.get("name") or "").strip().casefold()
+		if not channel_id or not channel_name:
+			continue
+		name_tokens = _tokenize(channel_name)
+		overlap_title = len(title_tokens & name_tokens)
+		overlap_game = len(game_tokens & name_tokens)
+		score = overlap_title * 3 + overlap_game * 2
+		if score > best_score:
+			best_score = score
+			best_channel_id = channel_id
+
+	if best_score > 0 and best_channel_id is not None:
+		return best_channel_id
+
+	for fallback_name in ("general", "lounge"):
+		for channel in channels:
+			channel_name = str(channel.get("name") or "").strip().casefold()
+			if channel_name == fallback_name:
+				return str(channel.get("id") or "").strip() or None
+
+	for fallback_name in ("general", "lounge"):
+		for channel in channels:
+			channel_name = str(channel.get("name") or "").strip().casefold()
+			if fallback_name in channel_name:
+				return str(channel.get("id") or "").strip() or None
+
+	if channels:
+		return str(channels[0].get("id") or "").strip() or None
+	return None
+
+
+def _tokenize(text: str) -> set[str]:
+	tokens = {
+		token
+		for token in re.split(r"[^a-z0-9]+", text.casefold())
+		if len(token) >= 3 and token not in _CHANNEL_MATCH_STOPWORDS
+	}
+	return tokens
+
+
+def _send_discord_here_announcement(*, bot_token: str, channel_id: str, stream: TwitchLiveStream) -> None:
+	token = bot_token.removeprefix("Bot ").strip()
+	title_suffix = f" - {stream.title}" if stream.title else ""
+	payload = {
+		"allowed_mentions": {"parse": ["everyone"]},
+		"content": f"@here its_not_qwerty is live: {stream.url}{title_suffix}",
+	}
+	request = Request(
+		f"https://discord.com/api/v10/channels/{channel_id}/messages",
+		data=json.dumps(payload).encode("utf-8"),
+		headers={
+			"Authorization": f"Bot {token}",
+			"Accept": "application/json",
+			"Content-Type": "application/json",
+			"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+		},
+		method="POST",
+	)
+	with urlopen(request, timeout=15) as response:
+		response.read()

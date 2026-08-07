@@ -10,6 +10,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from typing import Mapping
 
+from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
 from .db import (
 	connect_database,
 	initialize_database,
@@ -135,16 +136,23 @@ class TwitchConnector:
 		*,
 		join_command_channel: str = "its_not_qwerty",
 		bootstrap_channels: tuple[str, ...] = (),
+		command_registry: CommandRegistry | None = None,
 	) -> None:
 		self.database_path = Path(database_path)
 		self.join_command_channel = join_command_channel.strip().casefold()
 		self.bootstrap_channels = tuple(
 			channel.strip().casefold() for channel in bootstrap_channels if channel.strip()
 		)
+		self._command_registry = command_registry or build_default_command_registry()
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.twitch")
 
-	def ingest_message(self, payload: Mapping[str, object]) -> IngestionResult:
+	def ingest_message(
+		self,
+		payload: Mapping[str, object],
+		*,
+		reply_sink: callable | None = None,
+	) -> IngestionResult:
 		normalized = normalize_twitch_message(payload)
 		connection = connect_database(self.database_path)
 		try:
@@ -152,6 +160,9 @@ class TwitchConnector:
 			self._seed_bootstrap_channels(connection)
 			result = persist_normalized_message(connection, normalized)
 			self._process_join_command(connection, normalized, result)
+			reply = self._dispatch_registered_command(connection, normalized)
+			if reply is not None and reply_sink is not None:
+				reply_sink(render_command_reply(reply, "twitch"))
 			self._last_status = "ready"
 			return result
 		finally:
@@ -212,7 +223,14 @@ class TwitchConnector:
 					if payload is None:
 						continue
 
-					result = self.ingest_message(payload)
+					result = self.ingest_message(
+						payload,
+						reply_sink=lambda message: self._send_privmsg(
+							irc_socket,
+							str(payload["channel"]),
+							message,
+						),
+					)
 					self._logger.info(
 						"ingested twitch message channel=%s user=%s status=%s",
 						payload["channel"],
@@ -308,6 +326,31 @@ class TwitchConnector:
 		if content != "!join":
 			return None
 		return username or None
+
+	def _dispatch_registered_command(
+		self,
+		connection: object,
+		normalized: NormalizedMessage,
+	) -> object | None:
+		context = CommandContext(
+			platform="twitch",
+			database_path=self.database_path,
+			connection=connection,
+			author_platform_user_id=normalized.platform_user_id,
+			author_username=normalized.username,
+			channel_id=normalized.channel_id,
+			guild_id=None,
+			message_id=normalized.platform_message_id,
+			content=normalized.content_raw,
+		)
+		try:
+			return self._command_registry.dispatch(normalized.content_raw, context)
+		except Exception as exc:
+			self._logger.warning("twitch command dispatch failed: %s", exc)
+			return None
+
+	def _send_privmsg(self, irc_socket: ssl.SSLSocket, channel_name: str, message: str) -> None:
+		self._send_irc_line(irc_socket, f"PRIVMSG #{channel_name.strip().casefold()} :{message}")
 
 	def _mark_channel_active(self, channel_name: str) -> None:
 		connection = connect_database(self.database_path)

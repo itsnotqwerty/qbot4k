@@ -167,6 +167,7 @@ HTML routes:
 - /users
 - /users/{user_id}
 - /moderation
+- /commands
 - /login
 - /oauth/discord/callback
 
@@ -186,6 +187,12 @@ Auth model:
 - Dashboard uses Discord OAuth and a signed session cookie.
 - Role assignment is based on configured operator guild IDs and guild permissions.
 - If QBOT_OPERATOR_GUILD_IDS is empty, the current implementation admits authenticated users as admin for development convenience.
+
+Command templates:
+
+- /commands lets admins edit shared command templates used by both Discord and Twitch.
+- The built-in `credit` command stores its title and message templates in SQLite.
+- Discord renders the response as an embed, while Twitch renders the same command as plaintext.
 
 ## Ingestion and Moderation
 

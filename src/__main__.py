@@ -18,6 +18,7 @@ if __package__ in {None, ""}:
 	from src.discord import DiscordConnector
 	from src.health import build_health_snapshot, create_health_server
 	from src.jobs import run_maintenance_jobs
+	from src.jobs import run_twitch_live_announcement_job
 	from src.logging_utils import configure_logging
 	from src.twitch import TwitchConnector
 else:
@@ -26,6 +27,7 @@ else:
 	from .discord import DiscordConnector
 	from .health import build_health_snapshot, create_health_server
 	from .jobs import run_maintenance_jobs
+	from .jobs import run_twitch_live_announcement_job
 	from .logging_utils import configure_logging
 	from .twitch import TwitchConnector
 
@@ -133,6 +135,10 @@ def run_application(once: bool) -> int:
 			maintenance_report.rollup_rows,
 			maintenance_report.backup_path,
 		)
+		if "discord" in settings.enabled_services and "twitch" in settings.enabled_services:
+			announcements = run_twitch_live_announcement_job(settings)
+			if announcements > 0:
+				logging.getLogger("qbot4k.jobs").info("sent twitch live announcements count=%s", announcements)
 		service_states["jobs"] = "ready"
 	snapshot = build_health_snapshot(settings, service_states)
 
@@ -156,6 +162,10 @@ def run_application(once: bool) -> int:
 			try:
 				run_maintenance_jobs(settings)
 				jobs_logger.info("maintenance run complete")
+				if "discord" in settings.enabled_services and "twitch" in settings.enabled_services:
+					announcements = run_twitch_live_announcement_job(settings)
+					if announcements > 0:
+						jobs_logger.info("sent twitch live announcements count=%s", announcements)
 			except Exception:
 				jobs_logger.exception("maintenance run failed")
 			time.sleep(300)

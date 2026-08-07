@@ -5,10 +5,12 @@ import unittest
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import urlparse, parse_qs
+from unittest import mock
 
 from src.config import AppSettings
 from src.db import connect_database, initialize_database
-from src.jobs import run_maintenance_jobs
+from src.jobs import run_maintenance_jobs, run_twitch_live_announcement_job
 
 
 class JobTests(unittest.TestCase):
@@ -99,3 +101,88 @@ class JobTests(unittest.TestCase):
 		metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
 		self.assertEqual(metadata["backup_path"], report.backup_path)
 		self.assertEqual(metadata["sha256"], report.backup_sha256)
+
+	def test_twitch_live_announcement_posts_here_and_dedupes(self) -> None:
+		settings = AppSettings.from_env(
+			{
+				"QBOT_DATABASE_PATH": str(self.database_path),
+				"QBOT_BACKUP_DIR": str(self.backup_dir),
+				"QBOT_ENABLED_SERVICES": "jobs,twitch,discord",
+				"QBOT_MESSAGE_RETENTION_DAYS": "1",
+				"QBOT_AUDIT_RETENTION_DAYS": "1",
+				"QBOT_TWITCH_BOT_TOKEN": "oauth:test-token",
+				"QBOT_DISCORD_BOT_TOKEN": "discord-bot-token",
+				"QBOT_DISCORD_GUILD_IDS": "guild-1",
+			}
+		)
+
+		class _FakeResponse:
+			def __init__(self, payload: object) -> None:
+				self._payload = payload
+
+			def __enter__(self):
+				return self
+
+			def __exit__(self, exc_type, exc, tb) -> None:
+				return None
+
+			def read(self) -> bytes:
+				return json.dumps(self._payload).encode("utf-8")
+
+		post_calls: list[str] = []
+
+		def _fake_urlopen(request, timeout=15):
+			url = request.full_url
+			parsed = urlparse(url)
+			if parsed.netloc == "id.twitch.tv" and parsed.path == "/oauth2/validate":
+				return _FakeResponse({"client_id": "twitch-client-id", "login": "its_not_qwerty"})
+			if parsed.netloc == "api.twitch.tv" and parsed.path == "/helix/streams":
+				query = parse_qs(parsed.query)
+				self.assertEqual(query.get("user_login", [""])[0], "its_not_qwerty")
+				return _FakeResponse(
+					{
+						"data": [
+							{
+								"id": "stream-1",
+								"title": "Late Night Coding Session",
+								"game_name": "Software and Game Development",
+							}
+						]
+					}
+				)
+			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/guilds/guild-1/channels":
+				return _FakeResponse(
+					[
+						{"id": "c-1", "name": "general", "type": 0},
+						{"id": "c-2", "name": "coding", "type": 0},
+					]
+				)
+			if parsed.netloc == "discord.com" and parsed.path == "/api/v10/channels/c-2/messages":
+				post_calls.append(request.data.decode("utf-8"))
+				return _FakeResponse({"id": "discord-message-1"})
+			raise AssertionError(f"Unexpected URL in test: {url}")
+
+		with mock.patch("src.jobs.urlopen", side_effect=_fake_urlopen):
+			first_count = run_twitch_live_announcement_job(settings)
+			second_count = run_twitch_live_announcement_job(settings)
+
+		self.assertEqual(first_count, 1)
+		self.assertEqual(second_count, 0)
+		self.assertEqual(len(post_calls), 1)
+		self.assertIn("@here its_not_qwerty is live", post_calls[0])
+		self.assertIn("https://www.twitch.tv/its_not_qwerty", post_calls[0])
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			cache_rows = connection.execute(
+				"SELECT channel_id, channel_name FROM discord_channels ORDER BY channel_id"
+			).fetchall()
+			announcement_rows = connection.execute(
+				"SELECT twitch_stream_id, discord_guild_id, discord_channel_id FROM twitch_live_announcements"
+			).fetchall()
+		finally:
+			connection.close()
+
+		self.assertEqual([(row[0], row[1]) for row in cache_rows], [("c-1", "general"), ("c-2", "coding")])
+		self.assertEqual([(row[0], row[1], row[2]) for row in announcement_rows], [("stream-1", "guild-1", "c-2")])
