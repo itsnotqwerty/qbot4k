@@ -498,7 +498,7 @@ class DashboardApp:
 			"<section class='hero'><div><p class='eyebrow'>Users</p><h1>Canonical profiles</h1><p class='lede'>Search linked accounts, score bands, and recent activity.</p></div></section>"  # noqa: E501
 			+ sticky_panel
 			+ f"<form class='search' method='get'><input type='hidden' name='sort' value='{self._escape(sort_by)}'><input type='hidden' name='dir' value='{self._escape(sort_dir)}'><input name='q' value='{self._escape(search)}' placeholder='Search users'><button type='submit'>Search</button></form>"
-			+ f"<table><thead>{headers}</thead><tbody>{rows or '<tr><td colspan=6>No users found</td></tr>'}</tbody></table>"
+			+ f"<div class='table-scroll'><table class='table'><thead>{headers}</thead><tbody>{rows or '<tr><td colspan=6>No users found</td></tr>'}</tbody></table></div>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -838,7 +838,7 @@ class DashboardApp:
 			"Moderation",
 			session,
 			"<section class='hero'><div><p class='eyebrow'>Moderation</p><h1>Review and action queue</h1><p class='lede'>Open cases and recent actions are surfaced here for operators.</p></div></section>"  # noqa: E501
-			+ f"<div class='columns'><section><h2>Open reviews</h2><table class='moderation-table'><thead><tr><th>ID</th><th>Target</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=5>No open reviews</td></tr>'}</tbody></table></section><section><h2>Recent actions</h2><table class='moderation-table'><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=5>No actions yet</td></tr>'}</tbody></table></section></div>"
+			+ f"<section class='card'><h2>Open reviews</h2><div class='table-scroll'><table class='table'><thead><tr><th>ID</th><th>Target</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=5>No open reviews</td></tr>'}</tbody></table></div></section><section class='card'><h2>Recent actions</h2><div class='table-scroll'><table class='table'><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=5>No actions yet</td></tr>'}</tbody></table></div></section>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -890,12 +890,12 @@ class DashboardApp:
 			+ status_html
 			+ "</div></section>"
 			+ self._render_template_info_dialog()
-			+ "<section class='card'><h2>Built-Ins</h2><p class='muted'>Builtins are the commands that ship with the bot.</p><table class='builtin-commands-table'><thead><tr><th>Command</th><th>Title</th><th>Description template</th><th>Footer template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
+			+ "<section class='card'><h2>Built-Ins</h2><p class='muted'>Builtins are the commands that ship with the bot.</p><div class='table-scroll'><table class='table'><thead><tr><th>Command</th><th>Title</th><th>Description template</th><th>Footer template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
 			+ ("".join(builtin_rows) or "<tr><td colspan='6'>No builtin commands found</td></tr>")
-			+ "</tbody></table></section>"
-			+ "<section class='card'><h2>Plaintext Commands</h2><p class='muted'>Insert quick text replies or update existing simple commands.</p><form id='simple-new' method='post' action='/commands' class='new-command-form'><input type='hidden' name='record_type' value='simple'><input class='new-command-name' name='command_name' placeholder='Command name (without !) e.g. website' required><input class='new-command-response' name='response_template' placeholder='Plain text response with {display_name}' required><label class='checkbox new-command-enabled'><input type='checkbox' name='enabled' value='1' checked> Enabled</label><button type='submit'>New Command</button></form><table><thead><tr><th>Command</th><th>Response template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
+			+ "</tbody></table></div></section>"
+			+ "<section class='card'><h2>Plaintext Commands</h2><p class='muted'>Insert quick text replies or update existing simple commands.</p><form id='simple-new' method='post' action='/commands' class='new-command-form'><input type='hidden' name='record_type' value='simple'><input class='new-command-name' name='command_name' placeholder='Command name (without !) e.g. website' required><input class='new-command-response' name='response_template' placeholder='Plain text response with {display_name}' required><label class='checkbox new-command-enabled'><input type='checkbox' name='enabled' value='1' checked> Enabled</label><button type='submit'>New Command</button></form><div class='table-scroll'><table class='table'><thead><tr><th>Command</th><th>Response template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
 			+ "".join(simple_rows_html)
-			+ "</tbody></table></section>"
+			+ "</tbody></table></div></section>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -1390,26 +1390,84 @@ button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--
 .template-dialog-header h2 {{ margin: 0; }}
 .template-dialog table {{ margin-top: 16px; }}
 .template-dialog code {{ color: var(--accent); }}
-.command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 100%; }}
-.command-page .builtin-commands-table {{ min-width: 0; }}
-.command-page .builtin-commands-table th:nth-child(2), .command-page .builtin-commands-table td:nth-child(2) {{ min-width: 180px; width: 18%; }}
-.command-page .builtin-commands-table th:nth-child(3), .command-page .builtin-commands-table td:nth-child(3), .command-page .builtin-commands-table th:nth-child(4), .command-page .builtin-commands-table td:nth-child(4) {{ min-width: 220px; }}
-.command-page .builtin-title-input {{ min-width: 180px; width: 100%; }}
-.command-page .new-command-form {{ display: flex; align-items: center; gap: 12px; margin: 14px 0 10px; }}
-.command-page .new-command-form .new-command-name {{ flex: 1 1 240px; min-width: 210px; }}
-.command-page .new-command-form .new-command-response {{ flex: 2 1 380px; min-width: 260px; }}
-.command-page .new-command-form .new-command-enabled {{ margin-left: 8px; margin-right: 2px; white-space: nowrap; }}
-.command-page .new-command-form button {{ white-space: nowrap; }}
-.command-page table td .checkbox {{ display: inline-flex; justify-content: flex-start; margin: 0; }}
-.command-page table td .checkbox input {{ margin: 0; }}
-.command-page .row-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
-.command-page .row-actions form {{ margin: 0; }}
-.command-page .insert-row td {{ background: rgba(120,220,202,.04); }}
+table input:not([type='checkbox']),
+table textarea {{ 
+  width: 100%;
+  min-width: 0;                 /* allow the cell to control size */
+  box-sizing: border-box;
+}}
+
+.table-scroll {{
+  display: block;                 /* explicit – do NOT use table here */
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}}
+
+.table,
+.card table {{
+  display: table;
+  width: 100%;
+  table-layout: auto;
+  border-collapse: collapse;
+}}
+
+.command-page .builtin-title-input {{
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}}
+
+/* Keep the rest of your form / row-actions rules – they are fine */
+.command-page .new-command-form {{
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 14px 0 10px;
+  flex-wrap: wrap;
+}}
+.command-page .new-command-form .new-command-name {{
+  flex: 1 1 240px;
+  min-width: 210px;
+}}
+.command-page .new-command-form .new-command-response {{
+  flex: 2 1 380px;
+  min-width: 260px;
+}}
+.command-page .new-command-form .new-command-enabled {{
+  margin-left: 8px;
+  margin-right: 2px;
+  white-space: nowrap;
+}}
+.command-page .new-command-form button {{
+  white-space: nowrap;
+}}
+
+.command-page table td .checkbox {{
+  display: inline-flex;
+  justify-content: flex-start;
+  margin: 0;
+}}
+.command-page table td .checkbox input {{
+  margin: 0;
+}}
+.command-page .row-actions {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}}
+.command-page .row-actions form {{
+  margin: 0;
+}}
+.command-page .insert-row td {{
+  background: rgba(120, 220, 202, .04);
+}}
 .command-page .insert-row code {{ color: var(--accent); }}
-.moderation-table th, .moderation-table td {{ white-space: normal; overflow-wrap: anywhere; word-break: break-word; }}
 @media (max-width: 1100px) {{ .command-page .new-command-form {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }} .command-page .new-command-form > * {{ width: 100%; min-width: 0; }} .command-page .new-command-form .new-command-enabled {{ margin-left: 0; margin-right: 0; }} .command-page .new-command-form button {{ width: 100%; }} }}
 @media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ border-right: 0; border-bottom: 1px solid var(--border); }} .columns {{ grid-template-columns: 1fr; }} .sticky-link-panel {{ position: static; }} }}
-@media (max-width: 700px) {{ body {{ font-size: 14px; }} .main {{ padding: 16px; }} .nav {{ padding: 18px 14px; }} .hero, .card {{ padding: 16px; border-radius: 16px; }} .grid {{ grid-template-columns: 1fr; }} .toolbar, .status-row, form.search, .command-page .new-command-form, .command-page .row-actions {{ align-items: stretch; }} form.search > *, .toolbar > *, .command-page .new-command-form > *, .command-page .row-actions > * {{ width: 100%; }} button {{ width: 100%; }} .metric .value {{ font-size: 24px; }} th, td {{ padding: 10px 12px; white-space: nowrap; }} .moderation-table th, .moderation-table td {{ white-space: normal; }} .command-page .new-command-form .new-command-name, .command-page .new-command-form .new-command-response {{ min-width: 0; }} .command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 0; width: 100%; }} .template-dialog {{ width: calc(100vw - 16px); }} .template-dialog-inner {{ padding: 16px; }} }}
+@media (max-width: 700px) {{ body {{ font-size: 14px; }} .main {{ padding: 16px; }} .nav {{ padding: 18px 14px; }} .hero, .card {{ padding: 16px; border-radius: 16px; }} .grid {{ grid-template-columns: 1fr; }} .toolbar, .status-row, form.search, .command-page .new-command-form, .command-page .row-actions {{ align-items: stretch; }} form.search > *, .toolbar > *, .command-page .new-command-form > *, .command-page .row-actions > * {{ width: 100%; }} button {{ width: 100%; }} .metric .value {{ font-size: 24px; }} th, td {{ padding: 10px 12px; white-space: nowrap; }} .command-page .new-command-form .new-command-name, .command-page .new-command-form .new-command-response {{ min-width: 0; }} .command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 0; width: 100%; }} .template-dialog {{ width: calc(100vw - 16px); }} .template-dialog-inner {{ padding: 16px; }} }}
 </style>
 </head>
 <body>

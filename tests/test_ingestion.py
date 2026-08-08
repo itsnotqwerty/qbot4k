@@ -463,6 +463,98 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(request_row[0], "fulfilled")
         self.assertEqual(request_row[1], "/bump")
 
+    def test_server_bump_request_uses_interaction_command_name_when_content_is_empty(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        result = connector.ingest_message(
+            {
+                "id": "discord-msg-bump-empty-content",
+                "timestamp": "2026-08-06T05:03:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "</bump:1234567890>",
+                "author": {
+                    "id": "user-bump-empty",
+                    "username": "sam",
+                    "bot": False,
+                },
+                "interaction": {
+                    "name": "bump",
+                    "user": {"id": "user-bump-empty"},
+                },
+            }
+        )
+
+        self.assertEqual(result.status, "persisted")
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            request_row = connection.execute(
+                "SELECT status, command_name FROM server_boost_requests ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(request_row[0], "pending")
+        self.assertEqual(request_row[1], "/bump")
+
+    def test_server_bump_reward_accepts_broader_success_wording(self) -> None:
+        connector = DiscordConnector(self.database_path)
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-bump-success-wording-seed",
+                "timestamp": "2026-08-06T05:04:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "thanks",
+                "author": {
+                    "id": "user-bump-success-wording",
+                    "username": "sam",
+                    "bot": False,
+                },
+            }
+        )
+
+        connector.ingest_message(
+            {
+                "id": "discord-msg-bump-success-wording",
+                "timestamp": "2026-08-06T05:05:00Z",
+                "channel_id": "channel-1",
+                "guild_id": "guild-1",
+                "content": "Bump successful!",
+                "author": {
+                    "id": "bump-bot-alt",
+                    "username": "bumpbot",
+                    "bot": True,
+                },
+                "interaction_user_id": "user-bump-success-wording",
+                "interaction_command_name": "bump",
+            }
+        )
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            score = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord' AND platform_accounts.platform_user_id = 'user-bump-success-wording'
+                """
+            ).fetchone()[0]
+            request_row = connection.execute(
+                "SELECT status, command_name FROM server_boost_requests ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(score, 503)
+        self.assertEqual(request_row[0], "fulfilled")
+        self.assertEqual(request_row[1], "/bump")
+
     def test_very_negative_messages_cause_reputation_drop_without_moderation(self) -> None:
         connector = DiscordConnector(self.database_path)
 
