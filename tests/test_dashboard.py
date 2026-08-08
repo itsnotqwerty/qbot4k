@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 from unittest import mock
 
 from src.config import AppSettings
-from src.db import connect_database, initialize_database
+from src.db import connect_database, initialize_database, upsert_service_reliability_bucket
 from src.discord import DiscordConnector
 from src.health import create_health_server
 from src.dashboard.auth import DiscordIdentity
@@ -51,6 +51,29 @@ class DashboardTests(unittest.TestCase):
 		self.server.server_close()
 		self.thread.join(timeout=5)
 		self.tempdir.cleanup()
+
+	def _issue_operator_session_cookie(self) -> str:
+		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+			with mock.patch(
+				"src.dashboard.server.fetch_discord_identity",
+				return_value=DiscordIdentity(
+					user_id="123",
+					username="sam",
+					guild_ids=("guild-1",),
+					permissions={"guild-1": "8"},
+				),
+			):
+				request = Request(
+					f"{self.base_url}/oauth/discord/callback?code=abc&state=state-1",
+					headers={"Cookie": "qbot4k_oauth_state=state-1"},
+				)
+				with self.assertRaises(HTTPError) as callback_error:
+					self.opener.open(request)
+				callback_error.exception.close()
+
+		cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+		return session_cookie.split(";", 1)[0]
 
 	def test_login_redirects_to_discord_oauth(self) -> None:
 		with self.assertRaises(HTTPError) as error:
@@ -151,6 +174,159 @@ class DashboardTests(unittest.TestCase):
 			payload = json.loads(response.read().decode("utf-8"))
 
 		self.assertEqual(payload["overview"]["messages_total"], 0)
+
+	def test_dashboard_overview_shows_discord_and_twitch_status_indicators(self) -> None:
+		health_settings = replace(self.settings, enabled_services=("web", "jobs", "discord", "twitch"), dashboard_port=0)
+		service_started_at = {
+			"web": "2026-08-06T00:00:00+00:00",
+			"jobs": "2026-08-06T00:00:00+00:00",
+			"discord": "2026-08-06T00:00:00+00:00",
+			"twitch": "2026-08-06T00:00:00+00:00",
+		}
+		health_server = create_health_server(
+			health_settings,
+			{"web": "ready", "jobs": "ready", "discord": "ready", "twitch": "down"},
+			service_started_at=service_started_at,
+			app_started_at="2026-08-06T00:00:00+00:00",
+		)
+		health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
+		health_thread.start()
+		base_url = f"http://{health_server.server_address[0]}:{health_server.server_address[1]}"
+		opener = build_opener(NoRedirectHandler())
+
+		try:
+			with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+				with mock.patch(
+					"src.dashboard.server.fetch_discord_identity",
+					return_value=DiscordIdentity(
+						user_id="123",
+						username="sam",
+						guild_ids=("guild-1",),
+						permissions={"guild-1": "8"},
+					),
+				):
+					request = Request(
+						f"{base_url}/oauth/discord/callback?code=abc&state=state-1",
+						headers={"Cookie": "qbot4k_oauth_state=state-1"},
+					)
+					with self.assertRaises(HTTPError) as callback_error:
+						opener.open(request)
+					callback_error.exception.close()
+
+			cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+			session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+			cookie_value = session_cookie.split(";", 1)[0]
+
+			with opener.open(Request(f"{base_url}/dashboard", headers={"Cookie": cookie_value})) as response:
+				body = response.read().decode("utf-8")
+
+			self.assertIn("Connector Status", body)
+			self.assertIn("Connected and authenticated", body)
+			self.assertIn("Down", body)
+		finally:
+			health_server.shutdown()
+			health_server.server_close()
+			health_thread.join(timeout=5)
+
+	def test_api_health_reflects_live_service_state_mutations(self) -> None:
+		live_states = {"web": "ready", "jobs": "ready", "discord": "idle", "twitch": "idle"}
+		health_settings = replace(self.settings, enabled_services=("web", "jobs", "discord", "twitch"), dashboard_port=0)
+		health_server = create_health_server(health_settings, live_states)
+		health_thread = threading.Thread(target=health_server.serve_forever, daemon=True)
+		health_thread.start()
+		base_url = f"http://{health_server.server_address[0]}:{health_server.server_address[1]}"
+		opener = build_opener(NoRedirectHandler())
+
+		try:
+			with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
+				with mock.patch(
+					"src.dashboard.server.fetch_discord_identity",
+					return_value=DiscordIdentity(
+						user_id="123",
+						username="sam",
+						guild_ids=("guild-1",),
+						permissions={"guild-1": "8"},
+					),
+				):
+					request = Request(
+						f"{base_url}/oauth/discord/callback?code=abc&state=state-1",
+						headers={"Cookie": "qbot4k_oauth_state=state-1"},
+					)
+					with self.assertRaises(HTTPError) as callback_error:
+						opener.open(request)
+					callback_error.exception.close()
+
+			cookies = callback_error.exception.headers.get_all("Set-Cookie") or []
+			session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
+			cookie_value = session_cookie.split(";", 1)[0]
+
+			live_states["discord"] = "ready"
+			live_states["twitch"] = "ready"
+
+			with opener.open(Request(f"{base_url}/api/health", headers={"Cookie": cookie_value})) as response:
+				payload = json.loads(response.read().decode("utf-8"))
+
+			self.assertEqual(payload["services"]["discord"], "ready")
+			self.assertEqual(payload["services"]["twitch"], "ready")
+		finally:
+			health_server.shutdown()
+			health_server.server_close()
+			health_thread.join(timeout=5)
+
+	def test_system_health_page_and_api_include_uptime_details(self) -> None:
+		cookie_value = self._issue_operator_session_cookie()
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_service_reliability_bucket(
+				connection,
+				service_name="system",
+				bucket_start="2026-08-06T12:00:00+00:00",
+				is_up=True,
+				status="ready",
+			)
+			upsert_service_reliability_bucket(
+				connection,
+				service_name="system",
+				bucket_start="2026-08-06T12:01:00+00:00",
+				is_up=False,
+				status="down",
+			)
+			upsert_service_reliability_bucket(
+				connection,
+				service_name="system",
+				bucket_start="2026-08-06T12:02:00+00:00",
+				is_up=False,
+				status="down",
+			)
+			upsert_service_reliability_bucket(
+				connection,
+				service_name="system",
+				bucket_start="2026-08-06T12:03:00+00:00",
+				is_up=True,
+				status="ready",
+			)
+		finally:
+			connection.close()
+
+		with self.opener.open(Request(f"{self.base_url}/system-health", headers={"Cookie": cookie_value})) as response:
+			body = response.read().decode("utf-8")
+
+		self.assertIn("System health", body)
+		self.assertIn("App uptime", body)
+		self.assertIn("Database", body)
+		self.assertIn("Each bar is 1 minute. Green = uptime, red = downtime.", body)
+		self.assertIn("reliability-bar up", body)
+		self.assertIn("reliability-bar down", body)
+		self.assertIn("Outage start", body)
+		self.assertIn("2m", body)
+
+		with self.opener.open(Request(f"{self.base_url}/api/health", headers={"Cookie": cookie_value})) as response:
+			payload = json.loads(response.read().decode("utf-8"))
+
+		self.assertIn("services_detail", payload)
+		self.assertIn("uptime", payload)
+		self.assertIn("app_uptime_seconds", payload["uptime"])
 
 	def test_users_page_lists_ingested_accounts(self) -> None:
 		connector = DiscordConnector(self.database_path)

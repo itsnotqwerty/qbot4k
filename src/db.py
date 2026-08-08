@@ -233,6 +233,15 @@ CREATE TABLE IF NOT EXISTS metrics_rollups (
     UNIQUE(metric_name, bucket_start, bucket_size, dimension_json)
 );
 
+CREATE TABLE IF NOT EXISTS service_reliability_buckets (
+    service_name TEXT NOT NULL,
+    bucket_start TEXT NOT NULL,
+    is_up INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(service_name, bucket_start)
+);
+
 CREATE INDEX IF NOT EXISTS idx_platform_accounts_user_id
     ON platform_accounts(user_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at
@@ -267,6 +276,8 @@ CREATE INDEX IF NOT EXISTS idx_discord_channels_guild_name
     ON discord_channels(guild_id, channel_name);
 CREATE INDEX IF NOT EXISTS idx_twitch_live_announcements_lookup
     ON twitch_live_announcements(twitch_channel_name, twitch_stream_id, discord_guild_id);
+CREATE INDEX IF NOT EXISTS idx_service_reliability_buckets_lookup
+    ON service_reliability_buckets(service_name, bucket_start);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (
@@ -462,6 +473,79 @@ def database_health(database_path: Path) -> dict[str, object]:
         }
     finally:
         connection.close()
+
+
+def upsert_service_reliability_bucket(
+    connection: sqlite3.Connection,
+    *,
+    service_name: str,
+    bucket_start: str,
+    is_up: bool,
+    status: str,
+) -> None:
+    cleaned_service_name = service_name.strip().casefold()
+    cleaned_bucket_start = bucket_start.strip()
+    cleaned_status = status.strip().casefold() or "down"
+    if not cleaned_service_name:
+        raise ValueError("service_name must not be empty")
+    if not cleaned_bucket_start:
+        raise ValueError("bucket_start must not be empty")
+
+    with connection:
+        connection.execute(
+            """
+            INSERT INTO service_reliability_buckets (
+                service_name,
+                bucket_start,
+                is_up,
+                status
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(service_name, bucket_start)
+            DO UPDATE SET
+                is_up = MIN(service_reliability_buckets.is_up, excluded.is_up),
+                status = CASE
+                    WHEN service_reliability_buckets.is_up = 1 AND excluded.is_up = 0
+                    THEN excluded.status
+                    ELSE service_reliability_buckets.status
+                END,
+                recorded_at = CURRENT_TIMESTAMP
+            """,
+            (
+                cleaned_service_name,
+                cleaned_bucket_start,
+                1 if is_up else 0,
+                cleaned_status,
+            ),
+        )
+
+
+def list_service_reliability_buckets(
+    connection: sqlite3.Connection,
+    *,
+    service_name: str,
+    limit: int = 1440,
+) -> list[sqlite3.Row]:
+    cleaned_service_name = service_name.strip().casefold()
+    if not cleaned_service_name:
+        return []
+    if limit <= 0:
+        return []
+
+    rows = connection.execute(
+        """
+        SELECT bucket_start, is_up, status
+        FROM (
+            SELECT bucket_start, is_up, status
+            FROM service_reliability_buckets
+            WHERE service_name = ?
+            ORDER BY bucket_start DESC
+            LIMIT ?
+        )
+        ORDER BY bucket_start ASC
+        """,
+        (cleaned_service_name, int(limit)),
+    ).fetchall()
+    return list(rows)
 
 
 def ensure_platform_account(

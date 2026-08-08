@@ -14,7 +14,7 @@ from pathlib import Path
 if __package__ in {None, ""}:
 	sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 	from src.config import AppSettings, ConfigError
-	from src.db import connect_database, initialize_database, list_tables
+	from src.db import connect_database, initialize_database, list_tables, upsert_service_reliability_bucket
 	from src.discord import DiscordConnector
 	from src.health import build_health_snapshot, create_health_server
 	from src.jobs import run_maintenance_jobs
@@ -25,7 +25,7 @@ if __package__ in {None, ""}:
 	from src.twitch_auth import TwitchTokenManager
 else:
 	from .config import AppSettings, ConfigError
-	from .db import connect_database, initialize_database, list_tables
+	from .db import connect_database, initialize_database, list_tables, upsert_service_reliability_bucket
 	from .discord import DiscordConnector
 	from .health import build_health_snapshot, create_health_server
 	from .jobs import run_maintenance_jobs
@@ -133,6 +133,12 @@ def run_init_db() -> int:
 
 def run_application(once: bool) -> int:
 	settings = load_settings()
+	app_started_at = datetime.now(timezone.utc).isoformat()
+	service_started_at = {
+		service: app_started_at
+		for service in settings.enabled_services
+		if service in {"web", "jobs", "twitch", "discord"}
+	}
 	bootstrap_logger = logging.getLogger("qbot4k.bootstrap")
 	bootstrap_logger.info(
 		"starting application",
@@ -186,7 +192,12 @@ def run_application(once: bool) -> int:
 			if announcements > 0:
 				logging.getLogger("qbot4k.jobs").info("sent twitch live announcements count=%s", announcements)
 		service_states["jobs"] = "ready"
-	snapshot = build_health_snapshot(settings, service_states)
+	snapshot = build_health_snapshot(
+		settings,
+		service_states,
+		service_started_at=service_started_at,
+		app_started_at=app_started_at,
+	)
 
 	if once:
 		print(json.dumps(snapshot, indent=2, sort_keys=True))
@@ -196,11 +207,22 @@ def run_application(once: bool) -> int:
 	server_thread = None
 	service_threads: list[threading.Thread] = []
 	managed_connectors: list[object] = []
+	jobs_thread: threading.Thread | None = None
+	discord_thread: threading.Thread | None = None
+	twitch_thread: threading.Thread | None = None
+	discord_connector: DiscordConnector | None = None
+	twitch_connector: TwitchConnector | None = None
 	health_logger = logging.getLogger("qbot4k.health")
 	shutdown_event = threading.Event()
 	handler_state = _install_shutdown_handlers(shutdown_event, health_logger)
 	if "web" in settings.enabled_services:
-		server = create_health_server(settings, service_states)
+		service_started_at.setdefault("web", datetime.now(timezone.utc).isoformat())
+		server = create_health_server(
+			settings,
+			service_states,
+			service_started_at=service_started_at,
+			app_started_at=app_started_at,
+		)
 		server_thread = threading.Thread(target=server.serve_forever, daemon=True)
 		server_thread.start()
 		health_logger.info("health server listening")
@@ -220,6 +242,7 @@ def run_application(once: bool) -> int:
 			shutdown_event.wait(300)
 
 	if "jobs" in settings.enabled_services:
+		service_started_at.setdefault("jobs", datetime.now(timezone.utc).isoformat())
 		jobs_thread = threading.Thread(target=job_loop, name="maintenance-jobs", daemon=True)
 		jobs_thread.start()
 		service_threads.append(jobs_thread)
@@ -231,6 +254,7 @@ def run_application(once: bool) -> int:
 			allow_bot_messages=settings.discord_allow_bot_messages,
 		)
 		managed_connectors.append(discord_connector)
+		service_started_at.setdefault("discord", datetime.now(timezone.utc).isoformat())
 		discord_thread = threading.Thread(
 			target=discord_connector.run_forever,
 			args=(settings.discord_bot_token or "",),
@@ -254,6 +278,7 @@ def run_application(once: bool) -> int:
 			token_manager=twitch_token_manager,
 		)
 		managed_connectors.append(twitch_connector)
+		service_started_at.setdefault("twitch", datetime.now(timezone.utc).isoformat())
 		twitch_thread = threading.Thread(
 			target=twitch_connector.run_forever,
 			args=(settings.twitch_bot_token or "",),
@@ -262,6 +287,85 @@ def run_application(once: bool) -> int:
 		twitch_thread.start()
 		service_threads.append(twitch_thread)
 
+	def status_monitor_loop() -> None:
+		last_written_bucket: dict[str, str] = {}
+		last_written_is_up: dict[str, bool] = {}
+		enabled_runtime_services = tuple(
+			service
+			for service in settings.enabled_services
+			if service in {"web", "jobs", "twitch", "discord"}
+		)
+
+		def _bucket_start(now: datetime) -> str:
+			return now.replace(second=0, microsecond=0).isoformat()
+
+		def _should_write_sample(service_name: str, bucket_start: str, is_up: bool) -> bool:
+			previous_bucket = last_written_bucket.get(service_name)
+			if previous_bucket != bucket_start:
+				return True
+			previous_is_up = last_written_is_up.get(service_name)
+			return previous_is_up is True and not is_up
+
+		while not shutdown_event.is_set():
+			if "web" in settings.enabled_services:
+				service_states["web"] = "ready" if server_thread is not None and server_thread.is_alive() else "down"
+			if "jobs" in settings.enabled_services:
+				service_states["jobs"] = "ready" if jobs_thread is not None and jobs_thread.is_alive() else "down"
+			if "discord" in settings.enabled_services:
+				if discord_connector is None:
+					service_states["discord"] = "down"
+				elif discord_thread is not None and discord_thread.is_alive():
+					service_states["discord"] = discord_connector.health_snapshot().status
+				else:
+					last_status = discord_connector.health_snapshot().status
+					service_states["discord"] = last_status if last_status == "auth_failed" else "down"
+			if "twitch" in settings.enabled_services:
+				if twitch_connector is None:
+					service_states["twitch"] = "down"
+				elif twitch_thread is not None and twitch_thread.is_alive():
+					service_states["twitch"] = twitch_connector.health_snapshot().status
+				else:
+					service_states["twitch"] = "down"
+
+			now = datetime.now(timezone.utc)
+			current_bucket = _bucket_start(now)
+			reliability_samples: list[tuple[str, bool, str]] = []
+			for service_name in enabled_runtime_services:
+				status = str(service_states.get(service_name) or "down")
+				is_up = status == "ready"
+				if not _should_write_sample(service_name, current_bucket, is_up):
+					continue
+				reliability_samples.append((service_name, is_up, status))
+				last_written_bucket[service_name] = current_bucket
+				last_written_is_up[service_name] = is_up
+
+			system_is_up = all(str(service_states.get(service_name) or "down") == "ready" for service_name in enabled_runtime_services)
+			system_status = "ready" if system_is_up else "down"
+			if _should_write_sample("system", current_bucket, system_is_up):
+				reliability_samples.append(("system", system_is_up, system_status))
+				last_written_bucket["system"] = current_bucket
+				last_written_is_up["system"] = system_is_up
+
+			if reliability_samples:
+				connection = connect_database(settings.database_path)
+				try:
+					initialize_database(connection)
+					for service_name, is_up, status in reliability_samples:
+						upsert_service_reliability_bucket(
+							connection,
+							service_name=service_name,
+							bucket_start=current_bucket,
+							is_up=is_up,
+							status=status,
+						)
+				except Exception:
+					logging.getLogger("qbot4k.health").exception("failed to persist reliability sample")
+				finally:
+					connection.close()
+			shutdown_event.wait(1)
+
+	status_monitor_thread = threading.Thread(target=status_monitor_loop, name="service-status-monitor", daemon=True)
+	status_monitor_thread.start()
 	try:
 		if service_threads:
 			while any(thread.is_alive() for thread in service_threads):
@@ -291,6 +395,7 @@ def run_application(once: bool) -> int:
 				server_thread.join(timeout=5)
 		for thread in service_threads:
 			thread.join(timeout=5)
+		status_monitor_thread.join(timeout=2)
 		_restore_shutdown_handlers(handler_state)
 
 	return 0

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from typing import Mapping
@@ -13,8 +14,10 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse
 from ..config import AppSettings
 from ..db import (
     connect_database,
+	database_health,
 	delete_simple_command_definition,
     initialize_database,
+	list_service_reliability_buckets,
 	record_moderation_action,
     upsert_operator_account,
 	list_command_definitions,
@@ -61,9 +64,18 @@ class DashboardResponse:
 
 
 class DashboardApp:
-	def __init__(self, settings: AppSettings, service_states: Mapping[str, str] | None = None) -> None:
+	def __init__(
+		self,
+		settings: AppSettings,
+		service_states: Mapping[str, str] | None = None,
+		*,
+		service_started_at: Mapping[str, str] | None = None,
+		app_started_at: str | None = None,
+	) -> None:
 		self.settings = settings
-		self.service_states = dict(service_states or {})
+		self.service_states = service_states if service_states is not None else {}
+		self.service_started_at = dict(service_started_at or {})
+		self.app_started_at = app_started_at
 
 	def dispatch(self, handler: BaseHTTPRequestHandler) -> bool:
 		parsed = urlparse(handler.path)
@@ -71,6 +83,9 @@ class DashboardApp:
 
 		if handler.command == "GET" and path in {"/", "/dashboard"}:
 			self._serve_dashboard(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "GET" and path == "/system-health":
+			self._serve_system_health(handler)
 			return True
 		if handler.command == "POST" and path == "/dashboard/go-live":
 			self._serve_dashboard_go_live(handler)
@@ -297,12 +312,86 @@ class DashboardApp:
 			else ""
 		)
 		toolbar_html = f"<div class='toolbar'>{go_live_action}{status_html}</div>"
+		connector_status = self._render_overview_connector_status()
 		body = self._render_page(
 			"Dashboard",
 			session,
 			f"<section class='hero'><div><p class='eyebrow'>Overview</p><h1>QBot4K dashboard</h1><p class='lede'>Messages processed: {overview.messages_total}. Open reviews: {overview.open_reviews}. Pending actions: {overview.pending_actions}.</p></div></section>"  # noqa: E501
 			+ toolbar_html
+			+ connector_status
 			+ self._render_metric_grid(overview),
+		)
+		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_system_health(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		database_state = database_health(self.settings.database_path)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			reliability_history = {
+				name: list_service_reliability_buckets(connection, service_name=name, limit=1440)
+				for name in ("system", "web", "jobs", "twitch", "discord")
+			}
+		finally:
+			connection.close()
+		now = datetime.now(timezone.utc)
+		services = ("web", "jobs", "twitch", "discord")
+		rows = []
+		for service_name in services:
+			status = self._service_status(service_name)
+			started_at = self.service_started_at.get(service_name)
+			uptime_seconds = self._uptime_seconds(started_at, now)
+			rows.append(
+				"<tr>"
+				+ f"<td>{self._escape(service_name)}</td>"
+				+ f"<td>{self._render_status_pill(status)}</td>"
+				+ f"<td>{self._escape(self._format_uptime(uptime_seconds))}</td>"
+				+ f"<td>{self._escape(started_at or 'n/a')}</td>"
+				+ "</tr>"
+			)
+
+		app_uptime_seconds = self._uptime_seconds(self.app_started_at, now)
+		overall_status = self._overall_status(database_state, services)
+		reliability_sections = []
+		for service_name in ("system",) + services:
+			status = overall_status if service_name == "system" else self._service_status(service_name)
+			history = reliability_history.get(service_name, [])
+			outages = self._summarize_outages(history)
+			reliability_sections.append(
+				"<section class='card'>"
+				+ f"<h2>{self._escape(service_name.capitalize())} reliability</h2>"
+				+ f"<div class='status-row'>{self._render_status_pill(status)}<span class='muted'>Each bar is 1 minute. Green = uptime, red = downtime.</span></div>"
+				+ self._render_reliability_graph(service_name, history)
+				+ self._render_outage_table(outages)
+				+ "</section>"
+			)
+
+		body = self._render_page(
+			"Health",
+			session,
+			"<section class='hero'><div><p class='eyebrow'>Health</p><h1>System health</h1>"
+			+ f"<div class='status-row'><span class='muted'>Overall status:</span>{self._render_status_pill(overall_status)}</div>"
+			+ f"<p class='lede'>App uptime: {self._escape(self._format_uptime(app_uptime_seconds))}.</p>"
+			+ "</div></section>"
+			+ "<section class='card'>"
+			+ "<h2>Database</h2>"
+			+ "<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>"
+			+ f"<tr><td>Status</td><td>{self._render_status_pill(str(database_state.get('status') or 'unknown'))}</td></tr>"
+			+ f"<tr><td>Path</td><td>{self._escape(str(database_state.get('path') or ''))}</td></tr>"
+			+ f"<tr><td>Table count</td><td>{int(database_state.get('table_count') or 0)}</td></tr>"
+			+ f"<tr><td>Journal mode</td><td>{self._escape(str(database_state.get('journal_mode') or 'unknown'))}</td></tr>"
+			+ "</tbody></table>"
+			+ "</section>"
+			+ "<section class='card'>"
+			+ "<h2>Services</h2>"
+			+ "<table><thead><tr><th>Service</th><th>Status</th><th>Uptime</th><th>Started at</th></tr></thead><tbody>"
+			+ "".join(rows)
+			+ "</tbody></table>"
+			+ "</section>"
+			+ "".join(reliability_sections),
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -1039,15 +1128,204 @@ class DashboardApp:
 		session = self._require_session(handler)
 		if session is None:
 			return
-		connection = connect_database(self.settings.database_path)
+		database_state = database_health(self.settings.database_path)
+		now = datetime.now(timezone.utc)
+		services = ("web", "jobs", "twitch", "discord")
+		services_detail = {
+			service_name: {
+				"status": self._service_status(service_name),
+				"started_at": self.service_started_at.get(service_name),
+				"uptime_seconds": self._uptime_seconds(self.service_started_at.get(service_name), now),
+			}
+			for service_name in services
+		}
+		payload = {
+			"status": self._overall_status(database_state, services),
+			"table_count": int(database_state.get("table_count") or 0),
+			"database": database_state,
+			"services": {service_name: details["status"] for service_name, details in services_detail.items()},
+			"services_detail": services_detail,
+			"uptime": {
+				"app_started_at": self.app_started_at,
+				"app_uptime_seconds": self._uptime_seconds(self.app_started_at, now),
+			},
+		}
+		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _service_status(self, service_name: str) -> str:
+		if service_name not in self.settings.enabled_services:
+			return "disabled"
+		status = str(self.service_states.get(service_name) or "down").strip().casefold()
+		return status or "down"
+
+	def _overall_status(self, database_state: Mapping[str, object], services: tuple[str, ...]) -> str:
+		if str(database_state.get("status") or "").casefold() != "ready":
+			return "degraded"
+		for service_name in services:
+			if self._service_status(service_name) not in {"ready", "disabled"}:
+				return "degraded"
+		return "ready"
+
+	def _render_overview_connector_status(self) -> str:
+		discord_status = self._service_status("discord")
+		twitch_status = self._service_status("twitch")
+		discord_text = self._status_description("discord", discord_status)
+		twitch_text = self._status_description("twitch", twitch_status)
+		return (
+			"<section class='card'>"
+			+ "<h2>Connector Status</h2>"
+			+ "<p class='lede'>Live indicators for Discord and Twitch connectivity/authentication.</p>"
+			+ "<div class='grid'>"
+			+ f"<div class='metric'><div class='label'>Discord</div>{self._render_status_pill(discord_status)}<div class='muted'>{self._escape(discord_text)}</div></div>"
+			+ f"<div class='metric'><div class='label'>Twitch</div>{self._render_status_pill(twitch_status)}<div class='muted'>{self._escape(twitch_text)}</div></div>"
+			+ "</div></section>"
+		)
+
+	def _status_description(self, service_name: str, status: str) -> str:
+		if status == "ready":
+			return "Connected and authenticated"
+		if status == "disabled":
+			return f"{service_name.capitalize()} service is disabled"
+		if status == "auth_failed":
+			return "Down: authentication failed"
+		if status in {"connecting", "reconnecting"}:
+			return "Connecting"
+		if status == "idle":
+			return "Idle"
+		return "Down"
+
+	def _render_status_pill(self, status: str) -> str:
+		normalized = status.strip().casefold()
+		if normalized == "ready":
+			css_class = "status-up"
+			label = "ready"
+		elif normalized == "disabled":
+			css_class = "status-disabled"
+			label = "disabled"
+		elif normalized in {"connecting", "reconnecting", "idle"}:
+			css_class = "status-warn"
+			label = normalized
+		else:
+			css_class = "status-down"
+			label = normalized or "down"
+		return f"<span class='status-pill {css_class}'>{self._escape(label)}</span>"
+
+	def _uptime_seconds(self, started_at: str | None, now: datetime) -> int | None:
+		if not started_at:
+			return None
 		try:
-			initialize_database(connection)
-			database_state = connection.execute(
-				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-			).fetchone()[0]
-		finally:
-			connection.close()
-		self._send_json(handler, HTTPStatus.OK, {"status": "ready", "table_count": int(database_state), "services": dict(self.service_states)})
+			parsed = datetime.fromisoformat(started_at)
+		except ValueError:
+			return None
+		if parsed.tzinfo is None:
+			parsed = parsed.replace(tzinfo=timezone.utc)
+		seconds = int((now - parsed.astimezone(timezone.utc)).total_seconds())
+		return max(seconds, 0)
+
+	def _format_uptime(self, seconds: int | None) -> str:
+		if seconds is None:
+			return "n/a"
+		days, rem = divmod(seconds, 86400)
+		hours, rem = divmod(rem, 3600)
+		minutes, secs = divmod(rem, 60)
+		if days > 0:
+			return f"{days}d {hours}h {minutes}m"
+		if hours > 0:
+			return f"{hours}h {minutes}m {secs}s"
+		if minutes > 0:
+			return f"{minutes}m {secs}s"
+		return f"{secs}s"
+
+	def _render_reliability_graph(self, service_name: str, history: list[object]) -> str:
+		if not history:
+			return "<p class='muted'>No reliability samples yet.</p>"
+		bars = []
+		for row in history:
+			bucket_start = str(row["bucket_start"])
+			is_up = int(row["is_up"]) == 1
+			status = str(row["status"])
+			bar_class = "up" if is_up else "down"
+			title = f"{service_name} {bucket_start} {status}"
+			bars.append(
+				f"<span class='reliability-bar {bar_class}' title='{self._escape(title)}' aria-label='{self._escape(title)}'></span>"
+			)
+		return "<div class='reliability-track'>" + "".join(bars) + "</div>"
+
+	def _summarize_outages(self, history: list[object]) -> list[dict[str, object]]:
+		outages: list[dict[str, object]] = []
+		active_start: str | None = None
+		active_status = "down"
+		active_buckets = 0
+		last_bucket: str | None = None
+
+		for row in history:
+			bucket_start = str(row["bucket_start"])
+			is_up = int(row["is_up"]) == 1
+			status = str(row["status"])
+			if not is_up:
+				if active_start is None:
+					active_start = bucket_start
+					active_status = status
+					active_buckets = 0
+				active_buckets += 1
+				last_bucket = bucket_start
+				continue
+
+			if active_start is None:
+				last_bucket = bucket_start
+				continue
+
+			outages.append(
+				{
+					"started_at": active_start,
+					"ended_at": self._bucket_end_iso(last_bucket or active_start),
+					"duration_minutes": active_buckets,
+					"status": active_status,
+				}
+			)
+			active_start = None
+			active_buckets = 0
+			last_bucket = bucket_start
+
+		if active_start is not None:
+			outages.append(
+				{
+					"started_at": active_start,
+					"ended_at": "ongoing",
+					"duration_minutes": active_buckets,
+					"status": active_status,
+				}
+			)
+
+		outages.reverse()
+		return outages[:8]
+
+	def _render_outage_table(self, outages: list[dict[str, object]]) -> str:
+		if not outages:
+			return "<p class='muted'>No outages in the sampled window.</p>"
+		rows = "".join(
+			"<tr>"
+			+ f"<td>{self._escape(str(item['started_at']))}</td>"
+			+ f"<td>{self._escape(str(item['ended_at']))}</td>"
+			+ f"<td>{self._escape(str(item['duration_minutes']))}m</td>"
+			+ f"<td>{self._escape(str(item['status']))}</td>"
+			+ "</tr>"
+			for item in outages
+		)
+		return (
+			"<table class='outage-table'><thead><tr><th>Outage start</th><th>Outage end</th><th>Duration</th><th>Status</th></tr></thead><tbody>"
+			+ rows
+			+ "</tbody></table>"
+		)
+
+	def _bucket_end_iso(self, bucket_start: str) -> str:
+		try:
+			parsed = datetime.fromisoformat(bucket_start)
+		except ValueError:
+			return bucket_start
+		if parsed.tzinfo is None:
+			parsed = parsed.replace(tzinfo=timezone.utc)
+		return (parsed + timedelta(minutes=1)).isoformat()
 
 	def _render_page(self, title: str, session: DashboardSession, content: str) -> str:
 		page_class = " command-page" if title.casefold() == "commands" else ""
@@ -1078,6 +1356,17 @@ h1, h2 {{ margin: 0 0 10px; }}
 .metric .value {{ font-size: 30px; font-weight: 800; }}
 .toolbar {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0 20px; }}
 .status-banner {{ margin: 0; padding: 10px 14px; border-radius: 999px; background: rgba(120,220,202,.12); color: var(--accent); border: 1px solid rgba(120,220,202,.25); }}
+.status-row {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
+.status-pill {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 4px 10px; border: 1px solid transparent; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }}
+.status-up {{ background: rgba(76, 201, 142, .18); color: #8cf0c2; border-color: rgba(76, 201, 142, .45); }}
+.status-warn {{ background: rgba(255, 200, 87, .16); color: #ffd98a; border-color: rgba(255, 200, 87, .45); }}
+.status-down {{ background: rgba(255, 107, 107, .16); color: #ff9f9f; border-color: rgba(255, 107, 107, .45); }}
+.status-disabled {{ background: rgba(154, 167, 189, .15); color: #c8d1df; border-color: rgba(154, 167, 189, .4); }}
+.reliability-track {{ display: flex; align-items: flex-end; gap: 1px; padding: 12px; margin-top: 12px; border: 1px solid var(--border); border-radius: 14px; background: rgba(0, 0, 0, .18); overflow-x: auto; }}
+.reliability-bar {{ width: 2px; min-width: 2px; height: 26px; border-radius: 1px; }}
+.reliability-bar.up {{ background: #44d27f; }}
+.reliability-bar.down {{ background: #ff6b6b; }}
+.outage-table {{ margin-top: 14px; }}
 table {{ width: 100%; border-collapse: collapse; margin-top: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }}
 th, td {{ padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: left; }}
 th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
@@ -1119,6 +1408,7 @@ button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--
 <div class='muted'>{self._escape(session.username)} · {self._escape(session.role)}</div>
 <nav>
 <a href='/dashboard'>Overview</a>
+<a href='/system-health'>Health</a>
 <a href='/users'>Users</a>
 <a href='/moderation'>Moderation</a>
 		<a href='/commands'>Commands</a>
