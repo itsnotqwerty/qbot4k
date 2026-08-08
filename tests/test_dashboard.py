@@ -573,6 +573,9 @@ class DashboardTests(unittest.TestCase):
 
 		self.assertIn("viewer_two", body)
 		self.assertIn("this is my latest message", body)
+		self.assertIn("Profile summary", body)
+		self.assertIn("Reputation", body)
+		self.assertIn(">501</div>", body)
 
 	def test_user_detail_page_resolves_discord_channel_name(self) -> None:
 		connector = DiscordConnector(self.database_path)

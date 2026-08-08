@@ -735,6 +735,10 @@ class DashboardApp:
 			+ "</div></section>"
 			+ "<p><a href='/users'>&larr; Back to users</a></p>"
 			+ "<section class='card'>"
+			+ "<h2>Profile summary</h2>"
+			+ f"<div class='grid'><div class='metric'><div class='label'>Reputation</div><div class='value'>{selected_user.current_reputation_score}</div></div><div class='metric'><div class='label'>Power User</div><div class='value'>{'yes' if selected_user.candidate_flag else 'no'}</div></div><div class='metric'><div class='label'>Accounts</div><div class='value'>{selected_user.account_count}</div></div><div class='metric'><div class='label'>Messages</div><div class='value'>{selected_user.message_count}</div></div></div>"
+			+ "</section>"
+			+ "<section class='card'>"
 			+ "<h2>Moderation status</h2>"
 			+ moderation_notice
 			+ f"<div class='grid'><div class='metric'><div class='label'>Open reviews</div><div class='value'>{moderation_status.open_reviews}</div></div><div class='metric'><div class='label'>Pending actions</div><div class='value'>{moderation_status.pending_actions}</div></div><div class='metric'><div class='label'>Completed actions</div><div class='value'>{moderation_status.completed_actions}</div></div><div class='metric'><div class='label'>Total actions</div><div class='value'>{moderation_status.recent_actions}</div></div></div>"
@@ -834,7 +838,7 @@ class DashboardApp:
 			"Moderation",
 			session,
 			"<section class='hero'><div><p class='eyebrow'>Moderation</p><h1>Review and action queue</h1><p class='lede'>Open cases and recent actions are surfaced here for operators.</p></div></section>"  # noqa: E501
-			+ f"<div class='columns'><section><h2>Open reviews</h2><table><thead><tr><th>ID</th><th>Target</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=5>No open reviews</td></tr>'}</tbody></table></section><section><h2>Recent actions</h2><table><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=5>No actions yet</td></tr>'}</tbody></table></section></div>"
+			+ f"<div class='columns'><section><h2>Open reviews</h2><table class='moderation-table'><thead><tr><th>ID</th><th>Target</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=5>No open reviews</td></tr>'}</tbody></table></section><section><h2>Recent actions</h2><table class='moderation-table'><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=5>No actions yet</td></tr>'}</tbody></table></section></div>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -857,7 +861,7 @@ class DashboardApp:
 			builtin_rows.append(
 				"<tr>"
 				+ f"<td><code>!{command_name}</code><input form='builtin-{command_name}' type='hidden' name='record_type' value='builtin'><input form='builtin-{command_name}' type='hidden' name='command_name' value='{command_name}'></td>"
-				+ f"<td><input form='builtin-{command_name}' name='title' value='{self._escape(row[1])}' required></td>"
+				+ f"<td><input class='builtin-title-input' form='builtin-{command_name}' name='title' value='{self._escape(row[1])}' required></td>"
 				+ f"<td><textarea form='builtin-{command_name}' name='description_template' rows='3' required>{self._escape(row[2])}</textarea></td>"
 				+ f"<td><textarea form='builtin-{command_name}' name='footer_template' rows='3' placeholder='{{platform}} user: {{author_username}}'>{self._escape(row[3] or '')}</textarea></td>"
 				+ f"<td><label class='checkbox'><input form='builtin-{command_name}' type='checkbox' name='enabled' value='1' {enabled_checked}> Enabled</label></td>"
@@ -886,7 +890,7 @@ class DashboardApp:
 			+ status_html
 			+ "</div></section>"
 			+ self._render_template_info_dialog()
-			+ "<section class='card'><h2>Built-Ins</h2><p class='muted'>Builtins are the commands that ship with the bot.</p><table><thead><tr><th>Command</th><th>Title</th><th>Description template</th><th>Footer template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
+			+ "<section class='card'><h2>Built-Ins</h2><p class='muted'>Builtins are the commands that ship with the bot.</p><table class='builtin-commands-table'><thead><tr><th>Command</th><th>Title</th><th>Description template</th><th>Footer template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
 			+ ("".join(builtin_rows) or "<tr><td colspan='6'>No builtin commands found</td></tr>")
 			+ "</tbody></table></section>"
 			+ "<section class='card'><h2>Plaintext Commands</h2><p class='muted'>Insert quick text replies or update existing simple commands.</p><form id='simple-new' method='post' action='/commands' class='new-command-form'><input type='hidden' name='record_type' value='simple'><input class='new-command-name' name='command_name' placeholder='Command name (without !) e.g. website' required><input class='new-command-response' name='response_template' placeholder='Plain text response with {display_name}' required><label class='checkbox new-command-enabled'><input type='checkbox' name='enabled' value='1' checked> Enabled</label><button type='submit'>New Command</button></form><table><thead><tr><th>Command</th><th>Response template</th><th>Status</th><th>Action</th></tr></thead><tbody>"
@@ -1345,7 +1349,7 @@ a {{ color: var(--accent); text-decoration: none; }}
 .brand {{ font-size: 20px; font-weight: 800; letter-spacing: .04em; margin-bottom: 24px; }}
 .nav a {{ display: block; padding: 10px 12px; border-radius: 12px; color: var(--text); margin-bottom: 6px; background: transparent; }}
 .nav a:hover {{ background: var(--panel-2); }}
-.main {{ padding: 28px; }}
+.main {{ padding: 28px; min-width: 0; overflow-x: hidden; }}
 .hero, .card {{ background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,0)), var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 22px; box-shadow: 0 20px 60px rgba(0,0,0,.25); }}
 .hero {{ margin-bottom: 18px; }}
 .eyebrow {{ text-transform: uppercase; letter-spacing: .18em; color: var(--accent); font-size: 11px; margin: 0 0 10px; }}
@@ -1367,13 +1371,13 @@ h1, h2 {{ margin: 0 0 10px; }}
 .reliability-bar.up {{ background: #44d27f; }}
 .reliability-bar.down {{ background: #ff6b6b; }}
 .outage-table {{ margin-top: 14px; }}
-table {{ width: 100%; border-collapse: collapse; margin-top: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; }}
+table {{ width: 100%; max-width: 100%; border-collapse: collapse; margin-top: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: 18px; overflow: hidden; display: block; overflow-x: auto; }}
 th, td {{ padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: left; }}
 th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
-form.search {{ display: flex; gap: 10px; margin: 18px 0; }}
-input {{ flex: 1; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
-textarea {{ width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); resize: vertical; }}
-select {{ padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
+form.search {{ display: flex; gap: 10px; margin: 18px 0; flex-wrap: wrap; }}
+input {{ flex: 1; min-width: 0; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); max-width: 100%; }}
+textarea {{ width: 100%; min-width: 0; max-width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); resize: vertical; }}
+select {{ min-width: 0; max-width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
 button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--accent); color: #041014; font-weight: 700; }}
 .columns {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
 .sticky-link-panel {{ position: sticky; top: 12px; z-index: 5; margin-bottom: 18px; }}
@@ -1387,6 +1391,10 @@ button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--
 .template-dialog table {{ margin-top: 16px; }}
 .template-dialog code {{ color: var(--accent); }}
 .command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 100%; }}
+.command-page .builtin-commands-table {{ min-width: 0; }}
+.command-page .builtin-commands-table th:nth-child(2), .command-page .builtin-commands-table td:nth-child(2) {{ min-width: 180px; width: 18%; }}
+.command-page .builtin-commands-table th:nth-child(3), .command-page .builtin-commands-table td:nth-child(3), .command-page .builtin-commands-table th:nth-child(4), .command-page .builtin-commands-table td:nth-child(4) {{ min-width: 220px; }}
+.command-page .builtin-title-input {{ min-width: 180px; width: 100%; }}
 .command-page .new-command-form {{ display: flex; align-items: center; gap: 12px; margin: 14px 0 10px; }}
 .command-page .new-command-form .new-command-name {{ flex: 1 1 240px; min-width: 210px; }}
 .command-page .new-command-form .new-command-response {{ flex: 2 1 380px; min-width: 260px; }}
@@ -1398,7 +1406,10 @@ button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--
 .command-page .row-actions form {{ margin: 0; }}
 .command-page .insert-row td {{ background: rgba(120,220,202,.04); }}
 .command-page .insert-row code {{ color: var(--accent); }}
-@media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ border-right: 0; border-bottom: 1px solid var(--border); }} .columns {{ grid-template-columns: 1fr; }} .command-page .new-command-form {{ flex-wrap: wrap; }} .command-page .new-command-form button {{ width: 100%; }} }}
+.moderation-table th, .moderation-table td {{ white-space: normal; overflow-wrap: anywhere; word-break: break-word; }}
+@media (max-width: 1100px) {{ .command-page .new-command-form {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }} .command-page .new-command-form > * {{ width: 100%; min-width: 0; }} .command-page .new-command-form .new-command-enabled {{ margin-left: 0; margin-right: 0; }} .command-page .new-command-form button {{ width: 100%; }} }}
+@media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ border-right: 0; border-bottom: 1px solid var(--border); }} .columns {{ grid-template-columns: 1fr; }} .sticky-link-panel {{ position: static; }} }}
+@media (max-width: 700px) {{ body {{ font-size: 14px; }} .main {{ padding: 16px; }} .nav {{ padding: 18px 14px; }} .hero, .card {{ padding: 16px; border-radius: 16px; }} .grid {{ grid-template-columns: 1fr; }} .toolbar, .status-row, form.search, .command-page .new-command-form, .command-page .row-actions {{ align-items: stretch; }} form.search > *, .toolbar > *, .command-page .new-command-form > *, .command-page .row-actions > * {{ width: 100%; }} button {{ width: 100%; }} .metric .value {{ font-size: 24px; }} th, td {{ padding: 10px 12px; white-space: nowrap; }} .moderation-table th, .moderation-table td {{ white-space: normal; }} .command-page .new-command-form .new-command-name, .command-page .new-command-form .new-command-response {{ min-width: 0; }} .command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 0; width: 100%; }} .template-dialog {{ width: calc(100vw - 16px); }} .template-dialog-inner {{ padding: 16px; }} }}
 </style>
 </head>
 <body>

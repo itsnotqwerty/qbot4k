@@ -19,6 +19,7 @@ from .db import (
 	update_twitch_channel_status,
 	upsert_twitch_channel,
 )
+from .intelligence.powerusers import apply_reputation_event, score_delta_for_moderation
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
@@ -150,7 +151,7 @@ class TwitchConnector:
 		self._active_irc_token: str | None = None
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.twitch")
-		self._streamboo_term_pattern = re.compile(r"(?<!\\w)viewers(?!\\w)", re.IGNORECASE)
+		self._streamboo_term_pattern = re.compile(r"(?<!\\w)viewers?(?!\\w)", re.IGNORECASE)
 		self._stop_event = threading.Event()
 		self._active_socket: ssl.SSLSocket | None = None
 
@@ -431,6 +432,10 @@ class TwitchConnector:
 			action_type="timeout",
 			reason=reason,
 		)
+		self._apply_streamboo_penalty(
+			target_platform_account_id=result.platform_account_id,
+			message_id=result.message_id,
+		)
 		self._logger.warning(
 			"auto-moderated twitch message channel=%s user=%s reason=%s",
 			channel_name,
@@ -463,6 +468,37 @@ class TwitchConnector:
 				action_type=action_type,
 				reason=reason,
 				status="completed",
+			)
+		finally:
+			connection.close()
+
+	def _apply_streamboo_penalty(
+		self,
+		*,
+		target_platform_account_id: int,
+		message_id: int,
+	) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			user_row = connection.execute(
+				"SELECT user_id FROM platform_accounts WHERE id = ?",
+				(target_platform_account_id,),
+			).fetchone()
+			if user_row is None or user_row[0] is None:
+				return
+			delta, penalty_reason = score_delta_for_moderation(
+				severity="high",
+				action_type="timeout",
+				reason_code="streamboo_viewer_spam",
+			)
+			apply_reputation_event(
+				connection,
+				user_id=int(user_row[0]),
+				delta=delta,
+				reason_code=penalty_reason,
+				source_type="moderation",
+				source_id=message_id,
 			)
 		finally:
 			connection.close()

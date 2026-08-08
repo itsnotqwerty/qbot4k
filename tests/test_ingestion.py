@@ -1210,6 +1210,7 @@ class IngestionTests(unittest.TestCase):
         connector = TwitchConnector(self.database_path)
 
         self.assertTrue(connector._contains_streamboo_viewer_spam("Get viewers from streamboo now"))
+        self.assertTrue(connector._contains_streamboo_viewer_spam("Get viewer from streamboo now"))
         self.assertFalse(connector._contains_streamboo_viewer_spam("Get viewers now"))
         self.assertFalse(connector._contains_streamboo_viewer_spam("streamboo is bad"))
 
@@ -1256,6 +1257,72 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(action_row[2], "timeout")
         self.assertEqual(action_row[3], "streamboo_viewer_spam")
         self.assertEqual(action_row[4], "completed")
+
+    def test_streamboo_auto_moderation_applies_reputation_penalty(self) -> None:
+        connector = TwitchConnector(self.database_path)
+
+        result = connector.ingest_message(
+            {
+                "message_id": "twitch-msg-streamboo-2",
+                "timestamp": "2026-08-06T05:31:00Z",
+                "channel": "its_not_qwerty",
+                "content": "buy viewer from streamboo",
+                "user_id": "viewer-streamboo-2",
+                "username": "spam_viewer_two",
+            }
+        )
+        self.assertEqual(result.status, "persisted")
+        assert result.message_id is not None
+        assert result.platform_account_id is not None
+
+        class _FakeIrcSocket:
+            def __init__(self) -> None:
+                self.lines: list[bytes] = []
+
+            def sendall(self, payload: bytes) -> None:
+                self.lines.append(payload)
+
+        fake_socket = _FakeIrcSocket()
+        connector._maybe_auto_moderate_streamboo_viewer_spam(
+            fake_socket,
+            {
+                "channel": "its_not_qwerty",
+                "content": "buy viewer from streamboo",
+                "user_id": "viewer-streamboo-2",
+                "username": "spam_viewer_two",
+                "display_name": "spam_viewer_two",
+                "is_moderator": False,
+            },
+            result,
+        )
+
+        self.assertTrue(fake_socket.lines)
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            user_row = connection.execute(
+                "SELECT id, current_reputation_score FROM users WHERE primary_display_name = 'spam_viewer_two'"
+            ).fetchone()
+            self.assertIsNotNone(user_row)
+            penalty_row = connection.execute(
+                """
+                SELECT delta, reason_code, source_type, source_id
+                FROM reputation_events
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(user_row[0]),),
+            ).fetchone()
+        finally:
+            connection.close()
+
+        self.assertEqual(int(user_row[1]), 431)
+        self.assertEqual(int(penalty_row[0]), -70)
+        self.assertEqual(str(penalty_row[1]), "moderation_penalty")
+        self.assertEqual(str(penalty_row[2]), "moderation")
+        self.assertEqual(int(penalty_row[3]), result.message_id)
 
 
 if __name__ == "__main__":
