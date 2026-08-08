@@ -17,7 +17,7 @@ from .models import IngestionResult, NormalizedMessage
 from .moderation import ModerationFinding, ModerationRule, evaluate_egregious_content, evaluate_message_moderation
 
 BUILTIN_EGREGIOUS_RULE_NAME = "builtin:egregious_content"
-RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom"}
+RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom", "alias"}
 WELCOME_DUPLICATE_WINDOW_MINUTES = 10
 WELCOME_BONUS_DELTA = 1
 WELCOME_DUPLICATE_PENALTY_DELTA = -3
@@ -366,7 +366,7 @@ def list_simple_command_definitions(connection: sqlite3.Connection) -> list[sqli
         """
         SELECT command_name, response_template, enabled, created_at, updated_at
         FROM simple_command_definitions
-        WHERE command_name NOT IN ('addcom', 'delcom', 'editcom')
+        WHERE command_name NOT IN ('addcom', 'delcom', 'editcom', 'alias')
         ORDER BY command_name
         """
     ).fetchall()
@@ -731,6 +731,7 @@ def persist_normalized_message(
                     penalty_delta, penalty_reason = score_delta_for_moderation(
                         severity=finding.severity,
                         action_type=finding.auto_enforce_action,
+                        reason_code=finding.reason_code,
                     )
                     apply_reputation_event(
                         connection,
@@ -754,6 +755,7 @@ def persist_normalized_message(
                         penalty_delta, penalty_reason = score_delta_for_moderation(
                             severity=finding.severity,
                             action_type=finding.auto_enforce_action,
+                            reason_code=finding.reason_code,
                         )
                         apply_reputation_event(
                             connection,

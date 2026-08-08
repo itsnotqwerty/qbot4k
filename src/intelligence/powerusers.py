@@ -268,7 +268,16 @@ def is_egregious_content(content: str) -> bool:
 	)
 
 
-def score_delta_for_moderation(*, severity: str, action_type: str | None = None) -> tuple[int, str]:
+def score_delta_for_moderation(
+	*,
+	severity: str,
+	action_type: str | None = None,
+	reason_code: str | None = None,
+) -> tuple[int, str]:
+	reason_key = (reason_code or "").casefold().strip()
+	if reason_key == "egregious_term":
+		return (-20, "moderation_penalty")
+
 	severity_key = severity.casefold().strip()
 	base_delta = {
 		"low": -20,

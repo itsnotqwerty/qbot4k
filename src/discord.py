@@ -210,6 +210,7 @@ class DiscordConnector:
 		self._command_registry = command_registry or build_default_command_registry()
 		self._last_status = "idle"
 		self._guild_filter_warned_guilds: set[str] = set()
+		self._modlogs_channel_id_cache: dict[str, str | None] = {}
 		self._logger = logging.getLogger("qbot4k.discord")
 		self._stop_event = threading.Event()
 		self._active_websocket: WebSocket | None = None
@@ -326,6 +327,14 @@ class DiscordConnector:
 							reason,
 						)
 						mark_moderation_action_completed(connection, action_id)
+						self._log_moderation_event_to_modlogs(
+							guild_id=guild_id,
+							normalized=normalized,
+							message_id=result.message_id,
+							action_type=action_type,
+							reason=reason,
+							outcome="skipped_moderator",
+						)
 						continue
 					if guild_id:
 						self._timeout_discord_member(
@@ -334,10 +343,26 @@ class DiscordConnector:
 							reason=reason,
 						)
 						mark_moderation_action_completed(connection, action_id)
+						self._log_moderation_event_to_modlogs(
+							guild_id=guild_id,
+							normalized=normalized,
+							message_id=result.message_id,
+							action_type=action_type,
+							reason=reason,
+							outcome="completed",
+						)
 					else:
 						self._logger.warning(
 							"discord timeout skipped for message=%s because guild_id is missing",
 							result.message_id,
+						)
+						self._log_moderation_event_to_modlogs(
+							guild_id=guild_id,
+							normalized=normalized,
+							message_id=result.message_id,
+							action_type=action_type,
+							reason=reason,
+							outcome="skipped_missing_guild",
 						)
 				elif action_type == "ban":
 					if platform_message_id:
@@ -349,10 +374,26 @@ class DiscordConnector:
 							reason=reason,
 						)
 						mark_moderation_action_completed(connection, action_id)
+						self._log_moderation_event_to_modlogs(
+							guild_id=guild_id,
+							normalized=normalized,
+							message_id=result.message_id,
+							action_type=action_type,
+							reason=reason,
+							outcome="completed",
+						)
 					else:
 						self._logger.warning(
 							"discord ban skipped for message=%s because guild_id is missing",
 							result.message_id,
+						)
+						self._log_moderation_event_to_modlogs(
+							guild_id=guild_id,
+							normalized=normalized,
+							message_id=result.message_id,
+							action_type=action_type,
+							reason=reason,
+							outcome="skipped_missing_guild",
 						)
 				elif action_type == "warn":
 					self._logger.info(
@@ -361,11 +402,27 @@ class DiscordConnector:
 						result.message_id,
 						reason,
 					)
+					self._log_moderation_event_to_modlogs(
+						guild_id=guild_id,
+						normalized=normalized,
+						message_id=result.message_id,
+						action_type=action_type,
+						reason=reason,
+						outcome="recorded",
+					)
 				else:
 					self._logger.warning(
 						"discord moderation action not executed for unsupported type=%s message=%s",
 						action_type,
 						result.message_id,
+					)
+					self._log_moderation_event_to_modlogs(
+						guild_id=guild_id,
+						normalized=normalized,
+						message_id=result.message_id,
+						action_type=action_type,
+						reason=reason,
+						outcome="unsupported",
 					)
 			except Exception as exc:
 				self._logger.exception(
@@ -375,6 +432,100 @@ class DiscordConnector:
 					result.message_id,
 					exc,
 				)
+				self._log_moderation_event_to_modlogs(
+					guild_id=guild_id,
+					normalized=normalized,
+					message_id=result.message_id,
+					action_type=action_type,
+					reason=reason,
+					outcome="failed",
+					error_message=str(exc),
+				)
+
+	def _log_moderation_event_to_modlogs(
+		self,
+		*,
+		guild_id: str,
+		normalized: NormalizedMessage,
+		message_id: int | None,
+		action_type: str,
+		reason: str,
+		outcome: str,
+		error_message: str | None = None,
+	) -> None:
+		if not guild_id:
+			return
+		channel_id = self._resolve_modlogs_channel_id(guild_id)
+		if not channel_id:
+			return
+
+		message_reference = normalized.platform_message_id or (str(message_id) if message_id is not None else "unknown")
+		embed = {
+			"title": "Moderation Event",
+			"color": 15158332 if outcome in {"completed", "failed"} else 15844367,
+			"fields": [
+				{"name": "Action", "value": action_type[:1024] or "unknown", "inline": True},
+				{"name": "Outcome", "value": outcome[:1024] or "unknown", "inline": True},
+				{"name": "Reason", "value": reason[:1024] or "unspecified", "inline": False},
+				{
+					"name": "User",
+					"value": f"{normalized.username} ({normalized.platform_user_id})"[:1024],
+					"inline": True,
+				},
+				{"name": "Channel", "value": f"<#{normalized.channel_id}>"[:1024], "inline": True},
+				{"name": "Message", "value": message_reference[:1024], "inline": True},
+			],
+			"timestamp": datetime.now(timezone.utc).isoformat(),
+		}
+		if error_message:
+			embed["fields"].append(
+				{
+					"name": "Error",
+					"value": error_message[:1024],
+					"inline": False,
+				}
+			)
+
+		try:
+			self._send_discord_message(channel_id, {"embeds": [embed]})
+		except Exception as exc:
+			self._logger.warning(
+				"discord modlogs embed send failed guild=%s channel=%s action=%s outcome=%s: %s",
+				guild_id,
+				channel_id,
+				action_type,
+				outcome,
+				exc,
+			)
+
+	def _resolve_modlogs_channel_id(self, guild_id: str) -> str | None:
+		guild_key = guild_id.strip()
+		if not guild_key:
+			return None
+		if guild_key in self._modlogs_channel_id_cache:
+			return self._modlogs_channel_id_cache[guild_key]
+
+		channel_id: str | None = None
+		try:
+			response = self._discord_api_request("GET", f"/guilds/{guild_key}/channels")
+			if isinstance(response, list):
+				for channel in response:
+					if not isinstance(channel, Mapping):
+						continue
+					name = str(channel.get("name") or "").strip().casefold()
+					raw_channel_type = channel.get("type")
+					channel_type = int(raw_channel_type) if raw_channel_type is not None else -1
+					if name != "modlogs" or channel_type not in {0, 5}:
+						continue
+					candidate_id = str(channel.get("id") or "").strip()
+					if candidate_id:
+						channel_id = candidate_id
+						break
+		except Exception as exc:
+			self._logger.warning("discord modlogs channel lookup failed guild=%s: %s", guild_key, exc)
+
+		self._modlogs_channel_id_cache[guild_key] = channel_id
+		return channel_id
 
 	def _maybe_record_server_boost_request(
 		self,

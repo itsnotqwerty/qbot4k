@@ -10,28 +10,28 @@ It provides:
 - Canonical user profiles with cross-platform account linking
 - Reputation scoring and power-user flagging
 - Maintenance jobs for retention, rollups, and backups
+- Twitch live announcement delivery into Discord
 - A server-rendered dashboard with Discord OAuth login
 
 ## Current Project Status
 
 The current codebase is a working foundation and integration slice:
 
-- Core CLI, config validation, database schema, connectors, dashboard routes, and maintenance jobs are implemented.
-- Unit and integration tests exist across foundation, ingestion, identity, jobs, and dashboard auth/UI flows.
-- The test suite currently passes:
-
-	Ran 42 tests in about 5 seconds, result: OK
+- Core CLI, config validation, database schema, connectors, dashboard routes, and background jobs are implemented.
+- Unit and integration tests exist across foundation, ingestion, identity, jobs, commands, and dashboard auth/UI flows.
+- The repository currently includes 100 test methods under tests/.
 
 ## Repository Layout
 
 - src/__main__.py: CLI bootstrap and runtime orchestration
 - src/config.py: Environment loading and validation
-- src/db.py: SQLite schema, ingestion persistence, moderation recording, helper queries
-- src/discord.py: Discord gateway connector and message normalization
-- src/twitch.py: Twitch IRC connector, parsing, and join workflow
+- src/db.py: SQLite schema, ingestion persistence, moderation recording, command storage, helper queries
+- src/commands.py: Command parsing, reply rendering, template expansion, command management
+- src/discord.py: Discord gateway connector, message normalization, boost reward flow, moderation execution
+- src/twitch.py: Twitch IRC connector, parsing, join workflow, spam auto-timeout
 - src/moderation.py: Moderation rule evaluation
 - src/health.py: Health server and route dispatch to dashboard
-- src/jobs.py: Retention cleanup, metrics rollups, and backup generation
+- src/jobs.py: Retention cleanup, metrics rollups, backups, and Twitch live announcement jobs
 - src/intelligence/userprofiles.py: Canonical user linking and notes
 - src/intelligence/powerusers.py: Reputation and score update logic
 - src/dashboard/: Server-rendered dashboard and JSON APIs
@@ -90,9 +90,12 @@ QBOT_TWITCH_CLIENT_ID=
 QBOT_TWITCH_CLIENT_SECRET=
 
 # Discord options
+# Required when jobs+twitch+discord are all enabled
 QBOT_DISCORD_GUILD_IDS=
 # Required only when discord service is enabled
 QBOT_DISCORD_BOT_TOKEN=
+# Optional: allow bot-authored Discord messages to be ingested
+QBOT_DISCORD_ALLOW_BOT_MESSAGES=false
 
 # Retention settings (days)
 QBOT_MESSAGE_RETENTION_DAYS=90
@@ -155,7 +158,8 @@ QBot4K supports these service flags in QBOT_ENABLED_SERVICES:
 Behavior details:
 
 - web starts the health server and dashboard routes
-- jobs runs maintenance once at startup and then every 5 minutes
+- jobs runs maintenance once at startup and then every 300 seconds
+- jobs also runs Twitch live announcement checks when both discord and twitch services are enabled
 - twitch launches Twitch IRC connector loop
 - discord launches Discord gateway connector loop
 
@@ -173,6 +177,15 @@ HTML routes:
 - /commands
 - /login
 - /oauth/discord/callback
+- /auth/discord/callback
+
+POST routes:
+
+- /logout
+- /dashboard/go-live
+- /users/link
+- /users/{user_id}/moderation
+- /commands
 
 JSON routes:
 
@@ -191,11 +204,33 @@ Auth model:
 - Role assignment is based on configured operator guild IDs and guild permissions.
 - QBOT_OPERATOR_GUILD_IDS must be configured when the web service is enabled; users outside those guilds are denied access.
 
-Command templates:
+## Commands and Templating
 
-- /commands lets admins edit shared command templates used by both Discord and Twitch.
-- The built-in `credit` command stores its title and message templates in SQLite.
-- Discord renders the response as an embed, while Twitch renders the same command as plaintext.
+QBot4K supports two command families:
+
+- Structured command definitions (for example, credit) stored in command_definitions
+- Simple command definitions stored in simple_command_definitions
+
+Built-in management commands:
+
+- !addcom !name response
+- !editcom !name response
+- !delcom !name
+- !alias !newcommand !oldcommand
+
+Notes:
+
+- Command editing is restricted to dashboard operators.
+- Discord renders structured command output as embeds and simple command output as plaintext content.
+- Twitch renders command output as plaintext.
+
+Template capabilities:
+
+- Standard placeholders such as {display_name}, {author_username}, {platform}, {query}, {score}, {power_user}
+- Random number ranges with {min..max} and query-driven bounds via {query}
+- HTTP calls inside templates with syntax {GET}(url) or {POST}(url)
+- Optional JSON selectors in brackets, including alias mapping for extracted values
+- Per-render request caching for repeated identical HTTP calls
 
 ## Ingestion and Moderation
 
@@ -204,6 +239,7 @@ Command templates:
 - Discord and Twitch messages are normalized and persisted into messages.
 - Platform accounts are upserted in platform_accounts.
 - Each platform account is auto-linked to a canonical user on first message.
+- Discord message attachments are persisted in message_attachments.
 
 ### Moderation Rules
 
@@ -213,6 +249,7 @@ Supported rule types:
 - banned_phrase
 - link_restriction
 - duplicate_message (same_user_same_content pattern)
+- builtin egregious content rule
 
 Result behavior:
 
@@ -227,30 +264,66 @@ Result behavior:
 - Moderation findings apply additional penalties.
 - Candidate flag is updated when score reaches threshold.
 
-Note:
+Current behavior note:
 
-- The current implementation pins specific handles (apollyon, its_not_qwerty) to max score.
+- The implementation enforces fixed high scores for specific handles through power-user logic.
 
-## Twitch Join Workflow
+## Twitch Integration
+
+### Join Workflow
 
 When a message equal to !join is posted in QBOT_TWITCH_JOIN_COMMAND_CHANNEL:
 
-- The sender username is stored as a requested twitch channel in twitch_channels.
+- The sender username is stored as a requested Twitch channel in twitch_channels.
 - On active IRC runtime join, channel status can transition to active.
 
 Bootstrap channels from QBOT_TWITCH_CHANNELS are seeded as active entries.
 
-## Maintenance Jobs
+### Streamboo Viewer Spam Auto-Moderation
+
+For persisted non-moderator Twitch messages, if content contains both:
+
+- streamboo
+- viewers
+
+QBot4K sends a 600-second timeout command and records a completed moderation action with reason streamboo_viewer_spam.
+
+## Discord Integration
+
+### Server Boost Rewards
+
+QBot4K tracks server bump requests and fulfillment:
+
+- A user bump command request is recorded as pending in server_boost_requests.
+- A matching bump success bot message rewards the pending requester.
+- Reward completion updates status and contributes reputation via the standard event pipeline.
+
+## Maintenance and Background Jobs
+
+### Maintenance Run
 
 Each maintenance run performs:
 
 - Message retention purge using QBOT_MESSAGE_RETENTION_DAYS
 - Audit-log retention purge using QBOT_AUDIT_RETENTION_DAYS
 - Metrics rollup refresh for:
-	- messages_total
-	- open_reviews
-	- pending_actions
+  - messages_total
+  - open_reviews
+  - pending_actions
 - SQLite backup creation in QBOT_BACKUP_DIR with JSON metadata and SHA-256
+
+### Twitch Live Announcements
+
+The live announcement job:
+
+- Requires both Discord and Twitch bot tokens.
+- Resolves target Discord guild IDs from configured IDs plus bot-discovered guilds.
+- Fetches active stream state for its_not_qwerty via Twitch Helix.
+- Picks the best Discord channel using stream-title and game-name token overlap with fallback channel names.
+- Sends @here live notifications into Discord.
+- Deduplicates automatic announcements per stream and guild using twitch_live_announcements.
+- Supports manual dashboard-triggered announcements via POST /dashboard/go-live.
+- Attempts Twitch token refresh when credentials are configured.
 
 ## Database
 
@@ -260,6 +333,8 @@ SQLite is initialized with WAL mode and includes tables for:
 - platform_accounts
 - operator_accounts
 - messages
+- message_attachments
+- welcome_events
 - twitch_channels
 - moderation_rules
 - rule_matches
@@ -267,6 +342,11 @@ SQLite is initialized with WAL mode and includes tables for:
 - reputation_events
 - user_notes
 - review_queue
+- server_boost_requests
+- command_definitions
+- simple_command_definitions
+- discord_channels
+- twitch_live_announcements
 - audit_log
 - metrics_rollups
 
@@ -284,6 +364,8 @@ python -m unittest discover -s tests -p 'test_*.py'
 
 - Keep secrets in local environment variables or a local .env file that is not committed.
 - Enable only the services needed for local workflows.
+- When jobs+twitch+discord are enabled together, QBOT_DISCORD_GUILD_IDS is required.
+- Twitch OAuth refresh support requires QBOT_TWITCH_REFRESH_TOKEN, QBOT_TWITCH_CLIENT_ID, and QBOT_TWITCH_CLIENT_SECRET.
 - For local dashboard exposure (for OAuth callback testing), you can tunnel port 8080 with tools like ngrok.
 
 ## Documentation

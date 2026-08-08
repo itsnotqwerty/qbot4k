@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -543,7 +544,7 @@ class IngestionTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertLess(score, 450)
+        self.assertEqual(score, 470)
         self.assertIsNotNone(match_row)
         self.assertEqual(match_row[0], "egregious_term")
         self.assertEqual(match_row[1], "egregious_term")
@@ -598,6 +599,65 @@ class IngestionTests(unittest.TestCase):
         self.assertIn(("PATCH", "https://discord.com/api/v10/guilds/guild-1/members/user-egregious-exec"), observed_requests)
         self.assertEqual(action_row[0], "timeout")
         self.assertEqual(action_row[1], "completed")
+
+    def test_egregious_discord_messages_log_embed_to_modlogs_when_available(self) -> None:
+        connector = DiscordConnector(self.database_path, bot_token="discord-bot-token")
+
+        class _FakeResponse:
+            def __init__(self, body: str) -> None:
+                self._body = body.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._body
+
+        observed_requests: list[tuple[str, str, str | None]] = []
+
+        def _fake_urlopen(request, timeout=15):
+            body = request.data.decode("utf-8") if request.data is not None else None
+            observed_requests.append((request.method, request.full_url, body))
+            if request.method == "GET" and request.full_url.endswith("/guilds/guild-1/channels"):
+                return _FakeResponse('[{"id":"modlogs-1","name":"modlogs","type":0}]')
+            return _FakeResponse("{}")
+
+        with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
+            connector.ingest_message(
+                {
+                    "id": "discord-msg-egregious-modlogs",
+                    "timestamp": "2026-08-06T05:03:45Z",
+                    "channel_id": "channel-1",
+                    "guild_id": "guild-1",
+                    "content": "you are a nazi",
+                    "author": {
+                        "id": "user-egregious-modlogs",
+                        "username": "modlog_target",
+                        "bot": False,
+                    },
+                }
+            )
+
+        self.assertIn(("GET", "https://discord.com/api/v10/guilds/guild-1/channels", None), observed_requests)
+
+        modlog_posts = [
+            req
+            for req in observed_requests
+            if req[0] == "POST" and req[1] == "https://discord.com/api/v10/channels/modlogs-1/messages"
+        ]
+        self.assertEqual(len(modlog_posts), 1)
+
+        modlog_payload = json.loads(modlog_posts[0][2] or "{}")
+        self.assertIn("embeds", modlog_payload)
+        self.assertEqual(len(modlog_payload["embeds"]), 1)
+        self.assertEqual(modlog_payload["embeds"][0]["title"], "Moderation Event")
+        field_names = {field["name"] for field in modlog_payload["embeds"][0].get("fields", [])}
+        self.assertIn("Action", field_names)
+        self.assertIn("Reason", field_names)
+        self.assertIn("Outcome", field_names)
 
     def test_egregious_discord_moderator_skips_timeout_but_deletes_message(self) -> None:
         connector = DiscordConnector(self.database_path, bot_token="discord-bot-token")

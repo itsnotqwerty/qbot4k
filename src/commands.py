@@ -22,7 +22,7 @@ from .db import (
 from .intelligence.userprofiles import get_canonical_user_profile_for_platform_account
 
 
-RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom"}
+RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom", "alias"}
 _HTTP_TEMPLATE_CALL_PATTERN = re.compile(
 	r"\{(GET|POST|PUT|DELETE)\}\((https?://[^\s)]+)\)(?:\[([^\]]+)\])?",
 	re.IGNORECASE,
@@ -127,6 +127,8 @@ def _resolve_command_reply(context: CommandContext) -> CommandReply | None:
 		return _editcom_command(context)
 	if command_name == "delcom":
 		return _delcom_command(context)
+	if command_name == "alias":
+		return _alias_command(context)
 	if command_name == "credit":
 		return _credit_command(context)
 	simple_definition = get_simple_command_definition(context.connection, command_name)
@@ -211,6 +213,45 @@ def _delcom_command(context: CommandContext) -> CommandReply:
 		f"Deleted !{command_name}",
 		field_name="Command",
 		field_value=f"!{command_name}",
+	)
+
+
+def _alias_command(context: CommandContext) -> CommandReply:
+	if not _can_edit_commands(context):
+		return _command_editing_denied_reply("alias")
+	if len(context.command_args) != 2:
+		return _command_usage_reply("alias", "Usage: !alias !newcommand !oldcommand")
+
+	new_command_name = _normalize_custom_command_name(context.command_args[0])
+	source_command_name = _normalize_custom_command_name(context.command_args[1])
+	if not new_command_name or not source_command_name:
+		return _command_usage_reply("alias", "Usage: !alias !newcommand !oldcommand")
+
+	if get_simple_command_definition(context.connection, new_command_name) is not None:
+		return _command_result_reply(
+			"!alias",
+			f"!{new_command_name} already exists. Use !editcom to update it.",
+		)
+
+	source_definition = get_simple_command_definition(context.connection, source_command_name)
+	if source_definition is None:
+		return _command_result_reply(
+			"!alias",
+			f"!{source_command_name} does not exist.",
+		)
+
+	upsert_simple_command_definition(
+		context.connection,
+		command_name=new_command_name,
+		response_template=str(source_definition[1]),
+		enabled=bool(source_definition[2]),
+	)
+
+	return _command_result_reply(
+		"!alias",
+		f"Aliased !{new_command_name} to !{source_command_name}",
+		field_name="Response",
+		field_value=str(source_definition[1]),
 	)
 
 

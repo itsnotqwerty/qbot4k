@@ -920,6 +920,133 @@ class DiscordCommandTests(unittest.TestCase):
 		finally:
 			connection.close()
 
+	def test_alias_command_duplicates_existing_simple_command(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			user_id = create_canonical_user(connection, primary_display_name="sam")
+			ensure_platform_account(
+				connection,
+				platform="discord",
+				platform_user_id="discord-user-alias-1",
+				username="sam",
+				guild_or_channel_context="guild-1",
+			)
+			link_platform_account(
+				connection,
+				platform="discord",
+				platform_user_id="discord-user-alias-1",
+				user_id=user_id,
+			)
+			upsert_operator_account(
+				connection,
+				discord_user_id="discord-user-alias-1",
+				discord_username="sam",
+				role="admin",
+			)
+			ensure_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-alias-1",
+				username="sam",
+				guild_or_channel_context="its_not_qwerty",
+			)
+			link_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-alias-1",
+				user_id=user_id,
+			)
+			upsert_simple_command_definition(
+				connection,
+				command_name="website",
+				response_template="https://gatewaycorporate.org/",
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-alias-1",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-alias-1",
+				content="!alias !site !website",
+			)
+
+			reply = registry.dispatch("!alias !site !website", context)
+			self.assertIsNotNone(reply)
+			assert reply is not None
+			self.assertIn("Aliased !site to !website", render_command_reply(reply, "twitch"))
+
+			aliased_reply = registry.dispatch("!site", context)
+			self.assertIsNotNone(aliased_reply)
+			assert aliased_reply is not None
+			self.assertEqual(render_command_reply(aliased_reply, "twitch"), "https://gatewaycorporate.org/")
+		finally:
+			connection.close()
+
+	def test_alias_command_requires_existing_source_command(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			user_id = create_canonical_user(connection, primary_display_name="sam")
+			ensure_platform_account(
+				connection,
+				platform="discord",
+				platform_user_id="discord-user-alias-2",
+				username="sam",
+				guild_or_channel_context="guild-1",
+			)
+			link_platform_account(
+				connection,
+				platform="discord",
+				platform_user_id="discord-user-alias-2",
+				user_id=user_id,
+			)
+			upsert_operator_account(
+				connection,
+				discord_user_id="discord-user-alias-2",
+				discord_username="sam",
+				role="admin",
+			)
+			ensure_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-alias-2",
+				username="sam",
+				guild_or_channel_context="its_not_qwerty",
+			)
+			link_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-alias-2",
+				user_id=user_id,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-alias-2",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-alias-2",
+				content="!alias !site !missing",
+			)
+
+			reply = registry.dispatch("!alias !site !missing", context)
+			self.assertIsNotNone(reply)
+			assert reply is not None
+			self.assertIn("!missing does not exist.", render_command_reply(reply, "twitch"))
+		finally:
+			connection.close()
+
 
 if __name__ == "__main__":
 	unittest.main()
