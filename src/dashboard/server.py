@@ -867,10 +867,17 @@ class DashboardApp:
 			("query", "Everything after the command name, useful for API query parameters."),
 			("0..49", "Generates a random integer using an inclusive range, e.g. {0..49}."),
 			("0..{query}", "Uses a sanitized integer parsed from {query} as a range bound, e.g. {0..{query}}."),
-			("{GET}(url)[path.to.value]", "Performs an HTTP GET request and injects the JSON value at the path."),
-			("{POST}(url)[path.to.value]", "Performs an HTTP POST request and injects the JSON value at the path."),
-			("{PUT}(url)[path.to.value]", "Performs an HTTP PUT request and injects the JSON value at the path."),
-			("{DELETE}(url)[path.to.value]", "Performs an HTTP DELETE request and injects the JSON value at the path."),
+			(
+				"{METHOD}(url)[selectors]",
+				(
+					"Performs one HTTP request (GET/POST/PUT/DELETE) and supports either a single JSON path "
+					"or an alias map. Single-path example: {GET}(url)[totals.posts]. Alias-map examples: "
+					"{GET}(url)[posts:totals.posts,threads:totals.threads] or {GET}(url)[posts=totals.posts;threads=totals.threads]. "
+					"Aliased values are reused later in the template with {posts} and {threads}. Duplicate calls with "
+					"the same method+url are cached during one render. If the request or path lookup fails, aliased placeholders "
+					"remain unchanged so output degrades safely."
+				),
+			),
 		]
 		rows = "".join(
 			f"<tr><td><code>{self._escape(name if name.startswith('{') else '{' + name + '}')}</code></td><td>{self._escape(description)}</td></tr>"

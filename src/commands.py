@@ -27,6 +27,10 @@ _HTTP_TEMPLATE_CALL_PATTERN = re.compile(
 	r"\{(GET|POST|PUT|DELETE)\}\((https?://[^\s)]+)\)(?:\[([^\]]+)\])?",
 	re.IGNORECASE,
 )
+_HTTP_SELECTOR_ALIAS_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_HTTP_SELECTOR_MAPPING_PATTERN = re.compile(
+	r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*([^,;]+)\s*(?:[,;]|$)"
+)
 _RANDOM_RANGE_PATTERN = re.compile(r"\{(-?\d+|\{query\})\.\.(-?\d+|\{query\})\}")
 _SANITIZED_RANGE_MIN = -1_000_000
 _SANITIZED_RANGE_MAX = 1_000_000
@@ -481,39 +485,118 @@ def _resolve_range_bound(raw_bound: str, values: dict[str, object]) -> int:
 
 
 def _resolve_http_template_calls(template: str, values: dict[str, object]) -> str:
+	response_cache: dict[tuple[str, str], str] = {}
+
 	def _replace(match: re.Match[str]) -> str:
 		method = match.group(1).upper()
 		url = _substitute_http_url_template(match.group(2), values)
-		json_path = (match.group(3) or "").strip()
-		try:
-			request = Request(
-				url,
-				headers={
-					"Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
-					"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
-				},
-				method=method,
-			)
-			with urlopen(request, timeout=5) as response:
-				body = response.read()
-		except (URLError, ValueError):
+		selector_spec = (match.group(3) or "").strip()
+		selectors = _parse_http_selector_spec(selector_spec) if selector_spec else ()
+		for selector in selectors:
+			if ":" not in selector:
+				continue
+			alias, _path = selector.split(":", 1)
+			alias_key = alias.strip()
+			if alias_key and _HTTP_SELECTOR_ALIAS_PATTERN.fullmatch(alias_key) is not None:
+				values.setdefault(alias_key, f"{{{alias_key}}}")
+
+		decoded_body = _fetch_http_template_response(method, url, response_cache)
+		if decoded_body is None:
 			return ""
 
-		decoded_body = body.decode("utf-8", errors="replace").strip()
-		if not json_path:
+		if not selector_spec:
 			return _escape_format_braces(decoded_body)
+
+		if not selectors:
+			return ""
 
 		try:
 			json_payload = json.loads(decoded_body)
 		except json.JSONDecodeError:
 			return ""
 
-		extracted_value = _extract_json_path_value(json_payload, json_path)
-		if extracted_value is None:
-			return ""
-		return _escape_format_braces(_render_extracted_json_value(extracted_value))
+		inline_values: list[str] = []
+		for selector in selectors:
+			if ":" in selector:
+				alias, json_path = selector.split(":", 1)
+				alias_key = alias.strip()
+				path_key = json_path.strip()
+				if not alias_key or not path_key:
+					continue
+				if _HTTP_SELECTOR_ALIAS_PATTERN.fullmatch(alias_key) is None:
+					continue
+				extracted_value = _extract_json_path_value(json_payload, path_key)
+				if extracted_value is None:
+					values.setdefault(alias_key, f"{{{alias_key}}}")
+				else:
+					values[alias_key] = _render_extracted_json_value(extracted_value)
+				continue
+
+			path_key = selector.strip()
+			if not path_key:
+				continue
+			extracted_value = _extract_json_path_value(json_payload, path_key)
+			if extracted_value is None:
+				continue
+			inline_values.append(_render_extracted_json_value(extracted_value))
+
+		if inline_values:
+			return _escape_format_braces(" ".join(inline_values))
+		return ""
 
 	return _HTTP_TEMPLATE_CALL_PATTERN.sub(_replace, template)
+
+
+def _fetch_http_template_response(
+	method: str,
+	url: str,
+	response_cache: dict[tuple[str, str], str],
+) -> str | None:
+	cache_key = (method, url)
+	if cache_key in response_cache:
+		return response_cache[cache_key]
+
+	try:
+		request = Request(
+			url,
+			headers={
+				"Accept": "application/json, text/plain;q=0.9, */*;q=0.8",
+				"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+			},
+			method=method,
+		)
+		with urlopen(request, timeout=5) as response:
+			body = response.read()
+	except (URLError, ValueError):
+		return None
+
+	decoded_body = body.decode("utf-8", errors="replace").strip()
+	response_cache[cache_key] = decoded_body
+	return decoded_body
+
+
+def _parse_http_selector_spec(selector_spec: str) -> tuple[str, ...]:
+	trimmed_spec = selector_spec.strip()
+	if not trimmed_spec:
+		return ()
+
+	matches = list(_HTTP_SELECTOR_MAPPING_PATTERN.finditer(trimmed_spec))
+	if matches:
+		position = 0
+		mapped_selectors: list[str] = []
+		for match in matches:
+			if match.start() != position:
+				break
+			alias = match.group(1).strip()
+			path = match.group(2).strip()
+			mapped_selectors.append(f"{alias}:{path}")
+			position = match.end()
+		else:
+			if position == len(trimmed_spec):
+				return tuple(mapped_selectors)
+
+	selectors = [segment.strip() for segment in re.split(r"[,;]", trimmed_spec) if segment.strip()]
+	return tuple(selectors)
 
 
 def _substitute_http_url_template(url_template: str, values: dict[str, object]) -> str:

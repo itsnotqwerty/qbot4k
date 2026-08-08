@@ -341,6 +341,41 @@ class DiscordCommandTests(unittest.TestCase):
 		assert reply is not None
 		self.assertEqual(render_command_reply(reply, "twitch"), "prefix  suffix")
 
+	def test_template_http_macro_failure_initializes_alias_variables(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="httpaliasfail",
+				response_template=(
+					"{GET}(https://example.test/fail)[threads:data.threads,posts:data.posts] "
+					"{threads} threads and {posts} posts"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-2b",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-2b",
+				content="!httpaliasfail",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=ValueError("boom")):
+				reply = registry.dispatch("!httpaliasfail", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), " {threads} threads and {posts} posts")
+
 	def test_template_http_macro_extracts_json_path_value(self) -> None:
 		def _fake_urlopen(_request, timeout=5):
 			return _FakeHttpTemplateResponse(
@@ -380,6 +415,176 @@ class DiscordCommandTests(unittest.TestCase):
 		self.assertIsNotNone(reply)
 		assert reply is not None
 		self.assertEqual(render_command_reply(reply, "twitch"), "name=sam score=7")
+
+	def test_template_http_macro_extracts_multiple_variables_from_single_request(self) -> None:
+		captured_urls: list[str] = []
+
+		def _fake_urlopen(request, timeout=5):
+			captured_urls.append(str(request.full_url))
+			return _FakeHttpTemplateResponse(
+				b'{"data":{"profile":{"name":"sam","scores":[5,7,9]}}}'
+			)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="jsonmap",
+				response_template=(
+					"{GET}(https://example.test/user)"
+					"[name:data.profile.name,score:data.profile.scores.1]"
+					"name={name} score={score}"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-3b",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-3b",
+				content="!jsonmap",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!jsonmap", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "name=sam score=7")
+		self.assertEqual(captured_urls, ["https://example.test/user"])
+
+	def test_template_http_macro_selector_map_supports_equals_separator(self) -> None:
+		def _fake_urlopen(_request, timeout=5):
+			return _FakeHttpTemplateResponse(
+				b'{"data":{"profile":{"name":"sam","scores":[5,7,9]}}}'
+			)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="jsonmapeq",
+				response_template=(
+					"{GET}(https://example.test/user)"
+					"[name=data.profile.name,score=data.profile.scores.1]"
+					"name={name} score={score}"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-3d",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-3d",
+				content="!jsonmapeq",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!jsonmapeq", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "name=sam score=7")
+
+	def test_template_http_macro_selector_map_supports_semicolon_separator(self) -> None:
+		def _fake_urlopen(_request, timeout=5):
+			return _FakeHttpTemplateResponse(
+				b'{"data":{"profile":{"name":"sam","scores":[5,7,9]}}}'
+			)
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="jsonmapsemi",
+				response_template=(
+					"{GET}(https://example.test/user)"
+					"[name:data.profile.name;score:data.profile.scores.1]"
+					"name={name} score={score}"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-3e",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-3e",
+				content="!jsonmapsemi",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!jsonmapsemi", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "name=sam score=7")
+
+	def test_template_http_macro_caches_duplicate_request_in_single_render(self) -> None:
+		call_count = 0
+
+		def _fake_urlopen(_request, timeout=5):
+			nonlocal call_count
+			call_count += 1
+			return _FakeHttpTemplateResponse(b'{"data":{"profile":{"name":"sam","scores":[5,7,9]}}}')
+
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			upsert_simple_command_definition(
+				connection,
+				command_name="jsoncache",
+				response_template=(
+					"name={GET}(https://example.test/user)[data.profile.name] "
+					"score={GET}(https://example.test/user)[data.profile.scores.1]"
+				),
+				enabled=True,
+			)
+
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="twitch",
+				database_path=self.database_path,
+				connection=connection,
+				author_platform_user_id="twitch-user-http-3c",
+				author_username="sam",
+				channel_id="its_not_qwerty",
+				guild_id=None,
+				message_id="message-http-3c",
+				content="!jsoncache",
+			)
+			with mock.patch("src.commands.urlopen", side_effect=_fake_urlopen):
+				reply = registry.dispatch("!jsoncache", context)
+		finally:
+			connection.close()
+
+		self.assertIsNotNone(reply)
+		assert reply is not None
+		self.assertEqual(render_command_reply(reply, "twitch"), "name=sam score=7")
+		self.assertEqual(call_count, 1)
 
 	def test_template_http_macro_missing_json_path_returns_empty_string(self) -> None:
 		def _fake_urlopen(_request, timeout=5):
