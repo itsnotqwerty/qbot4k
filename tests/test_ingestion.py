@@ -17,6 +17,7 @@ from src.discord import (
     DiscordConnector,
     build_discord_message_payload,
 )
+from src.intelligence.powerusers import score_delta_for_message
 from src.twitch import TwitchConnector, parse_twitch_irc_message
 
 
@@ -76,8 +77,39 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(message[3], " Hello   World ")
         self.assertEqual(message[4], "hello world")
         self.assertTrue(message[5].endswith("+00:00"))
-        # "hello" contains "hell" which matches a very negative term substring
-        self.assertEqual(user_row[1], 490)
+        self.assertEqual(user_row[1], 501)
+
+    def test_scoring_avoids_substring_false_positives(self) -> None:
+        self.assertEqual(
+            score_delta_for_message("How many viewers are watching before stream?"),
+            (1, "message_sent"),
+        )
+
+    def test_scoring_supports_conservative_fuzzy_negative_match(self) -> None:
+        self.assertEqual(
+            score_delta_for_message("you are an ashole"),
+            (-10, "very_negative_content"),
+        )
+
+    def test_scoring_ignores_ambiguous_common_word_harder(self) -> None:
+        self.assertEqual(
+            score_delta_for_message("It is harder to grow on Twitch than YouTube."),
+            (1, "message_sent"),
+        )
+
+    def test_scoring_ignores_ambiguous_neutral_terms(self) -> None:
+        self.assertEqual(
+            score_delta_for_message(
+                "Our church group has asian and american members, and we discussed welfare policy."
+            ),
+            (1, "message_sent"),
+        )
+
+    def test_scoring_still_flags_clear_abusive_terms(self) -> None:
+        self.assertEqual(
+            score_delta_for_message("you are an asshole"),
+            (-10, "very_negative_content"),
+        )
 
     def test_positive_messages_give_small_social_score_increase(self) -> None:
         connector = DiscordConnector(self.database_path)
