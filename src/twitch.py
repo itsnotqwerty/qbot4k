@@ -31,6 +31,12 @@ class TwitchPayloadError(ValueError):
 class TwitchConnectionError(RuntimeError):
 	pass
 
+class TwitchAuthenticationRequired(Exception):
+    """The user must authorize the Twitch integration again."""
+
+class TwitchTemporaryAuthError(Exception):
+    """Twitch authentication is temporarily unavailable."""
+
 
 def normalize_twitch_message(payload: Mapping[str, object]) -> NormalizedMessage:
 	user_id = str(payload.get("user_id") or "").strip()
@@ -286,6 +292,19 @@ class TwitchConnector:
 							)
 				finally:
 					self._active_socket = None
+
+	def run_twitch_safely(self, initial_token: str) -> None:
+		twitch_logger = logging.getLogger("qbot4k.twitch")
+		try:
+			self.run_forever(initial_token)
+		except TwitchAuthenticationRequired:
+			service_states["twitch"] = "auth_failed"
+			twitch_logger.error(
+				"Twitch authorization is invalid; reauthorization is required"
+			)
+		except Exception:
+			service_states["twitch"] = "down"
+			twitch_logger.exception("Twitch connector stopped unexpectedly")
 
 	def _seed_bootstrap_channels(self, connection: object) -> None:
 		for channel_name in self.bootstrap_channels:

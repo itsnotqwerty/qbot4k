@@ -378,18 +378,18 @@ class DashboardApp:
 			+ "</div></section>"
 			+ "<section class='card'>"
 			+ "<h2>Database</h2>"
-			+ "<table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>"
+			+ "<div class='table-scroll'><table class='table'><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>"
 			+ f"<tr><td>Status</td><td>{self._render_status_pill(str(database_state.get('status') or 'unknown'))}</td></tr>"
 			+ f"<tr><td>Path</td><td>{self._escape(str(database_state.get('path') or ''))}</td></tr>"
 			+ f"<tr><td>Table count</td><td>{int(database_state.get('table_count') or 0)}</td></tr>"
 			+ f"<tr><td>Journal mode</td><td>{self._escape(str(database_state.get('journal_mode') or 'unknown'))}</td></tr>"
-			+ "</tbody></table>"
+			+ "</tbody></table></div>"
 			+ "</section>"
 			+ "<section class='card'>"
 			+ "<h2>Services</h2>"
-			+ "<table><thead><tr><th>Service</th><th>Status</th><th>Uptime</th><th>Started at</th></tr></thead><tbody>"
+			+ "<div class='table-scroll'><table class='table'><thead><tr><th>Service</th><th>Status</th><th>Uptime</th><th>Started at</th></tr></thead><tbody>"
 			+ "".join(rows)
-			+ "</tbody></table>"
+			+ "</tbody></table></div>"
 			+ "</section>"
 			+ "".join(reliability_sections),
 		)
@@ -1317,9 +1317,9 @@ class DashboardApp:
 			for item in outages
 		)
 		return (
-			"<table class='outage-table'><thead><tr><th>Outage start</th><th>Outage end</th><th>Duration</th><th>Status</th></tr></thead><tbody>"
+			"<div class='table-scroll'><table class='table'><thead><tr><th>Outage start</th><th>Outage end</th><th>Duration</th><th>Status</th></tr></thead><tbody>"
 			+ rows
-			+ "</tbody></table>"
+			+ "</tbody></table></div>"
 		)
 
 	def _bucket_end_iso(self, bucket_start: str) -> str:
@@ -1486,6 +1486,13 @@ table textarea {{
 </aside>
 <main class='main{page_class}'>{content}</main>
 </div>
+<script>
+document.addEventListener("DOMContentLoaded", () => {{
+  document.querySelectorAll(".reliability-track").forEach((track) => {{
+    track.scrollLeft = track.scrollWidth;
+  }});
+}});
+</script>
 </body>
 </html>"""
 
