@@ -363,12 +363,12 @@ class DashboardApp:
 			except (KeyError, IndexError, TypeError):
 				continue
 
-			if status in {"", "unknown", "missing"}:
+			if status in {"down"}:
 				continue
 
 			total_minutes += 1
 
-			if status in {"up", "healthy", "operational", "ok"}:
+			if status in {"ready"}:
 				uptime_minutes += 1
 
 		if total_minutes == 0:

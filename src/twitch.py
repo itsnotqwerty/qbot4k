@@ -157,7 +157,7 @@ class TwitchConnector:
 		self._active_irc_token: str | None = None
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.twitch")
-		self._streamboo_term_pattern = re.compile(r"(?<!\\w)viewers?(?!\\w)", re.IGNORECASE)
+		self._streamboo_term_pattern = re.compile(r"(?<!\\w)(viewers?|promotion)(?!\\w)", re.IGNORECASE)
 		self._stop_event = threading.Event()
 		self._active_socket: ssl.SSLSocket | None = None
 
