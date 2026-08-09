@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Mapping
+import json
+import sqlite3
 
 
 def normalize_message_content(content: str) -> str:
@@ -41,7 +43,6 @@ def observation_from_message(message: NormalizedMessage) -> Observation:
             "is_moderator": message.is_moderator,
         },
     )
-
 
 @dataclass(frozen=True)
 class NormalizedMessage:
@@ -100,3 +101,54 @@ class ConnectorHealth:
     name: str
     status: str
     details: Mapping[str, object] = field(default_factory=dict)
+    
+
+@dataclass(frozen=True)
+class CollectedObservation:
+    observation_id: int
+    status: str
+    analysis_job_id: int | None
+
+@dataclass(frozen=True)
+class CollectionResult:
+    status: str
+    platform: str
+    observation_id: int | None = None
+    analysis_job_id: int | None = None
+    reason: str | None = None
+
+@dataclass(frozen=True)
+class ProcessingJob:
+    id: int
+    stage: str
+    job_type: str
+    observation_id: int | None
+    payload: Mapping[str, object]
+    attempts: int
+    max_attempts: int
+
+    @classmethod
+    def from_row(
+        cls,
+        row: sqlite3.Row,
+    ) -> "ProcessingJob":
+        payload = json.loads(str(row["payload_json"]))
+
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "Processing job payload must be a JSON object"
+            )
+
+        return cls(
+            id=int(row["id"]),
+            stage=str(row["stage"]),
+            job_type=str(row["job_type"]),
+            observation_id=(
+                int(row["observation_id"])
+                if row["observation_id"] is not None
+                else None
+            ),
+            payload=payload,
+            attempts=int(row["attempts"]),
+            max_attempts=int(row["max_attempts"]),
+        )

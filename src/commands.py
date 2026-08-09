@@ -81,7 +81,7 @@ class CommandRegistry:
 		self.prefix = prefix
 
 	def dispatch(self, content: str, context: CommandContext) -> CommandReply | None:
-		parsed = self._parse_command(content)
+		parsed = self.parse_command(content)
 		if parsed is None:
 			return None
 
@@ -89,7 +89,8 @@ class CommandRegistry:
 		resolved_context = replace(context, command_name=command_name, command_args=args)
 		return _resolve_command_reply(resolved_context)
 
-	def _parse_command(self, content: str) -> tuple[str, tuple[str, ...]] | None:
+	def parse_command(self, content: str) -> tuple[str, tuple[str, ...]] | None:
+		"""Parse command text without executing or resolving the command."""
 		normalized = content.strip()
 		if not normalized.startswith(self.prefix):
 			return None

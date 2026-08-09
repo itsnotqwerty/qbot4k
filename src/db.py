@@ -5,6 +5,7 @@ import sqlite3
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from collections.abc import Mapping
 
 from .intelligence.powerusers import (
     POWERUSER_THRESHOLD,
@@ -14,7 +15,7 @@ from .intelligence.powerusers import (
     score_delta_for_message,
     score_delta_for_moderation,
 )
-from .models import IngestionResult, NormalizedMessage, Observation, ObservationResult
+from .models import IngestionResult, NormalizedMessage, Observation, ObservationResult, CollectedObservation
 from .moderation import ModerationFinding, ModerationRule, evaluate_egregious_content, evaluate_message_moderation
 
 BUILTIN_EGREGIOUS_RULE_NAME = "builtin:egregious_content"
@@ -311,6 +312,63 @@ CREATE INDEX IF NOT EXISTS idx_observations_actor_time
 
 CREATE INDEX IF NOT EXISTS idx_observations_context_time
     ON observations(context_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id INTEGER PRIMARY KEY,
+    stage TEXT NOT NULL,
+    job_type TEXT NOT NULL,
+    observation_id INTEGER REFERENCES observations(id) ON DELETE CASCADE,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+
+    status TEXT NOT NULL DEFAULT 'pending',
+    priority INTEGER NOT NULL DEFAULT 100,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+
+    available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    claimed_at TEXT,
+    claimed_by TEXT,
+    completed_at TEXT,
+    last_error TEXT,
+
+    idempotency_key TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    CHECK(stage IN ('analysis', 'action')),
+    CHECK(status IN (
+        'pending',
+        'running',
+        'completed',
+        'retry',
+        'failed',
+        'cancelled'
+    ))
+);
+
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_available
+    ON processing_jobs(stage, status, available_at, priority);
+
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_observation
+    ON processing_jobs(observation_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_observation_id
+    ON messages(observation_id)
+    WHERE observation_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS command_analysis_results (
+    observation_id INTEGER NOT NULL
+        REFERENCES observations(id) ON DELETE CASCADE,
+    analyzer_version INTEGER NOT NULL,
+    command_name TEXT,
+    matched INTEGER NOT NULL,
+    rendered_payload_json TEXT,
+    analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    PRIMARY KEY (observation_id, analyzer_version),
+
+    CHECK (matched IN (0, 1))
+);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (
@@ -752,6 +810,8 @@ def upsert_command_definition(
 def persist_normalized_message(
     connection: sqlite3.Connection,
     message: NormalizedMessage,
+    *,
+    observation_id: int | None = None,
 ) -> IngestionResult:
     platform_account_id = ensure_platform_account(
         connection,
@@ -772,8 +832,9 @@ def persist_normalized_message(
                     channel_id,
                     content_raw,
                     content_normalized,
-                    sent_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    sent_at,
+                    observation_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.platform,
@@ -783,6 +844,7 @@ def persist_normalized_message(
                     message.content_raw,
                     message.content_normalized,
                     message.sent_at,
+                    observation_id,
                 ),
             )
             message_id = int(cursor.lastrowid)
@@ -1734,3 +1796,277 @@ def persist_observation(
         actor_platform_account_id=actor_account_id,
         target_platform_account_id=target_account_id,
     )
+
+def enqueue_processing_job(
+    connection: sqlite3.Connection,
+    *,
+    stage: str,
+    job_type: str,
+    idempotency_key: str,
+    observation_id: int | None = None,
+    payload: Mapping[str, object] | None = None,
+    priority: int = 100,
+    max_attempts: int = 5,
+) -> int | None:
+    with connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO processing_jobs (
+                stage,
+                job_type,
+                observation_id,
+                payload_json,
+                priority,
+                max_attempts,
+                idempotency_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(idempotency_key) DO NOTHING
+            """,
+            (
+                stage,
+                job_type,
+                observation_id,
+                json.dumps(payload or {}, sort_keys=True),
+                priority,
+                max_attempts,
+                idempotency_key,
+            ),
+        )
+
+    if cursor.rowcount == 0:
+        return None
+
+    return int(cursor.lastrowid)
+
+def claim_processing_job(
+    connection: sqlite3.Connection,
+    *,
+    stage: str,
+    worker_id: str,
+) -> sqlite3.Row | None:
+    connection.execute("BEGIN IMMEDIATE")
+
+    try:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM processing_jobs
+            WHERE stage = ?
+              AND status IN ('pending', 'retry')
+              AND available_at <= CURRENT_TIMESTAMP
+              AND attempts < max_attempts
+            ORDER BY priority ASC, id ASC
+            LIMIT 1
+            """,
+            (stage,),
+        ).fetchone()
+
+        if row is None:
+            connection.commit()
+            return None
+
+        connection.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'running',
+                claimed_at = CURRENT_TIMESTAMP,
+                claimed_by = ?,
+                attempts = attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (worker_id, int(row["id"])),
+        )
+        connection.commit()
+
+        return connection.execute(
+            "SELECT * FROM processing_jobs WHERE id = ?",
+            (int(row["id"]),),
+        ).fetchone()
+    except Exception:
+        connection.rollback()
+        raise
+
+def complete_processing_job(
+    connection: sqlite3.Connection,
+    job_id: int,
+) -> None:
+    with connection:
+        connection.execute(
+            """
+            UPDATE processing_jobs
+            SET status = 'completed',
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+                last_error = NULL
+            WHERE id = ?
+            """,
+            (job_id,),
+        )
+
+def fail_processing_job(
+    connection: sqlite3.Connection,
+    job_id: int,
+    error: str,
+    *,
+    retry_delay_seconds: int,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT attempts, max_attempts
+        FROM processing_jobs
+        WHERE id = ?
+        """,
+        (job_id,),
+    ).fetchone()
+
+    if row is None:
+        return
+
+    exhausted = int(row["attempts"]) >= int(row["max_attempts"])
+    status = "failed" if exhausted else "retry"
+
+    with connection:
+        connection.execute(
+            """
+            UPDATE processing_jobs
+            SET status = ?,
+                available_at = datetime(
+                    CURRENT_TIMESTAMP,
+                    '+' || ? || ' seconds'
+                ),
+                last_error = ?,
+                claimed_at = NULL,
+                claimed_by = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                status,
+                retry_delay_seconds,
+                error[:2000],
+                job_id,
+            ),
+        )
+
+def collect_observation(
+    connection: sqlite3.Connection,
+    observation: Observation,
+) -> CollectedObservation:
+    with connection:
+        result = persist_observation(
+            connection,
+            observation
+        )
+
+        if result.status == "duplicate":
+            return CollectedObservation(
+                observation_id=result.observation_id,
+                status="duplicate",
+                analysis_job_id=None,
+            )
+
+        observation_id = result.observation_id
+        assert observation_id is not None
+
+        job_id = enqueue_processing_job(
+            connection,
+            stage="analysis",
+            job_type=f"analyze.{observation.event_type}",
+            observation_id=observation_id,
+            idempotency_key=(
+                f"observation:{observation_id}:"
+                f"{observation.event_type}:v1"
+            ),
+        )
+
+    return CollectedObservation(
+        observation_id=observation_id,
+        status="persisted",
+        analysis_job_id=job_id,
+    )
+
+def normalized_message_from_observation(
+    row: sqlite3.Row,
+) -> NormalizedMessage:
+    event_type = str(row["event_type"])
+
+    if event_type != "message.created":
+        raise ValueError(
+            f"Cannot construct a message from {event_type}"
+        )
+
+    raw_attributes = json.loads(
+        str(row["attributes_json"] or "{}")
+    )
+
+    if not isinstance(raw_attributes, dict):
+        raise ValueError(
+            "Observation attributes must be a JSON object"
+        )
+
+    role_names_value = raw_attributes.pop(
+        "role_names",
+        (),
+    )
+    if isinstance(role_names_value, list):
+        role_names = tuple(
+            str(role)
+            for role in role_names_value
+        )
+    else:
+        role_names = ()
+
+    is_moderator = bool(
+        raw_attributes.pop("is_moderator", False)
+    )
+
+    return NormalizedMessage(
+        platform=str(row["platform"]),
+        platform_message_id=(
+            str(row["external_event_id"])
+            if row["external_event_id"] is not None
+            else None
+        ),
+        platform_user_id=str(
+            row["actor_platform_user_id"]
+        ),
+        username=str(row["actor_username"]),
+        channel_id=str(row["container_id"]),
+        guild_or_channel_context=(
+            str(row["context_id"])
+            if row["context_id"] is not None
+            else None
+        ),
+        content_raw=str(row["text_raw"] or ""),
+        sent_at=str(row["occurred_at"]),
+        role_names=role_names,
+        is_moderator=is_moderator,
+        metadata=raw_attributes,
+    )
+
+def get_observation(
+    connection: sqlite3.Connection,
+    observation_id: int,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT
+            observations.*,
+            actor.platform_user_id
+                AS actor_platform_user_id,
+            actor.username
+                AS actor_username,
+            target.platform_user_id
+                AS target_platform_user_id
+        FROM observations
+        LEFT JOIN platform_accounts AS actor
+            ON actor.id =
+               observations.actor_platform_account_id
+        LEFT JOIN platform_accounts AS target
+            ON target.id =
+               observations.target_platform_account_id
+        WHERE observations.id = ?
+        """,
+        (observation_id,),
+    ).fetchone()

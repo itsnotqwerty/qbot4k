@@ -14,14 +14,13 @@ from .db import (
 	connect_database,
 	initialize_database,
 	list_twitch_channels,
-	persist_normalized_message,
 	record_moderation_action,
 	update_twitch_channel_status,
 	upsert_twitch_channel,
-	persist_observation
+	collect_observation
 )
 from .intelligence.powerusers import apply_reputation_event, score_delta_for_moderation
-from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp, observation_from_message
+from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
 
@@ -161,6 +160,7 @@ class TwitchConnector:
 		self._streamboo_term_pattern = re.compile(r"(?<!\\w)(viewers?|promotion)(?!\\w)", re.IGNORECASE)
 		self._stop_event = threading.Event()
 		self._active_socket: ssl.SSLSocket | None = None
+		self._send_lock = threading.Lock()
 
 	def stop(self) -> None:
 		self._stop_event.set()
@@ -175,24 +175,14 @@ class TwitchConnector:
 			except OSError:
 				pass
 
-	def ingest_message(
-		self,
-		payload: Mapping[str, object],
-		*,
-		reply_sink: callable | None = None,
-	) -> IngestionResult:
+	def ingest_message(self, payload: Mapping[str, object]) -> CollectionResult:
 		normalized = normalize_twitch_message(payload)
 		observation = observation_from_message(normalized)
+
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
-			self._seed_bootstrap_channels(connection)
-			result = persist_normalized_message(connection, normalized)
-			persist_observation(connection, observation)
-			self._process_join_command(connection, normalized, result)
-			reply = self._dispatch_registered_command(connection, normalized)
-			if reply is not None and reply_sink is not None:
-				reply_sink(render_command_reply(reply, "twitch"))
+			result = collect_observation(connection, observation)
 			self._last_status = "ready"
 			return result
 		finally:
@@ -263,24 +253,13 @@ class TwitchConnector:
 							continue
 
 						result = self.ingest_message(
-							payload,
-							reply_sink=lambda message: self._send_privmsg(
-								irc_socket,
-								str(payload["channel"]),
-								message,
-							),
+							payload
 						)
 						self._logger.info(
 							"ingested twitch message channel=%s user=%s status=%s",
 							payload["channel"],
 							payload["username"],
 							result.status,
-						)
-
-						self._maybe_auto_moderate_streamboo_viewer_spam(
-							irc_socket,
-							payload,
-							result,
 						)
 
 						requested_channel = self._requested_join_channel_from_payload(payload)
@@ -364,8 +343,49 @@ class TwitchConnector:
 		self._active_irc_token = validation.access_token
 		return validation.login
 
-	def _send_irc_line(self, irc_socket: ssl.SSLSocket, line: str) -> None:
-		irc_socket.sendall(f"{line}\r\n".encode("utf-8"))
+	def send_message(
+		self,
+		channel_id: str,
+		message: str,
+	) -> None:
+		irc_socket = self._active_socket
+
+		if irc_socket is None:
+			raise TwitchConnectionError(
+				"Twitch IRC connection is not ready"
+			)
+
+		normalized_channel = (
+			channel_id.strip()
+			.removeprefix("#")
+			.casefold()
+		)
+
+		if not normalized_channel:
+			raise ValueError(
+				"Twitch channel must not be empty"
+			)
+
+		if not message.strip():
+			raise ValueError(
+				"Twitch message must not be empty"
+			)
+
+		self._send_privmsg(
+			irc_socket,
+			normalized_channel,
+			message,
+		)
+
+	def _send_irc_line(
+		self,
+		irc_socket: ssl.SSLSocket,
+		line: str,
+	) -> None:
+		with self._send_lock:
+			irc_socket.sendall(
+				f"{line}\r\n".encode("utf-8")
+			)
 
 	def _join_channel(self, irc_socket: ssl.SSLSocket, channel_name: str) -> None:
 		normalized_channel_name = channel_name.strip().casefold()

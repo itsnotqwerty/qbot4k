@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from src.config import AppSettings, ConfigError
@@ -23,6 +24,17 @@ if __package__ in {None, ""}:
     from src.token_store import persist_refreshed_twitch_tokens
     from src.twitch import TwitchConnector
     from src.twitch_auth import TwitchTokenManager
+    from src.pipeline.analysis import AnalysisRegistry
+    from src.pipeline.message_analysis import (
+        MESSAGE_ANALYSIS_JOB_TYPE,
+        MessageAnalysisPipeline,
+    )
+    from src.pipeline.workers import AnalysisWorker, DiscordWorker
+    from src.pipeline.actions import (
+        ActionRegistry,
+        DiscordMessageActionHandler,
+        TwitchMessageActionHandler,
+    )
 else:
     from .config import AppSettings, ConfigError
     from .db import connect_database, initialize_database, list_tables, upsert_service_reliability_bucket
@@ -34,6 +46,17 @@ else:
     from .token_store import persist_refreshed_twitch_tokens
     from .twitch import TwitchConnector
     from .twitch_auth import TwitchTokenManager
+    from .pipeline.analysis import AnalysisRegistry
+    from .pipeline.message_analysis import (
+        MESSAGE_ANALYSIS_JOB_TYPE,
+        MessageAnalysisPipeline,
+    )
+    from .pipeline.workers import AnalysisWorker, DiscordWorker
+    from .pipeline.actions import (
+        ActionRegistry,
+        DiscordMessageActionHandler,
+        TwitchMessageActionHandler,
+    )
 
 
 def _persist_refreshed_twitch_tokens(
@@ -142,7 +165,7 @@ def run_application(once: bool) -> int:
     service_started_at = {
         service: app_started_at
         for service in settings.enabled_services
-        if service in {"web", "jobs", "twitch", "discord"}
+        if service in {"web", "jobs", "twitch", "discord", "analysis"}
     }
     bootstrap_logger = logging.getLogger("qbot4k.bootstrap")
     bootstrap_logger.info(
@@ -158,12 +181,29 @@ def run_application(once: bool) -> int:
     service_states = {
         service: "ready"
         for service in settings.enabled_services
-        if service in {"web", "jobs"}
+        if service in {"web", "jobs", "analysis"}
     }
 
     discord_connector: DiscordConnector | None = None
     twitch_connector: TwitchConnector | None = None
     twitch_token_manager: TwitchTokenManager | None = None
+
+    analysis_registry = AnalysisRegistry()
+
+    message_pipeline = MessageAnalysisPipeline(
+        settings.database_path,
+    )
+
+    analysis_registry.register(
+        MESSAGE_ANALYSIS_JOB_TYPE,
+        message_pipeline.analyze_message_created,
+    )
+
+    analysis_worker = AnalysisWorker(
+        settings.database_path,
+        analysis_registry,
+        worker_id="analysis-1",
+    )
 
     if "discord" in settings.enabled_services:
         discord_connector = DiscordConnector(
@@ -172,6 +212,7 @@ def run_application(once: bool) -> int:
             allow_bot_messages=settings.discord_allow_bot_messages,
         )
         service_states["discord"] = discord_connector.health_snapshot().status
+
     if "twitch" in settings.enabled_services:
         twitch_token_manager = TwitchTokenManager(
             initial_access_token=settings.twitch_bot_token or "",
@@ -217,7 +258,7 @@ def run_application(once: bool) -> int:
     server = None
     server_thread = None
     service_threads: list[threading.Thread] = []
-    managed_connectors: list[object] = []
+    managed_services: list[object] = [analysis_worker]
     jobs_thread: threading.Thread | None = None
     discord_thread: threading.Thread | None = None
     twitch_thread: threading.Thread | None = None
@@ -271,7 +312,7 @@ def run_application(once: bool) -> int:
             guild_ids=settings.discord_guild_ids,
             allow_bot_messages=settings.discord_allow_bot_messages,
         )
-        managed_connectors.append(discord_connector)
+        managed_services.append(discord_connector)
         service_started_at.setdefault(
             "discord", datetime.now(
                 timezone.utc).isoformat())
@@ -283,31 +324,82 @@ def run_application(once: bool) -> int:
         discord_thread.start()
         service_threads.append(discord_thread)
 
+        action_registry = ActionRegistry()
+
+        action_registry.register(
+            "discord.message.send",
+            DiscordMessageActionHandler(
+                discord_connector,
+            ),
+        )
+
+        discord_worker = DiscordWorker(
+            settings.database_path,
+            action_registry,
+        )
+
+        discord_worker_thread = threading.Thread(
+            target=discord_worker.run_forever,
+            name="action-worker",
+        )
+
+        discord_worker_thread.start()
+        service_threads.append(discord_worker_thread)
+
     if "twitch" in settings.enabled_services:
         twitch_token_manager = TwitchTokenManager(
-            initial_access_token=settings.twitch_bot_token or "",
+            initial_access_token=(
+                settings.twitch_bot_token or ""
+            ),
             refresh_token=settings.twitch_refresh_token,
             client_id=settings.twitch_client_id,
             client_secret=settings.twitch_client_secret,
-            on_token_refresh=_persist_refreshed_twitch_tokens,
+            on_token_refresh=(
+                _persist_refreshed_twitch_tokens
+            ),
         )
+
         twitch_connector = TwitchConnector(
             settings.database_path,
-            join_command_channel=settings.twitch_join_command_channel,
-            bootstrap_channels=settings.twitch_channels,
+            join_command_channel=(
+                settings.twitch_join_command_channel
+            ),
+            bootstrap_channels=(
+                settings.twitch_channels
+            ),
             token_manager=twitch_token_manager,
         )
-        managed_connectors.append(twitch_connector)
-        service_started_at.setdefault(
-            "twitch", datetime.now(
-                timezone.utc).isoformat())
+
+        managed_services.append(
+            twitch_connector
+        )
+
+        action_registry.register(
+            "twitch.message.send",
+            TwitchMessageActionHandler(
+                twitch_connector,
+            ),
+        )
+
         twitch_thread = threading.Thread(
             target=twitch_connector.run_twitch_safely,
-			args=(settings.twitch_bot_token or "", service_states),
+            args=(
+                settings.twitch_bot_token or "",
+                service_states,
+            ),
             name="twitch-connector",
         )
+
         twitch_thread.start()
         service_threads.append(twitch_thread)
+
+    analysis_thread = threading.Thread(
+        target=analysis_worker.run_forever,
+        name="analysis-worker",
+    )
+
+    analysis_thread.start()
+    service_threads.append(analysis_thread)
 
     def status_monitor_loop() -> None:
         last_written_bucket: dict[str, str] = {}
@@ -315,7 +407,7 @@ def run_application(once: bool) -> int:
         enabled_runtime_services = tuple(
             service
             for service in settings.enabled_services
-            if service in {"web", "jobs", "twitch", "discord"}
+            if service in {"web", "jobs", "twitch", "discord", "analysis"}
         )
 
         def _bucket_start(now: datetime) -> str:
@@ -353,6 +445,8 @@ def run_application(once: bool) -> int:
                     ).status
                 else:
                     service_states["twitch"] = "down"
+            if "analysis" in settings.enabled_services:
+                service_states["analysis"] = "ready" if analysis_thread is not None and analysis_thread.is_alive() else "down"
 
             now = datetime.now(timezone.utc)
             current_bucket = _bucket_start(now)
@@ -418,10 +512,11 @@ def run_application(once: bool) -> int:
         shutdown_event.set()
     finally:
         shutdown_event.set()
-        for connector in managed_connectors:
-            stop = getattr(connector, "stop", None)
+        for service in managed_services:
+            stop = getattr(service, "stop", None)
             if callable(stop):
                 stop()
+        discord_worker.stop()
         if server is not None:
             server.shutdown()
             server.server_close()

@@ -17,14 +17,13 @@ from .db import (
 	connect_database,
 	initialize_database,
 	list_pending_moderation_actions_for_message,
-	persist_normalized_message,
 	mark_moderation_action_completed,
 	record_server_boost_request,
 	reward_server_boost_request,
-	persist_observation
+	collect_observation
 )
 from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
-from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp, observation_from_message
+from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 
 
 class DiscordPayloadError(ValueError):
@@ -37,7 +36,6 @@ class DiscordConnectionError(RuntimeError):
 
 class DiscordAuthError(DiscordConnectionError):
 	pass
-
 
 def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessage:
 	author = payload.get("author")
@@ -279,59 +277,16 @@ class DiscordConnector:
 				self._logger.exception("discord gateway loop failed: %s", exc)
 				self._stop_event.wait(5)
 
-	def ingest_message(self, payload: Mapping[str, object]) -> IngestionResult:
+	def ingest_message(self, payload: Mapping[str, object]) -> CollectionResult:
 		normalized = normalize_discord_message(payload)
 		observation = observation_from_message(normalized)
-		if normalized.metadata.get("author_is_bot"):
-			boost_command = self._detect_server_boost_success(
-				normalized.content_raw,
-				str(normalized.metadata.get("interaction_command_name") or ""),
-			)
-			if boost_command is not None:
-				connection = connect_database(self.database_path)
-				try:
-					initialize_database(connection)
-
-					rewarded_request_id = reward_server_boost_request(
-						connection,
-						platform="discord",
-						channel_id=normalized.channel_id,
-						command_names=(boost_command,),
-					)
-					if rewarded_request_id is None:
-						rewarded_request_id = self._reward_server_boost_from_interaction(
-							connection,
-							normalized,
-							boost_command,
-						)
-					if rewarded_request_id is not None:
-						self._last_status = "ready"
-						return IngestionResult(
-							status="rewarded",
-							platform="discord",
-							reason="server_boost_success",
-						)
-				finally:
-					connection.close()
-			if not self.allow_bot_messages:
-				self._last_status = "ready"
-				return IngestionResult(
-					status="ignored",
-					platform="discord",
-					reason="bot_authored_message",
-				)
 
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
-			normalization_result = persist_normalized_message(connection, normalized)
-			observation_result = persist_observation(connection, observation)
-			if observation_result.status == "persisted":
-				self._maybe_record_server_boost_request(connection, normalized, normalization_result)
-				self._execute_pending_moderation_actions(connection, normalized, normalization_result)
-				self._dispatch_registered_command(connection, normalized)
+			result = collect_observation(connection, observation)
 			self._last_status = "ready"
-			return normalization_result
+			return result
 		finally:
 			connection.close()
 
@@ -687,6 +642,17 @@ class DiscordConnector:
 			self._send_discord_message(normalized.channel_id, render_command_reply(response, "discord"))
 		except Exception as exc:
 			self._logger.warning("discord command response failed: %s", exc)
+
+
+	def send_message(
+		self,
+		channel_id: str,
+		payload: Mapping[str, object],
+	) -> None:
+		self._send_discord_message(
+			channel_id,
+			payload,
+		)
 
 	def _send_discord_message(self, channel_id: str, payload: Mapping[str, object]) -> None:
 		self._discord_api_request(

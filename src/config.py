@@ -89,15 +89,24 @@ class AppSettings:
         if not database_raw:
             raise ConfigError("QBOT_DATABASE_PATH is required")
 
-        enabled_services = _parse_csv(env_map.get("QBOT_ENABLED_SERVICES", "web,jobs"))
+        enabled_services = _parse_csv(env_map.get("QBOT_ENABLED_SERVICES", "web,jobs,analysis"))
         if not enabled_services:
-            enabled_services = ("web", "jobs")
+            enabled_services = ("web", "jobs", "analysis")
 
-        allowed_services = {"web", "jobs", "twitch", "discord"}
+        allowed_services = {"web", "jobs", "twitch", "discord", "analysis"}
         unknown_services = sorted(set(enabled_services) - allowed_services)
         if unknown_services:
             raise ConfigError(
                 f"Unknown services requested: {', '.join(unknown_services)}"
+            )
+        
+        if (
+            {"discord", "twitch"} & set(enabled_services)
+            and "analysis" not in enabled_services
+        ):
+            raise ConfigError(
+                "analysis service is required when a "
+                "collection service is enabled"
             )
 
         log_level = env_map.get("QBOT_LOG_LEVEL", "INFO").upper()
