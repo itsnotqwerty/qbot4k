@@ -21,9 +21,10 @@ from .db import (
 	mark_moderation_action_completed,
 	record_server_boost_request,
 	reward_server_boost_request,
+	persist_observation
 )
 from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
-from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp
+from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp, observation_from_message
 
 
 class DiscordPayloadError(ValueError):
@@ -280,6 +281,7 @@ class DiscordConnector:
 
 	def ingest_message(self, payload: Mapping[str, object]) -> IngestionResult:
 		normalized = normalize_discord_message(payload)
+		observation = observation_from_message(normalized)
 		if normalized.metadata.get("author_is_bot"):
 			boost_command = self._detect_server_boost_success(
 				normalized.content_raw,
@@ -289,6 +291,7 @@ class DiscordConnector:
 				connection = connect_database(self.database_path)
 				try:
 					initialize_database(connection)
+
 					rewarded_request_id = reward_server_boost_request(
 						connection,
 						platform="discord",
@@ -321,13 +324,14 @@ class DiscordConnector:
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
-			result = persist_normalized_message(connection, normalized)
-			if result.status == "persisted":
-				self._maybe_record_server_boost_request(connection, normalized, result)
-				self._execute_pending_moderation_actions(connection, normalized, result)
+			normalization_result = persist_normalized_message(connection, normalized)
+			observation_result = persist_observation(connection, observation)
+			if observation_result.status == "persisted":
+				self._maybe_record_server_boost_request(connection, normalized, normalization_result)
+				self._execute_pending_moderation_actions(connection, normalized, normalization_result)
 				self._dispatch_registered_command(connection, normalized)
 			self._last_status = "ready"
-			return result
+			return normalization_result
 		finally:
 			connection.close()
 
@@ -335,19 +339,19 @@ class DiscordConnector:
 		self,
 		connection,
 		normalized: NormalizedMessage,
-		result: IngestionResult,
+		normalization_result: IngestionResult,
 	) -> None:
 		if not self._bot_token.strip():
 			return
-		if result.message_id is None:
+		if normalization_result.message_id is None:
 			return
 
-		pending_actions = list_pending_moderation_actions_for_message(connection, result.message_id)
+		pending_actions = list_pending_moderation_actions_for_message(connection, normalization_result.message_id)
 		if not pending_actions:
 			return
 
 		guild_id = str(normalized.metadata.get("guild_id") or "").strip()
-		platform_message_id = normalized.platform_message_id or str(result.message_id)
+		platform_message_id = normalized.platform_message_id or str(normalization_result.message_id)
 		for action in pending_actions:
 			action_id = int(action[0])
 			action_type = str(action[3]).strip().casefold()
@@ -360,14 +364,14 @@ class DiscordConnector:
 						self._logger.info(
 							"discord timeout skipped for moderator user=%s message=%s reason=%s",
 							normalized.username,
-							result.message_id,
+							normalization_result.message_id,
 							reason,
 						)
 						mark_moderation_action_completed(connection, action_id)
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
-							message_id=result.message_id,
+							message_id=normalization_result.message_id,
 							action_type=action_type,
 							reason=reason,
 							outcome="skipped_moderator",
@@ -383,7 +387,7 @@ class DiscordConnector:
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
-							message_id=result.message_id,
+							message_id=normalization_result.message_id,
 							action_type=action_type,
 							reason=reason,
 							outcome="completed",
@@ -391,12 +395,12 @@ class DiscordConnector:
 					else:
 						self._logger.warning(
 							"discord timeout skipped for message=%s because guild_id is missing",
-							result.message_id,
+							normalization_result.message_id,
 						)
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
-							message_id=result.message_id,
+							message_id=normalization_result.message_id,
 							action_type=action_type,
 							reason=reason,
 							outcome="skipped_missing_guild",
@@ -414,7 +418,7 @@ class DiscordConnector:
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
-							message_id=result.message_id,
+							message_id=normalization_result.message_id,
 							action_type=action_type,
 							reason=reason,
 							outcome="completed",
@@ -422,12 +426,12 @@ class DiscordConnector:
 					else:
 						self._logger.warning(
 							"discord ban skipped for message=%s because guild_id is missing",
-							result.message_id,
+							normalization_result.message_id,
 						)
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
-							message_id=result.message_id,
+							message_id=normalization_result.message_id,
 							action_type=action_type,
 							reason=reason,
 							outcome="skipped_missing_guild",
@@ -436,13 +440,13 @@ class DiscordConnector:
 					self._logger.info(
 						"discord moderation warning recorded for user=%s message=%s reason=%s",
 						normalized.username,
-						result.message_id,
+						normalization_result.message_id,
 						reason,
 					)
 					self._log_moderation_event_to_modlogs(
 						guild_id=guild_id,
 						normalized=normalized,
-						message_id=result.message_id,
+						message_id=normalization_result.message_id,
 						action_type=action_type,
 						reason=reason,
 						outcome="recorded",
@@ -451,12 +455,12 @@ class DiscordConnector:
 					self._logger.warning(
 						"discord moderation action not executed for unsupported type=%s message=%s",
 						action_type,
-						result.message_id,
+						normalization_result.message_id,
 					)
 					self._log_moderation_event_to_modlogs(
 						guild_id=guild_id,
 						normalized=normalized,
-						message_id=result.message_id,
+						message_id=normalization_result.message_id,
 						action_type=action_type,
 						reason=reason,
 						outcome="unsupported",
@@ -466,13 +470,13 @@ class DiscordConnector:
 					"discord moderation action failed action_id=%s type=%s message=%s: %s",
 					action_id,
 					action_type,
-					result.message_id,
+					normalization_result.message_id,
 					exc,
 				)
 				self._log_moderation_event_to_modlogs(
 					guild_id=guild_id,
 					normalized=normalized,
-					message_id=result.message_id,
+					message_id=normalization_result.message_id,
 					action_type=action_type,
 					reason=reason,
 					outcome="failed",

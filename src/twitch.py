@@ -18,9 +18,10 @@ from .db import (
 	record_moderation_action,
 	update_twitch_channel_status,
 	upsert_twitch_channel,
+	persist_observation
 )
 from .intelligence.powerusers import apply_reputation_event, score_delta_for_moderation
-from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp
+from .models import ConnectorHealth, IngestionResult, NormalizedMessage, coerce_timestamp, observation_from_message
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
 
@@ -181,11 +182,13 @@ class TwitchConnector:
 		reply_sink: callable | None = None,
 	) -> IngestionResult:
 		normalized = normalize_twitch_message(payload)
+		observation = observation_from_message(normalized)
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
 			self._seed_bootstrap_channels(connection)
 			result = persist_normalized_message(connection, normalized)
+			persist_observation(connection, observation)
 			self._process_join_command(connection, normalized, result)
 			reply = self._dispatch_registered_command(connection, normalized)
 			if reply is not None and reply_sink is not None:

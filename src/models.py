@@ -24,6 +24,24 @@ def coerce_timestamp(raw_value: str | datetime | None) -> str:
 
     return datetime.now(timezone.utc).isoformat()
 
+def observation_from_message(message: NormalizedMessage) -> Observation:
+    return Observation(
+        platform=message.platform,
+        event_type="message.created",
+        external_event_id=message.platform_message_id,
+        actor_platform_user_id=message.platform_user_id,
+        actor_username=message.username,
+        container_id=message.channel_id,
+        context_id=message.guild_or_channel_context,
+        text=message.content_raw,
+        occurred_at=message.sent_at,
+        attributes={
+            **dict(message.metadata),
+            "role_names": list(message.role_names),
+            "is_moderator": message.is_moderator,
+        },
+    )
+
 
 @dataclass(frozen=True)
 class NormalizedMessage:
@@ -42,6 +60,30 @@ class NormalizedMessage:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "content_normalized", normalize_message_content(self.content_raw))
+
+@dataclass(frozen=True)
+class Observation:
+    platform: str
+    event_type: str
+    occurred_at: str
+
+    external_event_id: str | None = None
+    actor_platform_user_id: str | None = None
+    actor_username: str | None = None
+    target_platform_user_id: str | None = None
+    container_id: str | None = None
+    context_id: str | None = None
+    text: str | None = None
+
+    attributes: Mapping[str, object] = field(default_factory=dict)
+    schema_version: int = 1
+
+@dataclass(frozen=True)
+class ObservationResult:
+    status: str
+    observation_id: int | None
+    actor_platform_account_id: int | None
+    target_platform_account_id: int | None = None
 
 
 @dataclass(frozen=True)

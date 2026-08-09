@@ -269,6 +269,28 @@ def purge_expired_messages(
 		)
 	return int(cursor.rowcount or 0)
 
+def purge_expired_observations(
+	connection: sqlite3.Connection,
+	now: datetime,
+	retention_days: int,
+) -> int:
+	cutoff = _cutoff_timestamp(now, retention_days)
+
+	with connection:
+		cursor = connection.execute(
+			"""
+			DELETE FROM observations WHERE occurred_at < ?
+				AND id NOT IN (
+					SELECT observation_id
+					FROM messages
+					WHERE observation_id IS NOT NULL
+				)
+			""",
+			(cutoff,),
+		)
+
+	return int(cursor.rowcount or 0)
+
 
 def purge_expired_audit_log(
 	connection: sqlite3.Connection,
@@ -290,6 +312,8 @@ def refresh_metrics_rollups(connection: sqlite3.Connection, now: datetime) -> in
 		"messages_total": connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0],
 		"open_reviews": connection.execute("SELECT COUNT(*) FROM review_queue WHERE status = 'open'").fetchone()[0],
 		"pending_actions": connection.execute("SELECT COUNT(*) FROM moderation_actions WHERE status = 'pending'").fetchone()[0],
+		"observations_total": connection.execute("SELECT COUNT(*) FROM observations").fetchone()[0],
+		"observations_24h": connection.execute("SELECT COUNT(*) FROM observations WHERE occurred_at >= datetime(?, '-1 day')", (now.astimezone(UTC).isoformat(),),).fetchone()[0],
 	}
 	with connection:
 		for metric_name, value in rollups.items():

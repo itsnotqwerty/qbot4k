@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from .intelligence.powerusers import (
     score_delta_for_message,
     score_delta_for_moderation,
 )
-from .models import IngestionResult, NormalizedMessage
+from .models import IngestionResult, NormalizedMessage, Observation, ObservationResult
 from .moderation import ModerationFinding, ModerationRule, evaluate_egregious_content, evaluate_message_moderation
 
 BUILTIN_EGREGIOUS_RULE_NAME = "builtin:egregious_content"
@@ -278,6 +279,38 @@ CREATE INDEX IF NOT EXISTS idx_twitch_live_announcements_lookup
     ON twitch_live_announcements(twitch_channel_name, twitch_stream_id, discord_guild_id);
 CREATE INDEX IF NOT EXISTS idx_service_reliability_buckets_lookup
     ON service_reliability_buckets(service_name, bucket_start);
+
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY,
+    platform TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    external_event_id TEXT,
+    actor_platform_account_id INTEGER
+        REFERENCES platform_accounts(id) ON DELETE SET NULL,
+    target_platform_account_id INTEGER
+        REFERENCES platform_accounts(id) ON DELETE SET NULL,
+    container_id TEXT,
+    context_id TEXT,
+    text_raw TEXT,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    occurred_at TEXT NOT NULL,
+    ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+
+    UNIQUE(platform, event_type, external_event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observations_occurred_at
+    ON observations(occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_observations_platform_type_time
+    ON observations(platform, event_type, occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_observations_actor_time
+    ON observations(actor_platform_account_id, occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_observations_context_time
+    ON observations(context_id, occurred_at);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (
@@ -1620,3 +1653,84 @@ def record_twitch_live_announcement(
                 timestamp,
             ),
         )
+
+def persist_observation(
+    connection: sqlite3.Connection,
+    observation: Observation,
+) -> ObservationResult:
+    actor_account_id = None
+    target_account_id = None
+
+    if observation.actor_platform_user_id:
+        actor_account_id = ensure_platform_account(
+            connection,
+            platform=observation.platform,
+            platform_user_id=observation.actor_platform_user_id,
+            username=(
+                observation.actor_username
+                or observation.actor_platform_user_id
+            ),
+            guild_or_channel_context=observation.context_id,
+        )
+
+    if observation.target_platform_user_id:
+        target_account_id = ensure_platform_account(
+            connection,
+            platform=observation.platform,
+            platform_user_id=observation.target_platform_user_id,
+            username=observation.target_platform_user_id,
+            guild_or_channel_context=observation.context_id,
+        )
+
+    try:
+        with connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO observations (
+                    platform,
+                    event_type,
+                    external_event_id,
+                    actor_platform_account_id,
+                    target_platform_account_id,
+                    container_id,
+                    context_id,
+                    text_raw,
+                    attributes_json,
+                    occurred_at,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    observation.platform,
+                    observation.event_type,
+                    observation.external_event_id,
+                    actor_account_id,
+                    target_account_id,
+                    observation.container_id,
+                    observation.context_id,
+                    observation.text,
+                    json.dumps(
+                        observation.attributes,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    observation.occurred_at,
+                    observation.schema_version,
+                ),
+            )
+    except sqlite3.IntegrityError:
+        if observation.external_event_id is None:
+            raise
+        return ObservationResult(
+            status="duplicate",
+            observation_id=None,
+            actor_platform_account_id=actor_account_id,
+            target_platform_account_id=target_account_id,
+        )
+
+    return ObservationResult(
+        status="persisted",
+        observation_id=int(cursor.lastrowid),
+        actor_platform_account_id=actor_account_id,
+        target_platform_account_id=target_account_id,
+    )
