@@ -303,7 +303,7 @@ def run_application(once: bool) -> int:
                 timezone.utc).isoformat())
         twitch_thread = threading.Thread(
             target=twitch_connector.run_twitch_safely,
-			args=(settings.twitch_bot_token or "",),
+			args=(settings.twitch_bot_token or "", service_states),
             name="twitch-connector",
         )
         twitch_thread.start()

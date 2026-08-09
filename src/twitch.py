@@ -293,7 +293,7 @@ class TwitchConnector:
 				finally:
 					self._active_socket = None
 
-	def run_twitch_safely(self, initial_token: str) -> None:
+	def run_twitch_safely(self, initial_token: str, service_states: dict[str, str]) -> None:
 		twitch_logger = logging.getLogger("qbot4k.twitch")
 		try:
 			self.run_forever(initial_token)

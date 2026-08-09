@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import tempfile
+import re
 from pathlib import Path
 
 _DOTENV_PATH = Path(__file__).resolve().parent.parent / ".env"

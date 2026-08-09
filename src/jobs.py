@@ -23,6 +23,7 @@ from .db import (
 	record_twitch_live_announcement,
 	upsert_discord_channel,
 )
+from .permissions import _everyone_cannot_view
 from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
@@ -48,7 +49,6 @@ _CHANNEL_MATCH_STOPWORDS = {
 	"working",
 	"giving",
 }
-
 
 @dataclass(frozen=True)
 class MaintenanceReport:
@@ -147,7 +147,7 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 		finally:
 			connection.close()
 
-		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name)
+		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name, guild_id=guild_id)
 		if not target_channel_id:
 			continue
 
@@ -200,7 +200,7 @@ def send_manual_twitch_live_announcements(settings: AppSettings) -> int:
 		if not guild_channels:
 			continue
 
-		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name)
+		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name, guild_id=guild_id)
 		if not target_channel_id:
 			continue
 
@@ -440,12 +440,18 @@ def _fetch_discord_guild_channels(guild_id: str, discord_bot_token: str) -> list
 			channels.append(item)
 	return channels
 
-
 def _pick_best_discord_channel_for_stream(
 	channels: list[dict[str, object]],
 	stream_title: str,
 	game_name: str,
+	guild_id: str,
 ) -> str | None:
+	channels = [
+		channel
+		for channel in channels
+		if not _everyone_cannot_view(channel, guild_id)
+	]
+
 	title_tokens = _tokenize(stream_title)
 	game_tokens = _tokenize(game_name)
 
