@@ -373,6 +373,53 @@ class DashboardTests(unittest.TestCase):
 
 		self.assertIn("viewer_one", body)
 
+	def test_signals_page_user_detail_and_apis_show_derived_signals(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		ingest_and_analyze(
+			connector,
+			{
+				"id": "dashboard-signal-message",
+				"timestamp": "2026-08-09T12:00:00Z",
+				"channel_id": "channel-1",
+				"guild_id": "guild-1",
+				"content": "you are an asshole",
+				"author": {"id": "dashboard-signal-user", "username": "signal_target", "bot": False},
+			},
+		)
+		connection = connect_database(self.database_path)
+		try:
+			user_id = int(connection.execute("SELECT id FROM users WHERE primary_display_name = 'signal_target'").fetchone()[0])
+		finally:
+			connection.close()
+
+		cookie = self._issue_operator_session_cookie()
+		signal_query = "signal=risk.composite&signal=activity.message_count&sort=evidence&dir=asc"
+		with self.opener.open(Request(f"{self.base_url}/signals?{signal_query}", headers={"Cookie": cookie})) as response:
+			signals_body = response.read().decode("utf-8")
+		with self.opener.open(Request(f"{self.base_url}/users/{user_id}", headers={"Cookie": cookie})) as response:
+			user_body = response.read().decode("utf-8")
+		with self.opener.open(Request(f"{self.base_url}/api/signals?{signal_query}", headers={"Cookie": cookie})) as response:
+			signals_api = json.loads(response.read().decode("utf-8"))
+		with self.opener.open(Request(f"{self.base_url}/api/users/{user_id}", headers={"Cookie": cookie})) as response:
+			user_api = json.loads(response.read().decode("utf-8"))
+
+		self.assertIn("Derived signals", signals_body)
+		self.assertIn("signal_target", signals_body)
+		self.assertIn("Composite risk", signals_body)
+		self.assertIn("multiple", signals_body)
+		self.assertIn("Ctrl/Cmd-click for multiple", signals_body)
+		self.assertIn("sort=value", signals_body)
+		self.assertIn("sort=confidence", signals_body)
+		self.assertIn("sort=evidence", signals_body)
+		self.assertIn("sort=timestamp", signals_body)
+		self.assertIn("Derived signals", user_body)
+		self.assertIn("Negative message ratio", user_body)
+		self.assertEqual(len(signals_api["items"]), 2)
+		self.assertEqual(signals_api["filters"]["signals"], ["risk.composite", "activity.message_count"])
+		self.assertEqual(signals_api["sort"], {"by": "evidence", "dir": "asc"})
+		self.assertEqual(len(user_api["signals"]), 9)
+		self.assertEqual(user_api["signals"][0]["signal_key"], "risk.composite")
+
 	def test_users_api_supports_sorting_by_requested_fields(self) -> None:
 		connector = DiscordConnector(self.database_path)
 		ingest_and_analyze(connector, 

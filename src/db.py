@@ -370,6 +370,30 @@ CREATE TABLE IF NOT EXISTS command_analysis_results (
 
     CHECK (matched IN (0, 1))
 );
+
+CREATE TABLE IF NOT EXISTS derived_signals (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    signal_key TEXT NOT NULL,
+    analyzer_version INTEGER NOT NULL,
+    value_real REAL NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    window_start TEXT,
+    window_end TEXT,
+    calculated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, signal_key, analyzer_version),
+    CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    CHECK(evidence_count >= 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_derived_signals_user
+    ON derived_signals(user_id, signal_key);
+
+CREATE INDEX IF NOT EXISTS idx_derived_signals_key_value
+    ON derived_signals(signal_key, value_real DESC);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (

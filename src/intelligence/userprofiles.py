@@ -11,6 +11,7 @@ from .powerusers import (
 	default_social_score_for_name,
 	enforced_social_score_for_name,
 )
+from .signals import refresh_user_derived_signals
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,9 @@ def link_platform_account(
 			""",
 			(operator_id, account[0], platform, platform_user_id, user_id),
 		)
+		refresh_user_derived_signals(connection, user_id)
+		if merged_from_user_id is not None:
+			refresh_user_derived_signals(connection, merged_from_user_id)
 
 
 def unlink_platform_account(
@@ -209,6 +213,8 @@ def unlink_platform_account(
 			""",
 			(operator_id, account[0], platform, platform_user_id),
 		)
+		if account[1] is not None:
+			refresh_user_derived_signals(connection, int(account[1]))
 
 
 def get_canonical_user_profile(
@@ -358,4 +364,3 @@ def list_user_notes(
 		(user_id,),
 	).fetchall()
 	return list(rows)
-

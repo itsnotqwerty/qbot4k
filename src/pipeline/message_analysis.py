@@ -14,6 +14,7 @@ from ..commands import (
 )
 from ..db import enqueue_processing_job, get_observation, persist_normalized_message, normalized_message_from_observation
 from ..models import NormalizedMessage
+from ..intelligence.signals import refresh_user_derived_signals
 
 
 MESSAGE_ANALYSIS_JOB_TYPE = "analyze.message.created"
@@ -97,6 +98,18 @@ class MessageAnalysisPipeline:
         with connection:
             _project_message(connection, message, observation_id)
             self._analyze_command(connection, message, observation_id)
+            user_row = connection.execute(
+                """
+                SELECT platform_accounts.user_id
+                FROM messages
+                INNER JOIN platform_accounts
+                    ON platform_accounts.id = messages.platform_account_id
+                WHERE messages.observation_id = ?
+                """,
+                (observation_id,),
+            ).fetchone()
+            if user_row is not None and user_row[0] is not None:
+                refresh_user_derived_signals(connection, int(user_row[0]))
 
     def _analyze_command(
         self,

@@ -9,6 +9,7 @@ class OverviewSnapshot:
 	messages_total: int
 	open_reviews: int
 	pending_actions: int
+	derived_signals: int
 	top_channels: tuple[tuple[str, int], ...]
 	top_platforms: tuple[tuple[str, int], ...]
 
@@ -21,6 +22,7 @@ def load_overview_snapshot(connection: sqlite3.Connection) -> OverviewSnapshot:
 	pending_actions = connection.execute(
 		"SELECT COUNT(*) FROM moderation_actions WHERE status = 'pending'"
 	).fetchone()[0]
+	derived_signals = connection.execute("SELECT COUNT(*) FROM derived_signals").fetchone()[0]
 	top_channels = connection.execute(
 		"""
 		SELECT
@@ -50,6 +52,7 @@ def load_overview_snapshot(connection: sqlite3.Connection) -> OverviewSnapshot:
 		messages_total=int(messages_total),
 		open_reviews=int(open_reviews),
 		pending_actions=int(pending_actions),
+		derived_signals=int(derived_signals),
 		top_channels=tuple(
 			(
 				f"#{str(row[2])}" if str(row[0]) == "discord" and row[2] is not None else str(row[1]),

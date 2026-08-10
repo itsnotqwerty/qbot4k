@@ -4,7 +4,7 @@ import logging
 import hashlib
 import hmac
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -32,6 +32,12 @@ from ..intelligence.userprofiles import (
     get_canonical_user_profile,
     link_platform_account,
     unlink_platform_account,
+)
+from ..intelligence.signals import (
+    SIGNAL_LABELS,
+    derived_signal_count,
+    list_signal_overview,
+    list_user_derived_signals,
 )
 from ..jobs import send_manual_twitch_live_announcements
 from .auth import (
@@ -94,6 +100,9 @@ class DashboardApp:
 		if handler.command == "GET" and path == "/users":
 			self._serve_users(handler, parse_qs(parsed.query))
 			return True
+		if handler.command == "GET" and path == "/signals":
+			self._serve_signals(handler, parse_qs(parsed.query))
+			return True
 		if handler.command == "POST" and path == "/users/link":
 			self._serve_users_link(handler)
 			return True
@@ -128,6 +137,9 @@ class DashboardApp:
 			return True
 		if handler.command == "GET" and path == "/api/users":
 			self._serve_api_users(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "GET" and path == "/api/signals":
+			self._serve_api_signals(handler, parse_qs(parsed.query))
 			return True
 		if handler.command == "GET" and path.startswith("/api/users/"):
 			self._serve_api_user_detail(handler, path)
@@ -756,6 +768,7 @@ class DashboardApp:
 			platform_accounts = list_user_platform_accounts(connection, user_id)
 			moderation_status = get_user_moderation_status(connection, user_id)
 			recent_moderation_actions = list_recent_user_moderation_actions(connection, user_id)
+			derived_signals = list_user_derived_signals(connection, user_id) if user_id >= 0 else []
 		finally:
 			connection.close()
 
@@ -770,6 +783,17 @@ class DashboardApp:
 		action_rows = "".join(
 			f"<tr><td>{self._escape(item.created_at)}</td><td>{self._escape(item.platform)}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.action_type)}</td><td>{self._escape(item.status)}</td><td>{self._escape(item.reason or '')}</td></tr>"
 			for item in recent_moderation_actions
+		)
+		signal_rows = "".join(
+			"<tr>"
+			+ f"<td>{self._escape(signal.label)}</td>"
+			+ f"<td>{self._escape(self._format_signal_value(signal.signal_key, signal.value))}</td>"
+			+ f"<td>{signal.confidence * 100:.0f}%</td>"
+			+ f"<td>{signal.evidence_count}</td>"
+			+ f"<td>{self._escape(signal.window_start or 'n/a')} → {self._escape(signal.window_end or 'n/a')}</td>"
+			+ f"<td>v{signal.analyzer_version}</td>"
+			+ "</tr>"
+			for signal in derived_signals
 		)
 		account_options = "".join(
 			f"<option value='{item.platform_account_id}'>{self._escape(item.platform)} · {self._escape(item.username)} ({self._escape(item.platform_user_id)})</option>"
@@ -805,6 +829,11 @@ class DashboardApp:
 			+ f"<div class='grid'><div class='metric'><div class='label'>Reputation</div><div class='value'>{selected_user.current_reputation_score}</div></div><div class='metric'><div class='label'>Power User</div><div class='value'>{'yes' if selected_user.candidate_flag else 'no'}</div></div><div class='metric'><div class='label'>Accounts</div><div class='value'>{selected_user.account_count}</div></div><div class='metric'><div class='label'>Messages</div><div class='value'>{selected_user.message_count}</div></div></div>"
 			+ "</section>"
 			+ "<section class='card'>"
+			+ "<h2>Derived signals</h2>"
+			+ "<p class='lede'>Persistent, versioned measurements derived from this profile's accumulated evidence.</p>"
+			+ f"<div class='table-scroll'><table class='table'><thead><tr><th>Signal</th><th>Value</th><th>Confidence</th><th>Evidence</th><th>Window</th><th>Analyzer</th></tr></thead><tbody>{signal_rows or '<tr><td colspan=6>No derived signals calculated</td></tr>'}</tbody></table></div>"
+			+ "</section>"
+			+ "<section class='card'>"
 			+ "<h2>Moderation status</h2>"
 			+ moderation_notice
 			+ f"<div class='grid'><div class='metric'><div class='label'>Open reviews</div><div class='value'>{moderation_status.open_reviews}</div></div><div class='metric'><div class='label'>Pending actions</div><div class='value'>{moderation_status.pending_actions}</div></div><div class='metric'><div class='label'>Completed actions</div><div class='value'>{moderation_status.completed_actions}</div></div><div class='metric'><div class='label'>Total actions</div><div class='value'>{moderation_status.recent_actions}</div></div></div>"
@@ -813,6 +842,80 @@ class DashboardApp:
 			+ "</section>"
 			+ f"<table><thead><tr><th>Action At</th><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=6>No moderation actions found</td></tr>'}</tbody></table>"
 			+ f"<table><thead><tr><th>Sent</th><th>Platform</th><th>Channel</th><th>Message</th></tr></thead><tbody>{message_rows or '<tr><td colspan=4>No messages found</td></tr>'}</tbody></table>"
+		)
+		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_signals(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		selected_signals, sort_by, sort_dir = self._normalize_signal_query(query)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			items = list_signal_overview(
+				connection,
+				signal_keys=selected_signals,
+				sort_by=sort_by,
+				sort_dir=sort_dir,
+				limit=500,
+			)
+			total = derived_signal_count(connection)
+			profile_count = int(connection.execute("SELECT COUNT(DISTINCT user_id) FROM derived_signals").fetchone()[0])
+			high_risk_count = int(connection.execute("SELECT COUNT(*) FROM derived_signals WHERE signal_key = 'risk.composite' AND value_real >= 50").fetchone()[0])
+		finally:
+			connection.close()
+
+		def _signal_query(*, sort: str | None = None, direction: str | None = None) -> str:
+			params: list[tuple[str, str]] = [("signal", key) for key in selected_signals]
+			params.append(("sort", sort or sort_by))
+			params.append(("dir", direction or sort_dir))
+			return urlencode(params)
+
+		def _sort_header(label: str, key: str) -> str:
+			is_current = sort_by == key
+			next_dir = "asc" if not is_current or sort_dir == "desc" else "desc"
+			indicator = " ↑" if is_current and sort_dir == "asc" else " ↓" if is_current else ""
+			return f"<a href='/signals?{_signal_query(sort=key, direction=next_dir)}'>{self._escape(label + indicator)}</a>"
+
+		options = "".join(
+			f"<option value='{self._escape(key)}' {'selected' if key in selected_signals else ''}>{self._escape(label)}</option>"
+			for key, label in SIGNAL_LABELS.items()
+		)
+		filter_form = (
+			"<form class='signal-filter' method='get' action='/signals'>"
+			+ "<label><h2>Signals</h2><span class='muted'>Select one or more signals with (ctrl+click) to filter the inventory.</span>"
+			+ f"<select name='signal' multiple size='6'>{options}</select></label>"
+			+ f"<input type='hidden' name='sort' value='{self._escape(sort_by)}'>"
+			+ f"<input type='hidden' name='dir' value='{self._escape(sort_dir)}'>"
+			+ "<div class='row-actions'>"
+			+ "<div class='signal-filter-actions'>"
+			+ "<button type='submit'>Apply</button>"
+			+ "<button type='button' onclick=\"window.location.href='/signals'\">Clear</button></div>"
+			+ "</div>"
+			+ "</form>"
+		)
+
+		rows = "".join(
+			"<tr>"
+			+ f"<td><a href='/users/{signal.user_id}'>{self._escape(display_name)}</a></td>"
+			+ f"<td>{self._escape(signal.label)}</td>"
+			+ f"<td>{self._escape(self._format_signal_value(signal.signal_key, signal.value))}</td>"
+			+ f"<td>{signal.confidence * 100:.0f}%</td>"
+			+ f"<td>{signal.evidence_count}</td>"
+			+ f"<td>{self._escape(signal.calculated_at or '')}</td>"
+			+ "</tr>"
+			for display_name, signal in items
+		)
+		body = self._render_page(
+			"Signals",
+			session,
+			"<section class='hero'><div><p class='eyebrow'>Intelligence</p><h1>Derived signals</h1>"
+			+ "<p class='lede'>Explainable behavioral and operational measurements derived from accumulated observations.</p></div></section>"
+			+ f"<div class='grid'><div class='metric'><div class='label'>Signals</div><div class='value'>{total}</div></div><div class='metric'><div class='label'>Profiles measured</div><div class='value'>{profile_count}</div></div><div class='metric'><div class='label'>High risk profiles</div><div class='value'>{high_risk_count}</div></div></div>"
+			+ filter_form
+			+ "<section class='card'><h2>Signal inventory</h2>"
+			+ f"<div class='table-scroll'><table class='table'><thead><tr><th>Profile</th><th>{_sort_header('Signal', 'signal')}</th><th>{_sort_header('Value', 'value')}</th><th>{_sort_header('Confidence', 'confidence')}</th><th>{_sort_header('Evidence', 'evidence')}</th><th>{_sort_header('Timestamp', 'timestamp')}</th></tr></thead><tbody>{rows or '<tr><td colspan=6>No derived signals calculated</td></tr>'}</tbody></table></div></section>",
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
 
@@ -1082,6 +1185,57 @@ class DashboardApp:
 			connection.close()
 		self._send_json(handler, HTTPStatus.OK, {"items": [item.__dict__ for item in users]})
 
+	def _serve_api_signals(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		selected_signals, sort_by, sort_dir = self._normalize_signal_query(query)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			items = list_signal_overview(
+				connection,
+				signal_keys=selected_signals,
+				sort_by=sort_by,
+				sort_dir=sort_dir,
+				limit=500,
+			)
+		finally:
+			connection.close()
+		self._send_json(
+			handler,
+			HTTPStatus.OK,
+			{
+				"filters": {"signals": list(selected_signals)},
+				"sort": {"by": sort_by, "dir": sort_dir},
+				"items": [
+					{
+						"display_name": display_name,
+						**asdict(signal),
+						"label": signal.label,
+					}
+					for display_name, signal in items
+				]
+			},
+		)
+
+	@staticmethod
+	def _normalize_signal_query(query: Mapping[str, list[str]]) -> tuple[tuple[str, ...], str, str]:
+		selected = tuple(
+			dict.fromkeys(
+				key.strip()
+				for key in query.get("signal", [])
+				if key.strip() in SIGNAL_LABELS
+			)
+		)
+		sort_by = (query.get("sort") or ["default"])[0].strip().casefold()
+		if sort_by not in {"default", "signal", "value", "confidence", "evidence", "timestamp"}:
+			sort_by = "default"
+		sort_dir = (query.get("dir") or ["desc"])[0].strip().casefold()
+		if sort_dir not in {"asc", "desc"}:
+			sort_dir = "desc"
+		return selected, sort_by, sort_dir
+
 	def _normalize_user_sort(self, sort_by_raw: str, sort_dir_raw: str) -> tuple[str, str]:
 		sort_by = (sort_by_raw or "score").strip().casefold()
 		if sort_by not in {"score", "messages", "poweruser", "accounts", "name"}:
@@ -1109,9 +1263,17 @@ class DashboardApp:
 		try:
 			initialize_database(connection)
 			profile = get_canonical_user_profile(connection, user_id)
+			signals = list_user_derived_signals(connection, user_id)
 		finally:
 			connection.close()
-		self._send_json(handler, HTTPStatus.OK, {"user": profile.__dict__})
+		self._send_json(
+			handler,
+			HTTPStatus.OK,
+			{
+				"user": asdict(profile),
+				"signals": [{**asdict(signal), "label": signal.label} for signal in signals],
+			},
+		)
 
 	def _serve_api_link_user(self, handler: BaseHTTPRequestHandler) -> None:
 		session = self._require_session(handler, admin_only=True)
@@ -1450,6 +1612,15 @@ table {{ width: 100%; max-width: 100%; border-collapse: collapse; margin-top: 14
 th, td {{ padding: 12px 14px; border-bottom: 1px solid var(--border); text-align: left; }}
 th {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }}
 form.search {{ display: flex; gap: 10px; margin: 18px 0; flex-wrap: wrap; }}
+.signal-filter {{ display: flex; align-items: flex-end; gap: 14px; margin: 18px 0; padding: 18px; border: 1px solid var(--border); border-radius: 18px; background: var(--panel); flex-wrap: wrap; }}
+.signal-filter label {{ display: grid; gap: 8px; min-width: min(100%, 360px); flex: 1; }}
+.signal-filter select[multiple] {{ width: 100%; min-height: 150px; }}
+.signal-filter-actions {{
+    display: grid;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+	gap: 0.5rem;
+}}
 input {{ flex: 1; min-width: 0; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); max-width: 100%; }}
 textarea {{ width: 100%; min-width: 0; max-width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); resize: vertical; }}
 select {{ min-width: 0; max-width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
@@ -1490,7 +1661,7 @@ table textarea {{
 
 .command-page .builtin-title-input {{
   width: 100%;
-  min-width: 0;
+  min-width: 140px;
   box-sizing: border-box;
 }}
 
@@ -1542,7 +1713,7 @@ table textarea {{
 .command-page .insert-row code {{ color: var(--accent); }}
 @media (max-width: 1100px) {{ .command-page .new-command-form {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }} .command-page .new-command-form > * {{ width: 100%; min-width: 0; }} .command-page .new-command-form .new-command-enabled {{ margin-left: 0; margin-right: 0; }} .command-page .new-command-form button {{ width: 100%; }} }}
 @media (max-width: 900px) {{ .shell {{ grid-template-columns: 1fr; }} .nav {{ border-right: 0; border-bottom: 1px solid var(--border); }} .columns {{ grid-template-columns: 1fr; }} .sticky-link-panel {{ position: static; }} }}
-@media (max-width: 700px) {{ body {{ font-size: 14px; }} .main {{ padding: 16px; }} .nav {{ padding: 18px 14px; }} .hero, .card {{ padding: 16px; border-radius: 16px; }} .grid {{ grid-template-columns: 1fr; }} .toolbar, .status-row, form.search, .command-page .new-command-form, .command-page .row-actions {{ align-items: stretch; }} form.search > *, .toolbar > *, .command-page .new-command-form > *, .command-page .row-actions > * {{ width: 100%; }} button {{ width: 100%; }} .metric .value {{ font-size: 24px; }} th, td {{ padding: 10px 12px; white-space: nowrap; }} .command-page .new-command-form .new-command-name, .command-page .new-command-form .new-command-response {{ min-width: 0; }} .command-page table input:not([type='checkbox']), .command-page table textarea {{ min-width: 0; width: 100%; }} .template-dialog {{ width: calc(100vw - 16px); }} .template-dialog-inner {{ padding: 16px; }} }}
+@media (max-width: 700px) {{ body {{ font-size: 14px; }} .main {{ padding: 16px; }} .nav {{ padding: 18px 14px; }} .hero, .card {{ padding: 16px; border-radius: 16px; }} .grid {{ grid-template-columns: 1fr; }} .toolbar, .status-row, form.search, .command-page .new-command-form, .command-page .row-actions {{ align-items: stretch; }} form.search > *, .toolbar > *, .command-page .new-command-form > *, .command-page .row-actions > * {{ width: 100%; }} button {{ width: 100%; }} .metric .value {{ font-size: 24px; }} th, td {{ padding: 10px 12px; white-space: nowrap; }} .command-page .new-command-form .new-command-name, .command-page .new-command-form .new-command-response {{ min-width: 0; }} .command-page table input:not([type='checkbox']), .command-page table textarea {{ width: 100%; }} .template-dialog {{ width: calc(100vw - 16px); }} .template-dialog-inner {{ padding: 16px; }} }}
 </style>
 </head>
 <body>
@@ -1553,6 +1724,7 @@ table textarea {{
 <nav>
 <a href='/dashboard'>Overview</a>
 <a href='/system-health'>Health</a>
+<a href='/signals'>Signals</a>
 <a href='/users'>Users</a>
 <a href='/moderation'>Moderation</a>
 		<a href='/commands'>Commands</a>
@@ -1580,7 +1752,17 @@ document.addEventListener("DOMContentLoaded", () => {{
 			f"<div class='metric'><div class='label'>{self._escape(channel)}</div><div class='value'>{count}</div></div>"
 			for channel, count in overview.top_channels
 		)
-		return f"<div class='grid'><div class='metric'><div class='label'>Messages</div><div class='value'>{overview.messages_total}</div></div><div class='metric'><div class='label'>Open reviews</div><div class='value'>{overview.open_reviews}</div></div><div class='metric'><div class='label'>Pending actions</div><div class='value'>{overview.pending_actions}</div></div></div><div class='grid'>{platform_cards}{channel_cards}</div>"
+		return f"<div class='grid'><div class='metric'><div class='label'>Messages</div><div class='value'>{overview.messages_total}</div></div><div class='metric'><div class='label'>Derived signals</div><div class='value'>{overview.derived_signals}</div></div><div class='metric'><div class='label'>Open reviews</div><div class='value'>{overview.open_reviews}</div></div><div class='metric'><div class='label'>Pending actions</div><div class='value'>{overview.pending_actions}</div></div></div><div class='grid'>{platform_cards}{channel_cards}</div>"
+
+	@staticmethod
+	def _format_signal_value(signal_key: str, value: float) -> str:
+		if signal_key.endswith("_ratio"):
+			return f"{value * 100:.1f}%"
+		if signal_key == "risk.composite":
+			return f"{value:.1f} / 100"
+		if float(value).is_integer():
+			return str(int(value))
+		return f"{value:.2f}"
 
 	def _send_json(self, handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: Mapping[str, object]) -> None:
 		response = json.dumps(payload, sort_keys=True).encode("utf-8")

@@ -26,6 +26,7 @@ from .db import (
 from .permissions import _everyone_cannot_view
 from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
+from .intelligence.signals import refresh_all_derived_signals
 
 
 JobConnectionFactory = Callable[[Path], sqlite3.Connection]
@@ -80,6 +81,7 @@ def run_maintenance_jobs(
 		initialize_database(connection)
 		deleted_messages = purge_expired_messages(connection, current_time, settings.message_retention_days)
 		deleted_audit_rows = purge_expired_audit_log(connection, current_time, settings.audit_retention_days)
+		refresh_all_derived_signals(connection)
 		rollup_rows = refresh_metrics_rollups(connection, current_time)
 	finally:
 		connection.close()
