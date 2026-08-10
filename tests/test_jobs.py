@@ -82,6 +82,9 @@ class JobTests(unittest.TestCase):
 			initialize_database(connection)
 			message_count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
 			audit_count = connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0]
+			audit_actions = [str(row[0]) for row in connection.execute(
+				"SELECT action_type FROM audit_log ORDER BY id"
+			).fetchall()]
 			rollups = connection.execute(
 				"SELECT metric_name, value FROM metrics_rollups ORDER BY metric_name"
 			).fetchall()
@@ -92,7 +95,8 @@ class JobTests(unittest.TestCase):
 		self.assertEqual(report.deleted_audit_log_rows, 1)
 		self.assertEqual(report.rollup_rows, 5)
 		self.assertEqual(message_count, 0)
-		self.assertEqual(audit_count, 0)
+		self.assertEqual(audit_count, 1)
+		self.assertEqual(audit_actions, ["social_score.calculated"])
 		self.assertEqual([row[0] for row in rollups], ["messages_total", "observations_24h", "observations_total", "open_reviews", "pending_actions"])
 		self.assertEqual([row[1] for row in rollups], [0.0, 0.0, 0.0, 0.0, 0.0])
 

@@ -7,17 +7,23 @@ from datetime import datetime, timezone
 from typing import Mapping
 
 
-SIGNAL_ANALYZER_VERSION = 1
+SIGNAL_ANALYZER_VERSION = 2
 
 SIGNAL_LABELS: Mapping[str, str] = {
     "activity.message_count": "Messages observed",
+    "activity.eligible_message_count": "Score-eligible messages",
     "activity.active_channel_count": "Active channels",
     "activity.platform_count": "Observed platforms",
     "identity.linked_account_count": "Linked accounts",
     "behavior.positive_message_ratio": "Positive message ratio",
     "behavior.negative_message_ratio": "Negative message ratio",
+    "behavior.negative_severity_points": "Negative content severity",
+    "behavior.reply_to_human_count": "Human replies",
     "behavior.welcome_count": "Welcome messages",
+    "behavior.welcome_duplicate_count": "Duplicate welcomes",
     "moderation.finding_count": "Moderation findings",
+    "moderation.penalty_points": "Moderation penalty evidence",
+    "moderation.severity_index": "Moderation severity index",
     "risk.composite": "Composite risk",
 }
 
@@ -44,10 +50,7 @@ def refresh_user_derived_signals(
     connection: sqlite3.Connection,
     user_id: int,
 ) -> list[DerivedSignal]:
-    user_row = connection.execute(
-        "SELECT current_reputation_score FROM users WHERE id = ?",
-        (user_id,),
-    ).fetchone()
+    user_row = connection.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
     if user_row is None:
         raise ValueError(f"User {user_id} does not exist")
 
@@ -77,18 +80,28 @@ def refresh_user_derived_signals(
             (user_id,),
         ).fetchone()[0]
     )
-    sentiment = connection.execute(
+    behavior = connection.execute(
         """
         SELECT
-            SUM(CASE WHEN delta > 0 THEN 1 ELSE 0 END),
-            SUM(CASE WHEN delta < 0 THEN 1 ELSE 0 END)
+            COUNT(DISTINCT CASE WHEN reason_code IN ('message_sent', 'positive_message', 'very_negative_content', 'reply_to_non_bot') THEN source_id END),
+            SUM(CASE WHEN reason_code = 'positive_message' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN reason_code = 'very_negative_content' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN reason_code = 'very_negative_content' THEN ABS(delta) ELSE 0 END),
+            SUM(CASE WHEN reason_code = 'reply_to_non_bot' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN reason_code = 'welcome_new_user' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN reason_code = 'welcome_spam_duplicate' THEN 1 ELSE 0 END)
         FROM reputation_events
         WHERE user_id = ? AND source_type = 'message'
         """,
         (user_id,),
     ).fetchone()
-    positive_count = int(sentiment[0] or 0)
-    negative_count = int(sentiment[1] or 0)
+    eligible_message_count = int(behavior[0] or 0)
+    positive_count = int(behavior[1] or 0)
+    negative_count = int(behavior[2] or 0)
+    negative_points = int(behavior[3] or 0)
+    reply_count = int(behavior[4] or 0)
+    welcome_positive_count = int(behavior[5] or 0)
+    welcome_duplicate_count = int(behavior[6] or 0)
     positive_ratio = positive_count / message_count if message_count else 0.0
     negative_ratio = negative_count / message_count if message_count else 0.0
 
@@ -104,23 +117,31 @@ def refresh_user_derived_signals(
             (user_id,),
         ).fetchone()[0]
     )
-    finding_count = int(
-        connection.execute(
+    moderation = connection.execute(
             """
-            SELECT COUNT(*)
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE severity WHEN 'high' THEN 1.0 WHEN 'medium' THEN 0.6 ELSE 0.25 END), 0.0)
             FROM rule_matches
             INNER JOIN messages ON messages.id = rule_matches.message_id
             INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
             WHERE platform_accounts.user_id = ?
             """,
             (user_id,),
-        ).fetchone()[0]
-    )
+        ).fetchone()
+    finding_count = int(moderation[0] or 0)
+    severity_points = float(moderation[1] or 0.0)
+    moderation_penalty_points = int(connection.execute(
+        """
+        SELECT COALESCE(SUM(ABS(delta)), 0) FROM reputation_events
+        WHERE user_id = ? AND source_type = 'moderation'
+        """,
+        (user_id,),
+    ).fetchone()[0])
     moderation_rate = min(1.0, finding_count / message_count) if message_count else 0.0
-    reputation_score = int(user_row[0])
-    reputation_deficit = min(1.0, max(0.0, (500 - reputation_score) / 500))
+    severity_rate = min(1.0, severity_points / message_count) if message_count else 0.0
     risk_score = round(
-        min(100.0, negative_ratio * 45.0 + moderation_rate * 35.0 + reputation_deficit * 20.0),
+        min(100.0, negative_ratio * 45.0 + moderation_rate * 35.0 + severity_rate * 20.0),
         2,
     )
     behavioral_confidence = round(min(1.0, message_count / 20.0), 4)
@@ -128,13 +149,19 @@ def refresh_user_derived_signals(
 
     signals = [
         _signal(user_id, "activity.message_count", message_count, message_count, window_start, window_end, {"unit": "messages"}, calculated_at),
+        _signal(user_id, "activity.eligible_message_count", eligible_message_count, message_count, window_start, window_end, {"unit": "messages", "excludes": ["commands", "empty_messages"]}, calculated_at, confidence=behavioral_confidence),
         _signal(user_id, "activity.active_channel_count", channel_count, message_count, window_start, window_end, {"unit": "channels"}, calculated_at),
         _signal(user_id, "activity.platform_count", platform_count, message_count, window_start, window_end, {"unit": "platforms"}, calculated_at),
         _signal(user_id, "identity.linked_account_count", account_count, account_count, None, None, {"unit": "accounts"}, calculated_at, confidence=1.0),
         _signal(user_id, "behavior.positive_message_ratio", positive_ratio, message_count, window_start, window_end, {"positive_messages": positive_count, "message_count": message_count, "unit": "ratio"}, calculated_at, confidence=behavioral_confidence),
         _signal(user_id, "behavior.negative_message_ratio", negative_ratio, message_count, window_start, window_end, {"negative_messages": negative_count, "message_count": message_count, "unit": "ratio"}, calculated_at, confidence=behavioral_confidence),
-        _signal(user_id, "behavior.welcome_count", welcome_count, message_count, window_start, window_end, {"unit": "welcome_events"}, calculated_at),
+        _signal(user_id, "behavior.negative_severity_points", negative_points, negative_count, window_start, window_end, {"unit": "legacy_penalty_points", "source": "classified_message_evidence"}, calculated_at, confidence=behavioral_confidence),
+        _signal(user_id, "behavior.reply_to_human_count", reply_count, reply_count, window_start, window_end, {"unit": "replies"}, calculated_at, confidence=behavioral_confidence),
+        _signal(user_id, "behavior.welcome_count", welcome_positive_count, welcome_count, window_start, window_end, {"unit": "welcome_events", "all_welcome_events": welcome_count}, calculated_at),
+        _signal(user_id, "behavior.welcome_duplicate_count", welcome_duplicate_count, welcome_duplicate_count, window_start, window_end, {"unit": "duplicate_welcome_events"}, calculated_at, confidence=behavioral_confidence),
         _signal(user_id, "moderation.finding_count", finding_count, message_count, window_start, window_end, {"unit": "findings"}, calculated_at),
+        _signal(user_id, "moderation.penalty_points", moderation_penalty_points, finding_count, window_start, window_end, {"unit": "legacy_penalty_points", "source": "moderation_evidence"}, calculated_at, confidence=behavioral_confidence),
+        _signal(user_id, "moderation.severity_index", severity_rate, finding_count, window_start, window_end, {"weighted_severity": round(severity_points, 4), "message_count": message_count, "unit": "ratio"}, calculated_at, confidence=behavioral_confidence),
         _signal(
             user_id,
             "risk.composite",
@@ -146,8 +173,9 @@ def refresh_user_derived_signals(
                 "unit": "score_0_100",
                 "negative_ratio": round(negative_ratio, 4),
                 "moderation_rate": round(moderation_rate, 4),
-                "reputation_score": reputation_score,
-                "formula": "negative_ratio*45 + moderation_rate*35 + reputation_deficit*20",
+                "severity_rate": round(severity_rate, 4),
+                "formula": "negative_ratio*45 + moderation_rate*35 + severity_rate*20",
+                "independent_of_social_score": True,
             },
             calculated_at,
             confidence=behavioral_confidence,
@@ -205,14 +233,14 @@ def list_user_derived_signals(
         SELECT signal_key, value_real, confidence, evidence_count,
                window_start, window_end, value_json, analyzer_version, calculated_at
         FROM derived_signals
-        WHERE user_id = ?
+        WHERE user_id = ? AND analyzer_version = ?
         ORDER BY CASE signal_key
             WHEN 'risk.composite' THEN 0
             WHEN 'activity.message_count' THEN 1
             ELSE 2
         END, signal_key
         """,
-        (user_id,),
+        (user_id, SIGNAL_ANALYZER_VERSION),
     ).fetchall()
     return [_from_row(user_id, row) for row in rows]
 
@@ -241,11 +269,12 @@ def list_signal_overview(
         "evidence": f"derived_signals.evidence_count {direction_sql}",
         "timestamp": f"derived_signals.calculated_at {direction_sql}",
     }[normalized_sort]
-    where_sql = ""
-    bindings: list[object] = []
+    conditions = ["derived_signals.analyzer_version = ?"]
+    bindings: list[object] = [SIGNAL_ANALYZER_VERSION]
     if selected_keys:
-        where_sql = f"WHERE derived_signals.signal_key IN ({','.join('?' for _ in selected_keys)})"
+        conditions.append(f"derived_signals.signal_key IN ({','.join('?' for _ in selected_keys)})")
         bindings.extend(selected_keys)
+    where_sql = "WHERE " + " AND ".join(conditions)
     bindings.append(max(1, min(limit, 500)))
     rows = connection.execute(
         f"""
@@ -272,7 +301,10 @@ def list_signal_overview(
 
 
 def derived_signal_count(connection: sqlite3.Connection) -> int:
-    return int(connection.execute("SELECT COUNT(*) FROM derived_signals").fetchone()[0])
+    return int(connection.execute(
+        "SELECT COUNT(*) FROM derived_signals WHERE analyzer_version = ?",
+        (SIGNAL_ANALYZER_VERSION,),
+    ).fetchone()[0])
 
 
 def _signal(

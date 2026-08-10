@@ -348,6 +348,8 @@ def _credit_command(context: CommandContext) -> CommandReply | None:
 		CommandField(name="Social Credit", value=str(profile.current_reputation_score), inline=True),
 		CommandField(name="Power User", value="Yes" if profile.candidate_flag else "No", inline=True),
 		CommandField(name="Linked Accounts", value=linked_accounts, inline=False),
+		CommandField(name="Score Band", value=profile.score_band.title(), inline=True),
+		CommandField(name="Evidence Confidence", value=f"{profile.score_confidence * 100:.0f}%", inline=True),
 	)
 	fields = list(field_values)
 	if recent_note is not None:

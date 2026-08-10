@@ -11,16 +11,6 @@ SOCIAL_SCORE_MAX = 900
 SOCIAL_SCORE_DEFAULT = 500
 POWERUSER_THRESHOLD = 700
 
-_MAX_SCORE_DEFAULT_HANDLES = {
-	"apollyon",
-	"its_not_qwerty",
-}
-
-_FIXED_SOCIAL_SCORE_BY_NAME = {
-	"apollyon": SOCIAL_SCORE_MAX,
-	"its_not_qwerty": SOCIAL_SCORE_MAX,
-}
-
 _POSITIVE_TERMS = {
 	"thanks",
 	"thank you",
@@ -231,17 +221,33 @@ def average_social_scores(first_score: int, second_score: int) -> int:
 
 
 def default_social_score_for_name(display_name: str) -> int:
-	normalized = display_name.strip().casefold()
-	if normalized in _MAX_SCORE_DEFAULT_HANDLES:
-		return SOCIAL_SCORE_MAX
 	return SOCIAL_SCORE_DEFAULT
 
 
 def enforced_social_score_for_name(display_name: str, proposed_score: int) -> int:
-	normalized = display_name.strip().casefold()
-	if normalized in _FIXED_SOCIAL_SCORE_BY_NAME:
-		return int(_FIXED_SOCIAL_SCORE_BY_NAME[normalized])
 	return clamp_social_score(proposed_score)
+
+
+def record_reputation_evidence(
+	connection: sqlite3.Connection,
+	*,
+	user_id: int,
+	delta: int,
+	reason_code: str,
+	source_type: str,
+	source_id: int | None = None,
+) -> int:
+	"""Record classified evidence without directly mutating the materialized score."""
+	if connection.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone() is None:
+		raise ValueError("canonical user not found")
+	cursor = connection.execute(
+		"""
+		INSERT INTO reputation_events (user_id, source_type, source_id, delta, reason_code)
+		VALUES (?, ?, ?, ?, ?)
+		""",
+		(user_id, source_type, source_id, delta, reason_code),
+	)
+	return int(cursor.lastrowid)
 
 
 def score_delta_for_message(content_raw: str) -> tuple[int, str] | None:
@@ -350,7 +356,7 @@ def apply_reputation_event(
 			(updated_score, int(candidate_flag), user_id),
 		)
 		if current_score > minimum_score and updated_score <= minimum_score:
-			_enforce_score_floor_ban(connection, user_id=user_id, floor_score=minimum_score)
+			enforce_score_floor_ban(connection, user_id=user_id, floor_score=minimum_score)
 		connection.execute(
 			"""
 			INSERT INTO audit_log (
@@ -381,7 +387,7 @@ def apply_reputation_event(
 	)
 
 
-def _enforce_score_floor_ban(
+def enforce_score_floor_ban(
 	connection: sqlite3.Connection,
 	*,
 	user_id: int,

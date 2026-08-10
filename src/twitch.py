@@ -19,7 +19,9 @@ from .db import (
 	upsert_twitch_channel,
 	collect_observation
 )
-from .intelligence.powerusers import apply_reputation_event, score_delta_for_moderation
+from .intelligence.powerusers import record_reputation_evidence, score_delta_for_moderation
+from .intelligence.scoring import calculate_social_score
+from .intelligence.signals import refresh_user_derived_signals
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
@@ -534,7 +536,7 @@ class TwitchConnector:
 				action_type="timeout",
 				reason_code="streamboo_viewer_spam",
 			)
-			apply_reputation_event(
+			record_reputation_evidence(
 				connection,
 				user_id=int(user_row[0]),
 				delta=delta,
@@ -542,5 +544,7 @@ class TwitchConnector:
 				source_type="moderation",
 				source_id=message_id,
 			)
+			refresh_user_derived_signals(connection, int(user_row[0]))
+			calculate_social_score(connection, int(user_row[0]))
 		finally:
 			connection.close()

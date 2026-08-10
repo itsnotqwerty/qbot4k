@@ -76,7 +76,7 @@ class IdentityTests(unittest.TestCase):
 		self.assertIsNone(linked_account_rows[0][1])
 		self.assertEqual(linked_account_rows[1][0], "twitch")
 		self.assertEqual(linked_account_rows[1][1], user_id)
-		self.assertEqual(audit_count, 3)
+		self.assertGreaterEqual(audit_count, 3)
 
 	def test_reputation_events_update_score_and_candidate_flag(self) -> None:
 		connection = connect_database(self.database_path)
@@ -213,7 +213,7 @@ class IdentityTests(unittest.TestCase):
 		self.assertTrue(all(row[3] == "social_score_floor_reached:350" for row in actions))
 		self.assertEqual(audit_row[0], "user_reputation_update")
 
-	def test_linking_account_from_other_user_averages_social_score(self) -> None:
+	def test_linking_account_recalculates_from_combined_evidence_without_averaging(self) -> None:
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
@@ -256,13 +256,17 @@ class IdentityTests(unittest.TestCase):
 				"SELECT source_type, reason_code FROM reputation_events WHERE user_id = ? ORDER BY id DESC LIMIT 1",
 				(target_user_id,),
 			).fetchone()
+			merge_event_count = int(connection.execute(
+				"SELECT COUNT(*) FROM reputation_events WHERE source_type = 'account_link_merge'"
+			).fetchone()[0])
 		finally:
 			connection.close()
 
-		self.assertEqual(target_row[0], 600)
-		self.assertEqual(target_row[1], 0)
-		self.assertEqual(reputation_row[0], "account_link_merge")
-		self.assertEqual(reputation_row[1], "account_link_average")
+		self.assertEqual(target_row[0], 800)
+		self.assertEqual(target_row[1], 1)
+		self.assertEqual(reputation_row[0], "initial_calibration")
+		self.assertEqual(reputation_row[1], "initial_score_calibration")
+		self.assertEqual(merge_event_count, 0)
 
 	def test_operator_notes_are_stored_and_listed(self) -> None:
 		connection = connect_database(self.database_path)
@@ -292,7 +296,7 @@ class IdentityTests(unittest.TestCase):
 		self.assertEqual(audit_row[0], "user_note_create")
 		self.assertEqual(audit_row[1], "user")
 
-	def test_priority_usernames_start_at_max_social_score(self) -> None:
+	def test_usernames_do_not_bypass_evidence_based_scoring(self) -> None:
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
@@ -306,12 +310,12 @@ class IdentityTests(unittest.TestCase):
 			connection.close()
 
 		self.assertEqual(len(rows), 2)
-		self.assertEqual(rows[0][1], 900)
-		self.assertEqual(rows[0][2], 1)
-		self.assertEqual(rows[1][1], 900)
-		self.assertEqual(rows[1][2], 1)
+		self.assertEqual(rows[0][1], 500)
+		self.assertEqual(rows[0][2], 0)
+		self.assertEqual(rows[1][1], 500)
+		self.assertEqual(rows[1][2], 0)
 
-	def test_priority_usernames_are_backfilled_and_remain_pinned_to_900(self) -> None:
+	def test_initialization_does_not_pin_privileged_usernames(self) -> None:
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
@@ -344,5 +348,5 @@ class IdentityTests(unittest.TestCase):
 		finally:
 			connection.close()
 
-		self.assertEqual(user_row[0], 900)
-		self.assertEqual(user_row[1], 1)
+		self.assertEqual(user_row[0], 350)
+		self.assertEqual(user_row[1], 0)

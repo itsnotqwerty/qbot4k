@@ -833,7 +833,7 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(action_row[0], "timeout")
         self.assertEqual(action_row[1], "completed")
 
-    def test_priority_usernames_get_max_default_social_score_on_ingestion(self) -> None:
+    def test_usernames_receive_the_same_evidence_based_default_on_ingestion(self) -> None:
         discord_connector = DiscordConnector(self.database_path)
         twitch_connector = TwitchConnector(self.database_path)
 
@@ -879,11 +879,11 @@ class IngestionTests(unittest.TestCase):
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][0], "apollyon")
-        self.assertEqual(rows[0][1], 900)
-        self.assertEqual(rows[0][2], 1)
+        self.assertEqual(rows[0][1], 501)
+        self.assertEqual(rows[0][2], 0)
         self.assertEqual(rows[1][0], "its_not_qwerty")
-        self.assertEqual(rows[1][1], 900)
-        self.assertEqual(rows[1][2], 1)
+        self.assertEqual(rows[1][1], 501)
+        self.assertEqual(rows[1][2], 0)
 
     def test_discord_message_ingestion_allows_empty_content(self) -> None:
         connector = DiscordConnector(self.database_path)

@@ -4,11 +4,7 @@ import logging
 import threading
 from pathlib import Path
 
-from ..db import (
-    claim_processing_job,
-    complete_processing_job,
-    connect_database
-)
+from ..db import connect_database
 from .handlers import (
     claim_processing_job,
     complete_processing_job,

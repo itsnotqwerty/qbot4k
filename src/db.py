@@ -9,9 +9,8 @@ from collections.abc import Mapping
 
 from .intelligence.powerusers import (
     POWERUSER_THRESHOLD,
-    apply_reputation_event,
     default_social_score_for_name,
-    enforced_social_score_for_name,
+    record_reputation_evidence,
     score_delta_for_message,
     score_delta_for_moderation,
 )
@@ -33,6 +32,9 @@ CREATE TABLE IF NOT EXISTS users (
     primary_display_name TEXT NOT NULL,
     current_reputation_score INTEGER NOT NULL DEFAULT 500,
     candidate_flag INTEGER NOT NULL DEFAULT 0,
+    score_confidence REAL NOT NULL DEFAULT 0.0,
+    score_model_version INTEGER,
+    score_calculated_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -329,6 +331,7 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     claimed_at TEXT,
     claimed_by TEXT,
+    lease_expires_at TEXT,
     completed_at TEXT,
     last_error TEXT,
 
@@ -394,6 +397,169 @@ CREATE INDEX IF NOT EXISTS idx_derived_signals_user
 
 CREATE INDEX IF NOT EXISTS idx_derived_signals_key_value
     ON derived_signals(signal_key, value_real DESC);
+
+CREATE TABLE IF NOT EXISTS signal_calculation_runs (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    trigger_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    analyzer_version INTEGER NOT NULL,
+    calculated_at TEXT NOT NULL,
+    UNIQUE(user_id, trigger_observation_id, analyzer_version)
+);
+
+CREATE TABLE IF NOT EXISTS derived_signal_windows (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    signal_key TEXT NOT NULL,
+    window_name TEXT NOT NULL,
+    analyzer_version INTEGER NOT NULL,
+    value_real REAL NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    window_start TEXT,
+    window_end TEXT,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY(user_id, signal_key, window_name, analyzer_version)
+);
+
+CREATE TABLE IF NOT EXISTS derived_signal_history (
+    id INTEGER PRIMARY KEY,
+    calculation_run_id INTEGER NOT NULL REFERENCES signal_calculation_runs(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    signal_key TEXT NOT NULL,
+    window_name TEXT NOT NULL,
+    analyzer_version INTEGER NOT NULL,
+    value_real REAL NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    window_start TEXT,
+    window_end TEXT,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS derived_signal_evidence (
+    signal_history_id INTEGER NOT NULL REFERENCES derived_signal_history(id) ON DELETE CASCADE,
+    observation_id INTEGER REFERENCES observations(id) ON DELETE CASCADE,
+    message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    contribution TEXT NOT NULL DEFAULT 'supporting',
+    weight REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY(signal_history_id, observation_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS intelligence_alerts (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    signal_history_id INTEGER REFERENCES derived_signal_history(id) ON DELETE SET NULL,
+    alert_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    disposition TEXT,
+    assigned_operator_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TEXT,
+    dedupe_key TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS investigation_cases (
+    id INTEGER PRIMARY KEY,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    priority TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    owner_operator_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS case_entities (
+    case_id INTEGER NOT NULL REFERENCES investigation_cases(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'subject',
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(case_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS case_evidence (
+    id INTEGER PRIMARY KEY,
+    case_id INTEGER NOT NULL REFERENCES investigation_cases(id) ON DELETE CASCADE,
+    observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    signal_history_id INTEGER REFERENCES derived_signal_history(id) ON DELETE SET NULL,
+    alert_id INTEGER REFERENCES intelligence_alerts(id) ON DELETE SET NULL,
+    note TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS entity_relationships (
+    id INTEGER PRIMARY KEY,
+    source_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    target_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    relationship_type TEXT NOT NULL,
+    context_key TEXT NOT NULL DEFAULT '',
+    strength REAL NOT NULL DEFAULT 0,
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(source_user_id, target_user_id, relationship_type, context_key)
+);
+
+CREATE TABLE IF NOT EXISTS intelligence_reports (
+    id INTEGER PRIMARY KEY,
+    report_type TEXT NOT NULL,
+    subject_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    content_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    generator_version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS social_score_runs (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    trigger_signal_run_id INTEGER REFERENCES signal_calculation_runs(id) ON DELETE SET NULL,
+    model_version INTEGER NOT NULL,
+    score INTEGER NOT NULL,
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    band TEXT NOT NULL,
+    explanation_json TEXT NOT NULL DEFAULT '{}',
+    calculated_at TEXT NOT NULL,
+    CHECK(confidence >= 0.0 AND confidence <= 1.0),
+    CHECK(evidence_count >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS social_score_components (
+    id INTEGER PRIMARY KEY,
+    score_run_id INTEGER NOT NULL REFERENCES social_score_runs(id) ON DELETE CASCADE,
+    component_key TEXT NOT NULL,
+    label TEXT NOT NULL,
+    raw_value REAL NOT NULL,
+    normalized_value REAL NOT NULL,
+    weight REAL NOT NULL,
+    contribution REAL NOT NULL,
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    source_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_signal_history_user_time ON derived_signal_history(user_id, calculated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_windows_key_value ON derived_signal_windows(signal_key, window_name, value_real DESC);
+CREATE INDEX IF NOT EXISTS idx_signal_evidence_observation ON derived_signal_evidence(observation_id, message_id);
+CREATE INDEX IF NOT EXISTS idx_intelligence_alerts_status ON intelligence_alerts(status, severity, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cases_status ON investigation_cases(status, priority, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_relationships_source ON entity_relationships(source_user_id, strength DESC);
+CREATE INDEX IF NOT EXISTS idx_reports_generated ON intelligence_reports(generated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_social_score_runs_user_time ON social_score_runs(user_id, calculated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_social_score_components_run ON social_score_components(score_run_id, ABS(contribution) DESC);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (
@@ -421,9 +587,29 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
 def initialize_database(connection: sqlite3.Connection) -> None:
     with connection:
         connection.executescript(SCHEMA_SQL)
-        _backfill_fixed_social_scores(connection)
+        _migrate_schema(connection)
         _seed_default_command_definitions(connection)
         _seed_builtin_moderation_rules(connection)
+        _backfill_social_scores(connection)
+
+
+def _migrate_schema(connection: sqlite3.Connection) -> None:
+    processing_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(processing_jobs)").fetchall()
+    }
+    if "lease_expires_at" not in processing_columns:
+        connection.execute("ALTER TABLE processing_jobs ADD COLUMN lease_expires_at TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_processing_jobs_lease ON processing_jobs(status, lease_expires_at)"
+    )
+    user_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(users)").fetchall()}
+    if "score_confidence" not in user_columns:
+        connection.execute("ALTER TABLE users ADD COLUMN score_confidence REAL NOT NULL DEFAULT 0.0")
+    if "score_model_version" not in user_columns:
+        connection.execute("ALTER TABLE users ADD COLUMN score_model_version INTEGER")
+    if "score_calculated_at" not in user_columns:
+        connection.execute("ALTER TABLE users ADD COLUMN score_calculated_at TEXT")
 
 
 def _seed_builtin_moderation_rules(connection: sqlite3.Connection) -> None:
@@ -437,32 +623,24 @@ def _seed_builtin_moderation_rules(connection: sqlite3.Connection) -> None:
     )
 
 
-def _backfill_fixed_social_scores(connection: sqlite3.Connection) -> None:
-    rows = connection.execute(
-        """
-        SELECT id, primary_display_name, current_reputation_score, candidate_flag
-        FROM users
-        """
-    ).fetchall()
-    for row in rows:
-        user_id = int(row[0])
-        display_name = str(row[1])
-        current_score = int(row[2])
-        current_candidate_flag = int(row[3])
-        enforced_score = enforced_social_score_for_name(display_name, current_score)
-        enforced_candidate_flag = int(enforced_score >= POWERUSER_THRESHOLD)
-        if enforced_score == current_score and enforced_candidate_flag == current_candidate_flag:
-            continue
-        connection.execute(
+def _backfill_social_scores(connection: sqlite3.Connection) -> None:
+    from .intelligence.scoring import SOCIAL_SCORE_MODEL_VERSION, calculate_social_score
+    from .intelligence.signals import refresh_user_derived_signals
+
+    user_ids = [
+        int(row[0])
+        for row in connection.execute(
             """
-            UPDATE users
-            SET current_reputation_score = ?,
-                candidate_flag = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
+            SELECT id FROM users
+            WHERE score_model_version IS NULL OR score_model_version != ?
+            ORDER BY id
             """,
-            (enforced_score, enforced_candidate_flag, user_id),
-        )
+            (SOCIAL_SCORE_MODEL_VERSION,),
+        ).fetchall()
+    ]
+    for user_id in user_ids:
+        refresh_user_derived_signals(connection, user_id)
+        calculate_social_score(connection, user_id)
 
 
 def _seed_default_command_definitions(connection: sqlite3.Connection) -> None:
@@ -891,7 +1069,7 @@ def persist_normalized_message(
                 if delta > 0 and message.metadata.get("reply_to_author_is_bot") is False:
                     delta = 2
                     reason_code = "reply_to_non_bot"
-                apply_reputation_event(
+                record_reputation_evidence(
                     connection,
                     user_id=canonical_user_id,
                     delta=delta,
@@ -908,7 +1086,7 @@ def persist_normalized_message(
             )
             if welcome_delta is not None:
                 delta, reason_code = welcome_delta
-                apply_reputation_event(
+                record_reputation_evidence(
                     connection,
                     user_id=canonical_user_id,
                     delta=delta,
@@ -937,7 +1115,7 @@ def persist_normalized_message(
                         action_type=finding.auto_enforce_action,
                         reason_code=finding.reason_code,
                     )
-                    apply_reputation_event(
+                    record_reputation_evidence(
                         connection,
                         user_id=canonical_user_id,
                         delta=penalty_delta,
@@ -961,7 +1139,7 @@ def persist_normalized_message(
                             action_type=finding.auto_enforce_action,
                             reason_code=finding.reason_code,
                         )
-                        apply_reputation_event(
+                        record_reputation_evidence(
                             connection,
                             user_id=canonical_user_id,
                             delta=penalty_delta,
@@ -1612,7 +1790,7 @@ def reward_server_boost_request(
     request_id = int(row[0])
     requester_user_id = int(row[1])
     command_name = str(row[2])
-    apply_reputation_event(
+    record_reputation_evidence(
         connection,
         user_id=requester_user_id,
         delta=reward_delta,
@@ -1620,6 +1798,11 @@ def reward_server_boost_request(
         source_type="server_boost",
         source_id=request_id,
     )
+    from .intelligence.scoring import calculate_social_score
+    from .intelligence.signals import refresh_user_derived_signals
+
+    refresh_user_derived_signals(connection, requester_user_id)
+    calculate_social_score(connection, requester_user_id)
     with connection:
         connection.execute(
             """

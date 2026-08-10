@@ -417,7 +417,7 @@ class DashboardTests(unittest.TestCase):
 		self.assertEqual(len(signals_api["items"]), 2)
 		self.assertEqual(signals_api["filters"]["signals"], ["risk.composite", "activity.message_count"])
 		self.assertEqual(signals_api["sort"], {"by": "evidence", "dir": "asc"})
-		self.assertEqual(len(user_api["signals"]), 9)
+		self.assertEqual(len(user_api["signals"]), 15)
 		self.assertEqual(user_api["signals"][0]["signal_key"], "risk.composite")
 
 	def test_users_api_supports_sorting_by_requested_fields(self) -> None:

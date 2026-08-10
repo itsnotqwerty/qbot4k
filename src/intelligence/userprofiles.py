@@ -7,10 +7,10 @@ from typing import Mapping
 from .powerusers import (
 	POWERUSER_THRESHOLD,
 	SOCIAL_SCORE_DEFAULT,
-	average_social_scores,
 	default_social_score_for_name,
-	enforced_social_score_for_name,
+	record_reputation_evidence,
 )
+from .scoring import calculate_social_score, score_band
 from .signals import refresh_user_derived_signals
 
 
@@ -28,6 +28,9 @@ class CanonicalUserProfile:
 	primary_display_name: str
 	current_reputation_score: int
 	candidate_flag: bool
+	score_confidence: float
+	score_band: str
+	score_model_version: int | None
 	linked_accounts: tuple[LinkedAccount, ...]
 	notes: tuple[sqlite3.Row, ...] = ()
 
@@ -62,6 +65,14 @@ def create_canonical_user(
 		row = connection.execute(
 			"SELECT id FROM users WHERE rowid = last_insert_rowid()"
 		).fetchone()
+		if row is not None and effective_score != SOCIAL_SCORE_DEFAULT:
+			record_reputation_evidence(
+				connection,
+				user_id=int(row[0]),
+				delta=effective_score - SOCIAL_SCORE_DEFAULT,
+				reason_code="initial_score_calibration",
+				source_type="initial_calibration",
+			)
 
 	if row is None:
 		raise sqlite3.IntegrityError("Failed to resolve canonical user after insert")
@@ -97,7 +108,6 @@ def link_platform_account(
 
 	existing_user_id = account[1]
 	merged_from_user_id: int | None = None
-	merged_score: int | None = None
 	if existing_user_id is not None and int(existing_user_id) != user_id:
 		source_user = connection.execute(
 			"SELECT id, primary_display_name, current_reputation_score FROM users WHERE id = ?",
@@ -106,33 +116,8 @@ def link_platform_account(
 		if source_user is None:
 			raise ValueError("linked source user not found")
 		merged_from_user_id = int(source_user[0])
-		merged_score = average_social_scores(int(user[2]), int(source_user[2]))
-		merged_score = enforced_social_score_for_name(str(user[1]), merged_score)
 
 	with connection:
-		if merged_score is not None:
-			connection.execute(
-				"""
-				UPDATE users
-				SET current_reputation_score = ?,
-				    candidate_flag = ?,
-				    updated_at = CURRENT_TIMESTAMP
-				WHERE id = ?
-				""",
-				(merged_score, int(merged_score >= POWERUSER_THRESHOLD), user_id),
-			)
-			connection.execute(
-				"""
-				INSERT INTO reputation_events (
-					user_id,
-					source_type,
-					source_id,
-					delta,
-					reason_code
-				) VALUES (?, 'account_link_merge', ?, ?, 'account_link_average')
-				""",
-				(user_id, merged_from_user_id, merged_score - int(user[2])),
-			)
 		connection.execute(
 			"""
 			UPDATE platform_accounts
@@ -162,8 +147,10 @@ def link_platform_account(
 			(operator_id, account[0], platform, platform_user_id, user_id),
 		)
 		refresh_user_derived_signals(connection, user_id)
+		calculate_social_score(connection, user_id)
 		if merged_from_user_id is not None:
 			refresh_user_derived_signals(connection, merged_from_user_id)
+			calculate_social_score(connection, merged_from_user_id)
 
 
 def unlink_platform_account(
@@ -215,6 +202,7 @@ def unlink_platform_account(
 		)
 		if account[1] is not None:
 			refresh_user_derived_signals(connection, int(account[1]))
+			calculate_social_score(connection, int(account[1]))
 
 
 def get_canonical_user_profile(
@@ -223,7 +211,8 @@ def get_canonical_user_profile(
 ) -> CanonicalUserProfile:
 	user = connection.execute(
 		"""
-		SELECT id, primary_display_name, current_reputation_score, candidate_flag
+		SELECT id, primary_display_name, current_reputation_score, candidate_flag,
+		       score_confidence, score_model_version
 		FROM users
 		WHERE id = ?
 		""",
@@ -256,6 +245,9 @@ def get_canonical_user_profile(
 		primary_display_name=str(user[1]),
 		current_reputation_score=int(user[2]),
 		candidate_flag=bool(user[3]),
+		score_confidence=float(user[4] or 0.0),
+		score_band=score_band(int(user[2])),
+		score_model_version=int(user[5]) if user[5] is not None else None,
 		linked_accounts=tuple(
 			LinkedAccount(
 				platform=str(account[0]),

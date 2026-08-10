@@ -52,16 +52,17 @@ class DerivedSignalTests(unittest.TestCase):
             connection.close()
 
         by_key = {signal.signal_key: signal for signal in signals}
-        self.assertEqual(len(by_key), 9)
+        self.assertEqual(len(by_key), 15)
         self.assertEqual(by_key["activity.message_count"].value, 3.0)
         self.assertEqual(by_key["activity.active_channel_count"].value, 2.0)
-        self.assertAlmostEqual(by_key["behavior.positive_message_ratio"].value, 2 / 3)
+        self.assertAlmostEqual(by_key["behavior.positive_message_ratio"].value, 1 / 3)
         self.assertAlmostEqual(by_key["behavior.negative_message_ratio"].value, 1 / 3)
         self.assertGreater(by_key["risk.composite"].value, 0)
         self.assertEqual(by_key["risk.composite"].evidence_count, 3)
         self.assertEqual(by_key["risk.composite"].confidence, 0.15)
         self.assertEqual(by_key["risk.composite"].analyzer_version, SIGNAL_ANALYZER_VERSION)
         self.assertIn("formula", by_key["risk.composite"].details)
+        self.assertTrue(by_key["risk.composite"].details["independent_of_social_score"])
 
     def test_refresh_is_idempotent_and_updates_existing_rows(self) -> None:
         self._ingest("signal-message-idempotent", "hello")
@@ -76,7 +77,7 @@ class DerivedSignalTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(count, 9)
+        self.assertEqual(count, 15)
         self.assertEqual(first_ids, second_ids)
 
     def test_signal_overview_prioritizes_composite_risk(self) -> None:
@@ -87,7 +88,7 @@ class DerivedSignalTests(unittest.TestCase):
         finally:
             connection.close()
 
-        self.assertEqual(len(overview), 9)
+        self.assertEqual(len(overview), 15)
         self.assertEqual(overview[0][0], "analyst_target")
         self.assertEqual(overview[0][1].signal_key, "risk.composite")
 
@@ -128,7 +129,7 @@ class DerivedSignalTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(refreshed_users, 1)
-        self.assertEqual(signal_count, 9)
+        self.assertEqual(signal_count, 15)
 
     def test_schema_contains_persistent_signal_indexes(self) -> None:
         connection = connect_database(self.database_path)
