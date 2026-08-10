@@ -279,6 +279,8 @@ class DiscordConnector:
 
 	def ingest_message(self, payload: Mapping[str, object]) -> CollectionResult:
 		normalized = normalize_discord_message(payload)
+		if normalized.metadata.get("author_is_bot") and not self.allow_bot_messages:
+			return CollectionResult(status="ignored", platform="discord", reason="bot_message")
 		observation = observation_from_message(normalized)
 
 		connection = connect_database(self.database_path)

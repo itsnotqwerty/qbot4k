@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS operator_accounts (
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
+    observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
     platform TEXT NOT NULL,
     platform_message_id TEXT,
     platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),

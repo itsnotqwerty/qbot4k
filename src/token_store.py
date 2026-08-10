@@ -29,20 +29,20 @@ def persist_refreshed_twitch_tokens(
     access_token: str,
     refresh_token: str | None,
 ) -> None:
-    env_path = Path(".env").resolve()
+    env_path = _DOTENV_PATH
     contents = env_path.read_text(
         encoding="utf-8") if env_path.exists() else ""
 
     contents = update_env_value(
         contents,
-        "TWITCH_BOT_TOKEN",
+        "QBOT_TWITCH_BOT_TOKEN",
         access_token,
     )
 
     if refresh_token:
         contents = update_env_value(
             contents,
-            "TWITCH_REFRESH_TOKEN",
+            "QBOT_TWITCH_REFRESH_TOKEN",
             refresh_token,
         )
 

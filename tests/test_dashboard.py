@@ -17,6 +17,7 @@ from src.discord import DiscordConnector
 from src.health import create_health_server
 from src.dashboard.auth import DiscordIdentity
 from src.twitch import TwitchConnector
+from tests.pipeline_support import ingest_and_analyze
 
 
 class NoRedirectHandler(HTTPRedirectHandler):
@@ -330,7 +331,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_users_page_lists_ingested_accounts(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-1",
 				"timestamp": "2026-08-06T05:00:00Z",
@@ -374,7 +375,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_users_api_supports_sorting_by_requested_fields(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-sort-anna-1",
 				"timestamp": "2026-08-06T05:00:00Z",
@@ -388,7 +389,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-sort-anna-2",
 				"timestamp": "2026-08-06T05:01:00Z",
@@ -402,7 +403,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-sort-anna-3",
 				"timestamp": "2026-08-06T05:02:00Z",
@@ -416,7 +417,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-sort-brad-1",
 				"timestamp": "2026-08-06T05:03:00Z",
@@ -430,7 +431,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-sort-carl-1",
 				"timestamp": "2026-08-06T05:04:00Z",
@@ -444,7 +445,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-sort-carl-2",
 				"timestamp": "2026-08-06T05:05:00Z",
@@ -526,7 +527,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_user_detail_page_shows_recent_messages(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-2",
 				"timestamp": "2026-08-06T05:10:00Z",
@@ -579,7 +580,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_user_detail_page_resolves_discord_channel_name(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-resolve-1",
 				"timestamp": "2026-08-06T05:10:00Z",
@@ -636,7 +637,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_user_detail_page_renders_discord_attachments_as_numbered_links(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-attach-1",
 				"timestamp": "2026-08-06T05:10:00Z",
@@ -687,7 +688,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_user_detail_page_supports_operator_moderation_actions(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-mod-1",
 				"timestamp": "2026-08-06T05:11:00Z",
@@ -701,7 +702,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-review-1",
 				"timestamp": "2026-08-06T05:12:00Z",
@@ -817,7 +818,7 @@ class DashboardTests(unittest.TestCase):
 
 	def test_users_page_link_button_relinks_tagged_username(self) -> None:
 		connector = DiscordConnector(self.database_path)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-link-1",
 				"timestamp": "2026-08-06T05:20:00Z",
@@ -831,7 +832,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		connector.ingest_message(
+		ingest_and_analyze(connector, 
 			{
 				"id": "discord-msg-link-2",
 				"timestamp": "2026-08-06T05:21:00Z",
@@ -1022,7 +1023,7 @@ class DashboardTests(unittest.TestCase):
 		self.assertEqual(simple_row[1], 1)
 
 		reply_lines: list[str] = []
-		TwitchConnector(self.database_path).ingest_message(
+		ingest_and_analyze(TwitchConnector(self.database_path), 
 			{
 				"message_id": "twitch-credit-live-1",
 				"timestamp": "2026-08-06T05:40:00Z",
@@ -1039,7 +1040,7 @@ class DashboardTests(unittest.TestCase):
 		self.assertIn("Twitch profile for sam", reply_lines[0])
 
 		simple_reply_lines: list[str] = []
-		TwitchConnector(self.database_path).ingest_message(
+		ingest_and_analyze(TwitchConnector(self.database_path), 
 			{
 				"message_id": "twitch-wave-live-1",
 				"timestamp": "2026-08-06T05:41:00Z",
@@ -1084,7 +1085,7 @@ class DashboardTests(unittest.TestCase):
 		discord_connector = DiscordConnector(self.database_path)
 		twitch_connector = TwitchConnector(self.database_path)
 
-		discord_connector.ingest_message(
+		ingest_and_analyze(discord_connector,
 			{
 				"id": "discord-multi-1",
 				"timestamp": "2026-08-06T05:31:00Z",
@@ -1098,7 +1099,7 @@ class DashboardTests(unittest.TestCase):
 				},
 			}
 		)
-		twitch_connector.ingest_message(
+		ingest_and_analyze(twitch_connector,
 			{
 				"message_id": "twitch-multi-1",
 				"timestamp": "2026-08-06T05:32:00Z",

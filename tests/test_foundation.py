@@ -100,7 +100,7 @@ class FoundationTests(unittest.TestCase):
             settings = AppSettings.from_env(
                 self.build_env(
                     tmpdir,
-                    QBOT_ENABLED_SERVICES="twitch",
+                    QBOT_ENABLED_SERVICES="twitch,analysis",
                     QBOT_TWITCH_BOT_TOKEN="token",
                 )
             )
@@ -114,7 +114,7 @@ class FoundationTests(unittest.TestCase):
                 AppSettings.from_env(
                     self.build_env(
                         tmpdir,
-                        QBOT_ENABLED_SERVICES="twitch",
+                        QBOT_ENABLED_SERVICES="twitch,analysis",
                         QBOT_TWITCH_BOT_TOKEN="token",
                         QBOT_TWITCH_REFRESH_TOKEN="refresh-token",
                     )
@@ -123,7 +123,7 @@ class FoundationTests(unittest.TestCase):
             settings = AppSettings.from_env(
                 self.build_env(
                     tmpdir,
-                    QBOT_ENABLED_SERVICES="twitch",
+                    QBOT_ENABLED_SERVICES="twitch,analysis",
                     QBOT_TWITCH_BOT_TOKEN="token",
                     QBOT_TWITCH_REFRESH_TOKEN="refresh-token",
                     QBOT_TWITCH_CLIENT_ID="client-id",

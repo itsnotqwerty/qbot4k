@@ -90,11 +90,11 @@ class JobTests(unittest.TestCase):
 
 		self.assertEqual(report.deleted_messages, 1)
 		self.assertEqual(report.deleted_audit_log_rows, 1)
-		self.assertEqual(report.rollup_rows, 3)
+		self.assertEqual(report.rollup_rows, 5)
 		self.assertEqual(message_count, 0)
 		self.assertEqual(audit_count, 0)
-		self.assertEqual([row[0] for row in rollups], ["messages_total", "open_reviews", "pending_actions"])
-		self.assertEqual([row[1] for row in rollups], [0.0, 0.0, 0.0])
+		self.assertEqual([row[0] for row in rollups], ["messages_total", "observations_24h", "observations_total", "open_reviews", "pending_actions"])
+		self.assertEqual([row[1] for row in rollups], [0.0, 0.0, 0.0, 0.0, 0.0])
 
 		backup_path = Path(report.backup_path)
 		metadata_path = Path(report.backup_metadata_path)
@@ -109,7 +109,7 @@ class JobTests(unittest.TestCase):
 			{
 				"QBOT_DATABASE_PATH": str(self.database_path),
 				"QBOT_BACKUP_DIR": str(self.backup_dir),
-				"QBOT_ENABLED_SERVICES": "jobs,twitch,discord",
+				"QBOT_ENABLED_SERVICES": "jobs,twitch,discord,analysis",
 				"QBOT_MESSAGE_RETENTION_DAYS": "1",
 				"QBOT_AUDIT_RETENTION_DAYS": "1",
 				"QBOT_TWITCH_BOT_TOKEN": "oauth:test-token",
@@ -197,7 +197,7 @@ class JobTests(unittest.TestCase):
 			{
 				"QBOT_DATABASE_PATH": str(self.database_path),
 				"QBOT_BACKUP_DIR": str(self.backup_dir),
-				"QBOT_ENABLED_SERVICES": "jobs,twitch,discord",
+				"QBOT_ENABLED_SERVICES": "jobs,twitch,discord,analysis",
 				"QBOT_MESSAGE_RETENTION_DAYS": "1",
 				"QBOT_AUDIT_RETENTION_DAYS": "1",
 				"QBOT_TWITCH_BOT_TOKEN": "oauth:expired-token",

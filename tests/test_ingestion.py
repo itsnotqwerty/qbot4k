@@ -20,6 +20,7 @@ from src.discord import (
 )
 from src.intelligence.powerusers import score_delta_for_message
 from src.twitch import TwitchConnector, parse_twitch_irc_message
+from tests.pipeline_support import ingest_and_analyze
 
 
 class IngestionTests(unittest.TestCase):
@@ -33,7 +34,7 @@ class IngestionTests(unittest.TestCase):
     def test_discord_message_ingestion_persists_account_and_message(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-1",
                 "timestamp": "2026-08-06T05:00:00Z",
@@ -115,7 +116,7 @@ class IngestionTests(unittest.TestCase):
     def test_positive_messages_give_small_social_score_increase(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-positive",
                 "timestamp": "2026-08-06T05:01:00Z",
@@ -149,7 +150,7 @@ class IngestionTests(unittest.TestCase):
     def test_reply_to_non_bot_user_gives_larger_social_score_increase(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-reply-human",
                 "timestamp": "2026-08-06T05:01:10Z",
@@ -202,7 +203,7 @@ class IngestionTests(unittest.TestCase):
     def test_reply_to_bot_user_keeps_standard_social_score_increase(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-reply-bot",
                 "timestamp": "2026-08-06T05:01:20Z",
@@ -243,7 +244,7 @@ class IngestionTests(unittest.TestCase):
     def test_welcoming_new_user_grants_small_bonus(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-welcome-1",
                 "timestamp": "2026-08-06T05:01:30Z",
@@ -292,7 +293,7 @@ class IngestionTests(unittest.TestCase):
     def test_duplicate_welcome_same_target_is_penalized(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-welcome-dup-1",
                 "timestamp": "2026-08-06T05:02:00Z",
@@ -307,7 +308,7 @@ class IngestionTests(unittest.TestCase):
                 "mentions": ["new-user-2"],
             }
         )
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-welcome-dup-2",
                 "timestamp": "2026-08-06T05:03:00Z",
@@ -358,7 +359,7 @@ class IngestionTests(unittest.TestCase):
     def test_successful_server_bump_rewards_only_after_success_message(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-1",
                 "timestamp": "2026-08-06T05:01:00Z",
@@ -372,7 +373,7 @@ class IngestionTests(unittest.TestCase):
                 },
             }
         )
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-2",
                 "timestamp": "2026-08-06T05:02:00Z",
@@ -411,7 +412,7 @@ class IngestionTests(unittest.TestCase):
     def test_server_bump_reward_uses_interaction_user_when_command_not_literal(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-seed-user",
                 "timestamp": "2026-08-06T05:01:00Z",
@@ -426,7 +427,7 @@ class IngestionTests(unittest.TestCase):
             }
         )
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-success-interaction",
                 "timestamp": "2026-08-06T05:02:00Z",
@@ -466,7 +467,7 @@ class IngestionTests(unittest.TestCase):
     def test_server_bump_request_uses_interaction_command_name_when_content_is_empty(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-empty-content",
                 "timestamp": "2026-08-06T05:03:00Z",
@@ -502,7 +503,7 @@ class IngestionTests(unittest.TestCase):
     def test_server_bump_reward_accepts_broader_success_wording(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-success-wording-seed",
                 "timestamp": "2026-08-06T05:04:00Z",
@@ -517,7 +518,7 @@ class IngestionTests(unittest.TestCase):
             }
         )
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-bump-success-wording",
                 "timestamp": "2026-08-06T05:05:00Z",
@@ -558,7 +559,7 @@ class IngestionTests(unittest.TestCase):
     def test_very_negative_messages_cause_reputation_drop_without_moderation(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-negative",
                 "timestamp": "2026-08-06T05:02:00Z",
@@ -596,7 +597,7 @@ class IngestionTests(unittest.TestCase):
     def test_egregious_messages_trigger_automatic_moderation(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-egregious",
                 "timestamp": "2026-08-06T05:03:00Z",
@@ -663,7 +664,7 @@ class IngestionTests(unittest.TestCase):
             return _FakeResponse()
 
         with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
-            connector.ingest_message(
+            ingest_and_analyze(connector, 
                 {
                     "id": "discord-msg-egregious-exec",
                     "timestamp": "2026-08-06T05:03:30Z",
@@ -718,7 +719,7 @@ class IngestionTests(unittest.TestCase):
             return _FakeResponse("{}")
 
         with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
-            connector.ingest_message(
+            ingest_and_analyze(connector, 
                 {
                     "id": "discord-msg-egregious-modlogs",
                     "timestamp": "2026-08-06T05:03:45Z",
@@ -771,7 +772,7 @@ class IngestionTests(unittest.TestCase):
             return _FakeResponse()
 
         with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
-            result = connector.ingest_message(
+            result = ingest_and_analyze(connector, 
                 {
                     "id": "discord-msg-egregious-mod",
                     "timestamp": "2026-08-06T05:03:40Z",
@@ -836,7 +837,7 @@ class IngestionTests(unittest.TestCase):
         discord_connector = DiscordConnector(self.database_path)
         twitch_connector = TwitchConnector(self.database_path)
 
-        discord_connector.ingest_message(
+        ingest_and_analyze(discord_connector,
             {
                 "id": "discord-priority-1",
                 "timestamp": "2026-08-06T05:03:00Z",
@@ -850,7 +851,7 @@ class IngestionTests(unittest.TestCase):
                 },
             }
         )
-        twitch_connector.ingest_message(
+        ingest_and_analyze(twitch_connector,
             {
                 "message_id": "twitch-priority-1",
                 "timestamp": "2026-08-06T05:04:00Z",
@@ -887,7 +888,7 @@ class IngestionTests(unittest.TestCase):
     def test_discord_message_ingestion_allows_empty_content(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-empty",
                 "timestamp": "2026-08-06T05:05:00Z",
@@ -979,7 +980,7 @@ class IngestionTests(unittest.TestCase):
     def test_discord_bot_messages_are_ignored_by_default(self) -> None:
         connector = DiscordConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-2",
                 "timestamp": "2026-08-06T05:00:00Z",
@@ -1028,7 +1029,7 @@ class IngestionTests(unittest.TestCase):
             connection.close()
 
         connector = DiscordConnector(self.database_path)
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-rule-1",
                 "timestamp": "2026-08-06T05:20:00Z",
@@ -1086,7 +1087,7 @@ class IngestionTests(unittest.TestCase):
             connection.close()
 
         connector = DiscordConnector(self.database_path)
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "id": "discord-msg-rule-penalty",
                 "timestamp": "2026-08-06T05:25:00Z",
@@ -1120,7 +1121,7 @@ class IngestionTests(unittest.TestCase):
     def test_twitch_message_ingestion_persists_normalized_fields(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "message_id": "twitch-msg-1",
                 "timestamp": "2026-08-06T05:10:00Z",
@@ -1159,8 +1160,8 @@ class IngestionTests(unittest.TestCase):
             "username": "viewer",
         }
 
-        first_result = connector.ingest_message(payload)
-        second_result = connector.ingest_message(payload)
+        first_result = ingest_and_analyze(connector, payload)
+        second_result = ingest_and_analyze(connector, payload)
 
         self.assertEqual(first_result.status, "persisted")
         self.assertEqual(second_result.status, "duplicate")
@@ -1178,7 +1179,7 @@ class IngestionTests(unittest.TestCase):
     def test_join_command_in_its_not_qwerty_channel_registers_requesting_user_channel(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "message_id": "join-msg-1",
                 "timestamp": "2026-08-06T05:12:00Z",
@@ -1207,7 +1208,7 @@ class IngestionTests(unittest.TestCase):
     def test_join_command_outside_qwerty_channel_does_not_register_channel(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "message_id": "join-msg-2",
                 "timestamp": "2026-08-06T05:13:00Z",
@@ -1276,7 +1277,7 @@ class IngestionTests(unittest.TestCase):
 
     def test_mark_channel_active_updates_joined_channel_status(self) -> None:
         connector = TwitchConnector(self.database_path)
-        connector.ingest_message(
+        ingest_and_analyze(connector, 
             {
                 "message_id": "join-msg-3",
                 "timestamp": "2026-08-06T05:14:00Z",
@@ -1309,7 +1310,7 @@ class IngestionTests(unittest.TestCase):
     def test_record_moderation_action_persists_completed_twitch_action(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "message_id": "twitch-msg-streamboo-1",
                 "timestamp": "2026-08-06T05:30:00Z",
@@ -1353,7 +1354,7 @@ class IngestionTests(unittest.TestCase):
     def test_streamboo_auto_moderation_applies_reputation_penalty(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        result = connector.ingest_message(
+        result = ingest_and_analyze(connector, 
             {
                 "message_id": "twitch-msg-streamboo-2",
                 "timestamp": "2026-08-06T05:31:00Z",

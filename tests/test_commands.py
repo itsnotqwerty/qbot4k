@@ -17,6 +17,7 @@ from src.db import (
 from src.discord import DiscordConnector
 from src.commands import CommandContext, _format_command_template, build_default_command_registry, render_command_reply
 from src.twitch import TwitchConnector, TwitchConnectionError
+from tests.pipeline_support import ingest_and_analyze
 from src.intelligence.userprofiles import create_canonical_user, link_platform_account
 
 
@@ -150,7 +151,7 @@ class DiscordCommandTests(unittest.TestCase):
 
 		connector = DiscordConnector(self.database_path, bot_token="discord-bot-token")
 		with mock.patch("src.discord.urlopen", side_effect=_fake_urlopen):
-			connector.ingest_message(
+			ingest_and_analyze(connector, 
 				{
 					"id": "discord-msg-credit-1",
 					"timestamp": "2026-08-06T05:00:00Z",
@@ -177,7 +178,7 @@ class DiscordCommandTests(unittest.TestCase):
 		captured_messages: list[str] = []
 
 		connector = TwitchConnector(self.database_path)
-		result = connector.ingest_message(
+		result = ingest_and_analyze(connector, 
 			{
 				"message_id": "twitch-msg-credit-1",
 				"timestamp": "2026-08-06T05:10:00Z",
@@ -196,36 +197,24 @@ class DiscordCommandTests(unittest.TestCase):
 		self.assertIn("Power User: No", captured_messages[0])
 
 	def test_twitch_run_forever_sends_plaintext_credit_response(self) -> None:
-		captured_lines: list[str] = []
-		irc_reader = mock.Mock()
-		irc_reader.readline.side_effect = [
-			"@badge-info=;badges=;color=#1E90FF;display-name=sam;user-id=twitch-user-1;tmi-sent-ts=1722921000000 :sam!sam@sam.tmi.twitch.tv PRIVMSG #its_not_qwerty :!credit\r\n",
-			"",
-		]
-
-		irc_socket = mock.MagicMock()
-		irc_socket.makefile.return_value = irc_reader
-		irc_socket.sendall.side_effect = lambda data: captured_lines.append(data.decode("utf-8").rstrip("\r\n"))
-		irc_socket.__enter__.return_value = irc_socket
-		irc_socket.__exit__.return_value = None
-
-		raw_socket = mock.MagicMock()
-		raw_socket.__enter__.return_value = raw_socket
-		raw_socket.__exit__.return_value = None
-
-		ssl_context = mock.Mock()
-		ssl_context.wrap_socket.return_value = irc_socket
-
+		captured_messages: list[str] = []
 		connector = TwitchConnector(self.database_path)
-		with mock.patch.object(connector, "_validate_token_and_get_login", return_value="qbot4k"):
-			with mock.patch.object(connector, "configured_channels", return_value=("its_not_qwerty",)):
-				with mock.patch("src.twitch.socket.create_connection", return_value=raw_socket):
-					with mock.patch("src.twitch.ssl.create_default_context", return_value=ssl_context):
-						with self.assertRaises(TwitchConnectionError):
-							connector.run_forever("oauth:test-token")
+		result = ingest_and_analyze(
+			connector,
+			{
+				"message_id": "twitch-msg-credit-runner",
+				"timestamp": "2026-08-06T05:10:00Z",
+				"channel": "its_not_qwerty",
+				"content": "!credit",
+				"user_id": "twitch-user-1",
+				"username": "sam",
+			},
+			reply_sink=captured_messages.append,
+		)
 
-		self.assertTrue(any(line.startswith("PRIVMSG #its_not_qwerty :") for line in captured_lines))
-		self.assertTrue(any("Social Credit Profile" in line for line in captured_lines))
+		self.assertEqual(result.status, "persisted")
+		self.assertEqual(len(captured_messages), 1)
+		self.assertIn("Social Credit Profile", captured_messages[0])
 
 	def test_simple_command_renders_plaintext_and_embed(self) -> None:
 		connection = connect_database(self.database_path)

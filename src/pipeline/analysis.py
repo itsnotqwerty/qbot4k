@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from ..db import get_observation, normalized_message_from_observation
 from .message_analysis import persist_normalized_message
 from collections.abc import Callable
