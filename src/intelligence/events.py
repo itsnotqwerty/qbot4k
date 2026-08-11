@@ -8,15 +8,15 @@ from pathlib import Path
 from typing import Mapping
 
 from ..db import collect_observation, connect_database, get_observation, initialize_database
-from ..models import CollectionResult, Observation, coerce_timestamp
-from .content import analyze_observation_content
+from ..models import CollectionResult, Observation, coerce_timestamp, normalize_message_content
+from .content import analyze_observation_content, emit_content_alert
 
 
 SUPPORTED_EVENT_TYPES = (
     "message.edited", "message.deleted", "member.joined", "member.left",
     "reaction.added", "reaction.removed", "member.roles_changed",
     "moderation.action", "moderation.ban_added", "moderation.ban_removed",
-    "stream.started", "stream.ended", "stream.updated", "account.updated", "external.item",
+    "stream.started", "stream.ended", "stream.updated", "account.updated", "channel.notice", "external.item",
 )
 
 _DISCORD_EVENTS = {
@@ -75,7 +75,7 @@ def observation_from_twitch_irc_event(raw_line: str) -> Observation | None:
         event_type = "moderation.action"
         command = " CLEARCHAT #" if " CLEARCHAT #" in remainder else " CLEARMSG #"
     elif " USERNOTICE #" in remainder:
-        event_type = "account.updated"
+        event_type = "channel.notice"
         command = " USERNOTICE #"
     else:
         return None
@@ -84,7 +84,7 @@ def observation_from_twitch_irc_event(raw_line: str) -> Observation | None:
     channel = tail.split(" ", 1)[0].split(" :", 1)[0].strip().lstrip("#")
     target = tail.split(" :", 1)[1].strip() if " :" in tail else ""
     actor_id = tags.get("user-id") or prefix or None
-    target_id = tags.get("target-user-id") or target or None if event_type == "moderation.action" else None
+    target_id = (tags.get("target-user-id") or target or None) if event_type == "moderation.action" else None
     return Observation(
         platform="twitch", event_type=event_type,
         external_event_id=tags.get("id") or f"{event_type}:{channel}:{actor_id or target_id}:{tags.get('tmi-sent-ts', '')}",
@@ -131,8 +131,10 @@ class GenericEventAnalysisPipeline:
         if observation is None or str(observation["event_type"]) not in SUPPORTED_EVENT_TYPES:
             raise ValueError("unsupported or missing event observation")
         with connection:
-            analyze_observation_content(connection, int(job.observation_id))
             _ensure_event_users(connection, observation)
+            content = analyze_observation_content(connection, int(job.observation_id))
+            emit_content_alert(connection, int(job.observation_id), content)
+            _project_event_state(connection, observation)
             _upsert_event_relationship(connection, observation)
 
 
@@ -161,6 +163,16 @@ def _ensure_event_users(connection: sqlite3.Connection, observation: sqlite3.Row
 
 def _upsert_event_relationship(connection: sqlite3.Connection, observation: sqlite3.Row) -> None:
     actor_id, target_id = observation["actor_platform_account_id"], observation["target_platform_account_id"]
+    if target_id is None and str(observation["event_type"]).startswith("reaction."):
+        attributes = json.loads(str(observation["attributes_json"] or "{}"))
+        message_external_id = str(attributes.get("message_id") or "").strip()
+        if message_external_id:
+            target = connection.execute(
+                "SELECT platform_account_id FROM messages WHERE platform=? AND platform_message_id=?",
+                (str(observation["platform"]), message_external_id),
+            ).fetchone()
+            if target is not None:
+                target_id = target[0]
     if actor_id is None or target_id is None:
         return
     users = connection.execute(
@@ -182,6 +194,85 @@ def _upsert_event_relationship(connection: sqlite3.Connection, observation: sqli
         (int(users[0]), int(users[1]), relationship, context, occurred, occurred,
          json.dumps({"latest_observation_id": int(observation["id"])})),
     )
+    relationship_row = connection.execute(
+        """SELECT id FROM entity_relationships WHERE source_user_id=? AND target_user_id=?
+           AND relationship_type=? AND context_key=?""",
+        (int(users[0]), int(users[1]), relationship, context),
+    ).fetchone()
+    if relationship_row is not None:
+        connection.execute(
+            """INSERT OR IGNORE INTO relationship_evidence(
+                 relationship_id, observation_id, occurred_at, attributes_json
+               ) VALUES (?, ?, ?, ?)""",
+            (
+                int(relationship_row[0]),
+                int(observation["id"]),
+                occurred,
+                json.dumps({"event_type": relationship}, sort_keys=True),
+            ),
+        )
+
+
+def _project_event_state(connection: sqlite3.Connection, observation: sqlite3.Row) -> None:
+    event_type = str(observation["event_type"])
+    attributes = json.loads(str(observation["attributes_json"] or "{}"))
+    if event_type in {"message.edited", "message.deleted"}:
+        external_message_id = str(
+            attributes.get("id") or attributes.get("message_id") or ""
+        ).strip()
+        if not external_message_id:
+            return
+        if event_type == "message.deleted":
+            connection.execute(
+                """UPDATE messages SET deleted_at=?
+                   WHERE platform=? AND platform_message_id=?""",
+                (str(observation["occurred_at"]), str(observation["platform"]), external_message_id),
+            )
+        else:
+            text = str(observation["text_raw"] or "")
+            connection.execute(
+                """UPDATE messages SET content_raw=?, content_normalized=?, edited_at=?
+                   WHERE platform=? AND platform_message_id=?""",
+                (
+                    text,
+                    normalize_message_content(text),
+                    str(observation["occurred_at"]),
+                    str(observation["platform"]),
+                    external_message_id,
+                ),
+            )
+        return
+    if event_type.startswith("stream."):
+        stream_key = str(
+            attributes.get("stream_id")
+            or observation["container_id"]
+            or observation["context_id"]
+            or "default"
+        )
+        status = {
+            "stream.started": "live",
+            "stream.updated": "live",
+            "stream.ended": "offline",
+        }[event_type]
+        connection.execute(
+            """INSERT INTO stream_states(
+                 platform, stream_key, status, title, category, started_at,
+                 ended_at, latest_observation_id, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(platform, stream_key) DO UPDATE SET
+                 status=excluded.status, title=COALESCE(excluded.title,stream_states.title),
+                 category=COALESCE(excluded.category,stream_states.category),
+                 started_at=COALESCE(stream_states.started_at,excluded.started_at),
+                 ended_at=excluded.ended_at, latest_observation_id=excluded.latest_observation_id,
+                 updated_at=excluded.updated_at""",
+            (
+                str(observation["platform"]), stream_key, status,
+                attributes.get("title"), attributes.get("category") or attributes.get("game_name"),
+                str(observation["occurred_at"]) if event_type == "stream.started" else None,
+                str(observation["occurred_at"]) if event_type == "stream.ended" else None,
+                int(observation["id"]), str(observation["occurred_at"]),
+            ),
+        )
 
 
 def _parse_irc_tags(line: str) -> tuple[dict[str, str], str]:

@@ -18,6 +18,7 @@ from .models import IngestionResult, NormalizedMessage, Observation, Observation
 from .moderation import ModerationFinding, ModerationRule, evaluate_egregious_content, evaluate_message_moderation
 
 BUILTIN_EGREGIOUS_RULE_NAME = "builtin:egregious_content"
+BUILTIN_STREAMBOO_RULE_NAME = "builtin:streamboo_viewer_spam"
 RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom", "alias"}
 WELCOME_DUPLICATE_WINDOW_MINUTES = 10
 WELCOME_BONUS_DELTA = 1
@@ -72,6 +73,8 @@ CREATE TABLE IF NOT EXISTS messages (
     content_raw TEXT NOT NULL,
     content_normalized TEXT NOT NULL,
     sent_at TEXT NOT NULL,
+    edited_at TEXT,
+    deleted_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(platform, platform_message_id)
 );
@@ -110,6 +113,8 @@ CREATE TABLE IF NOT EXISTS moderation_rules (
     pattern TEXT NOT NULL,
     severity TEXT NOT NULL,
     auto_enforce_action TEXT,
+    enforcement_mode TEXT NOT NULL DEFAULT 'enforce',
+    action_duration_seconds INTEGER NOT NULL DEFAULT 600,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -136,8 +141,11 @@ CREATE TABLE IF NOT EXISTS moderation_actions (
     actor_type TEXT NOT NULL,
     actor_id INTEGER,
     reason TEXT,
+    duration_seconds INTEGER NOT NULL DEFAULT 600,
     status TEXT NOT NULL DEFAULT 'pending',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS reputation_events (
@@ -165,6 +173,9 @@ CREATE TABLE IF NOT EXISTS review_queue (
     severity TEXT NOT NULL,
     queue_reason_code TEXT NOT NULL,
     assigned_operator_id INTEGER,
+    resolution TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
+    resolved_by_operator_id INTEGER,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     resolved_at TEXT
 );
@@ -455,6 +466,7 @@ CREATE TABLE IF NOT EXISTS intelligence_alerts (
     id INTEGER PRIMARY KEY,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     signal_history_id INTEGER REFERENCES derived_signal_history(id) ON DELETE SET NULL,
+    observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
     alert_type TEXT NOT NULL,
     severity TEXT NOT NULL,
     title TEXT NOT NULL,
@@ -466,6 +478,8 @@ CREATE TABLE IF NOT EXISTS intelligence_alerts (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     resolved_at TEXT,
+    acknowledged_at TEXT,
+    suppressed_until TEXT,
     dedupe_key TEXT NOT NULL UNIQUE
 );
 
@@ -500,6 +514,16 @@ CREATE TABLE IF NOT EXISTS case_evidence (
     added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS case_activity (
+    id INTEGER PRIMARY KEY,
+    case_id INTEGER NOT NULL REFERENCES investigation_cases(id) ON DELETE CASCADE,
+    operator_id INTEGER,
+    activity_type TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS entity_relationships (
     id INTEGER PRIMARY KEY,
     source_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -512,6 +536,31 @@ CREATE TABLE IF NOT EXISTS entity_relationships (
     last_observed_at TEXT NOT NULL,
     evidence_json TEXT NOT NULL DEFAULT '{}',
     UNIQUE(source_user_id, target_user_id, relationship_type, context_key)
+);
+
+CREATE TABLE IF NOT EXISTS relationship_evidence (
+    relationship_id INTEGER NOT NULL REFERENCES entity_relationships(id) ON DELETE CASCADE,
+    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    occurred_at TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(relationship_id, observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_relationship_evidence_time
+    ON relationship_evidence(relationship_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS stream_states (
+    platform TEXT NOT NULL,
+    stream_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT,
+    category TEXT,
+    started_at TEXT,
+    ended_at TEXT,
+    latest_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(platform, stream_key)
 );
 
 CREATE TABLE IF NOT EXISTS intelligence_reports (
@@ -784,6 +833,9 @@ CREATE TABLE IF NOT EXISTS evaluation_labels (
     user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     label_key TEXT NOT NULL,
     label_value TEXT NOT NULL,
+    score_key TEXT,
+    score_value REAL,
+    model_version INTEGER,
     operator_id INTEGER,
     source TEXT NOT NULL DEFAULT 'operator',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -814,6 +866,23 @@ CREATE TABLE IF NOT EXISTS threshold_backtests (
 
 CREATE INDEX IF NOT EXISTS idx_evaluation_runs_model_time
     ON model_evaluation_runs(model_key, calculated_at DESC);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS operational_metrics (
+    metric_name TEXT NOT NULL,
+    dimension_key TEXT NOT NULL DEFAULT '',
+    value REAL NOT NULL,
+    observed_at TEXT NOT NULL,
+    PRIMARY KEY(metric_name, dimension_key, observed_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_operational_metrics_time
+    ON operational_metrics(metric_name, observed_at DESC);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (
@@ -898,6 +967,44 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE moderation_actions ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"
         )
+
+    migration_columns: tuple[tuple[str, str, str], ...] = (
+        ("messages", "edited_at", "TEXT"),
+        ("messages", "deleted_at", "TEXT"),
+        ("moderation_rules", "enforcement_mode", "TEXT NOT NULL DEFAULT 'enforce'"),
+        ("moderation_rules", "action_duration_seconds", "INTEGER NOT NULL DEFAULT 600"),
+        ("moderation_actions", "duration_seconds", "INTEGER NOT NULL DEFAULT 600"),
+        ("moderation_actions", "error_message", "TEXT"),
+        ("moderation_actions", "completed_at", "TEXT"),
+        ("intelligence_alerts", "observation_id", "INTEGER REFERENCES observations(id) ON DELETE SET NULL"),
+        ("intelligence_alerts", "acknowledged_at", "TEXT"),
+        ("intelligence_alerts", "suppressed_until", "TEXT"),
+        ("evaluation_labels", "score_key", "TEXT"),
+        ("evaluation_labels", "score_value", "REAL"),
+        ("evaluation_labels", "model_version", "INTEGER"),
+        ("review_queue", "resolution", "TEXT"),
+        ("review_queue", "resolution_note", "TEXT NOT NULL DEFAULT ''"),
+        ("review_queue", "resolved_by_operator_id", "INTEGER"),
+    )
+    for table_name, column_name, definition in migration_columns:
+        columns = {
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+        }
+        if column_name not in columns:
+            connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+            )
+
+    migrations = (
+        (1, "processing job leases"),
+        (2, "canonical identity attribution"),
+        (3, "intelligence platform P0-P3"),
+    )
+    connection.executemany(
+        "INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)",
+        migrations,
+    )
 
     connection.execute(
         """
@@ -1045,6 +1152,14 @@ def _seed_builtin_moderation_rules(connection: sqlite3.Connection) -> None:
         ON CONFLICT(name) DO NOTHING
         """,
         (BUILTIN_EGREGIOUS_RULE_NAME,),
+    )
+    connection.execute(
+        """
+        INSERT INTO moderation_rules (name, rule_type, pattern, severity, auto_enforce_action, enabled)
+        VALUES (?, 'streamboo_viewer_spam', 'streamboo + solicitation', 'high', 'timeout', 1)
+        ON CONFLICT(name) DO NOTHING
+        """,
+        (BUILTIN_STREAMBOO_RULE_NAME,),
     )
 
 
@@ -1214,21 +1329,31 @@ def reset_database(connection: sqlite3.Connection) -> dict[str, int]:
 
 
 def database_health(database_path: Path) -> dict[str, object]:
-    connection = connect_database(database_path)
+    connection: sqlite3.Connection | None = None
     try:
+        connection = connect_database(database_path)
         initialize_database(connection)
         table_count = connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         ).fetchone()[0]
         pragma_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        integrity = str(connection.execute("PRAGMA quick_check").fetchone()[0])
         return {
-            "status": "ready",
+            "status": "ready" if integrity == "ok" else "degraded",
             "path": str(database_path),
             "table_count": table_count,
             "journal_mode": pragma_mode,
+            "integrity": integrity,
+        }
+    except sqlite3.Error as exc:
+        return {
+            "status": "degraded",
+            "path": str(database_path),
+            "error": str(exc),
         }
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
 
 def upsert_service_reliability_bucket(
@@ -1302,6 +1427,66 @@ def list_service_reliability_buckets(
         (cleaned_service_name, int(limit)),
     ).fetchall()
     return list(rows)
+
+
+def record_operational_metric(
+    connection: sqlite3.Connection,
+    metric_name: str,
+    value: float,
+    *,
+    dimension_key: str = "",
+    observed_at: str | None = None,
+) -> None:
+    cleaned_name = metric_name.strip().casefold()
+    if not cleaned_name:
+        raise ValueError("metric_name must not be empty")
+    timestamp = observed_at or datetime.now(timezone.utc).isoformat()
+    with connection:
+        connection.execute(
+            """INSERT INTO operational_metrics(metric_name,dimension_key,value,observed_at)
+               VALUES (?,?,?,?) ON CONFLICT(metric_name,dimension_key,observed_at)
+               DO UPDATE SET value=excluded.value""",
+            (cleaned_name, dimension_key.strip().casefold(), float(value), timestamp),
+        )
+
+
+def operational_readiness_snapshot(connection: sqlite3.Connection) -> dict[str, object]:
+    queue_rows = connection.execute(
+        """SELECT stage,status,COUNT(*) count FROM processing_jobs
+           GROUP BY stage,status ORDER BY stage,status"""
+    ).fetchall()
+    latest_metrics = connection.execute(
+        """SELECT m.metric_name,m.dimension_key,m.value,m.observed_at
+           FROM operational_metrics m
+           JOIN (SELECT metric_name,dimension_key,MAX(observed_at) latest
+                 FROM operational_metrics GROUP BY metric_name,dimension_key) x
+             ON x.metric_name=m.metric_name AND x.dimension_key=m.dimension_key AND x.latest=m.observed_at
+           ORDER BY m.metric_name,m.dimension_key"""
+    ).fetchall()
+    counters = {
+        "observations_5m": int(connection.execute(
+            "SELECT COUNT(*) FROM observations WHERE occurred_at>=datetime('now','-5 minutes')"
+        ).fetchone()[0]),
+        "observations_1h": int(connection.execute(
+            "SELECT COUNT(*) FROM observations WHERE occurred_at>=datetime('now','-1 hour')"
+        ).fetchone()[0]),
+        "open_reviews": int(connection.execute("SELECT COUNT(*) FROM review_queue WHERE status='open'").fetchone()[0]),
+        "pending_actions": int(connection.execute("SELECT COUNT(*) FROM moderation_actions WHERE status='pending'").fetchone()[0]),
+        "failed_actions_24h": int(connection.execute(
+            "SELECT COUNT(*) FROM moderation_actions WHERE status='failed' AND created_at>=datetime('now','-1 day')"
+        ).fetchone()[0]),
+        "open_alerts": int(connection.execute("SELECT COUNT(*) FROM intelligence_alerts WHERE status='open'").fetchone()[0]),
+        "open_cases": int(connection.execute("SELECT COUNT(*) FROM investigation_cases WHERE status!='closed'").fetchone()[0]),
+    }
+    return {
+        "counters": counters,
+        "queues": [dict(row) for row in queue_rows],
+        "latest_metrics": [dict(row) for row in latest_metrics],
+        "schema_version": int(connection.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]),
+        "latest_evaluation_at": connection.execute(
+            "SELECT MAX(calculated_at) FROM model_evaluation_runs"
+        ).fetchone()[0],
+    }
 
 
 def ensure_platform_account(
@@ -1477,6 +1662,7 @@ def persist_normalized_message(
     message: NormalizedMessage,
     *,
     observation_id: int | None = None,
+    moderation_shadow_mode: bool = False,
 ) -> IngestionResult:
     platform_account_id = ensure_platform_account(
         connection,
@@ -1573,6 +1759,7 @@ def persist_normalized_message(
                     message_id=message_id,
                     platform=message.platform,
                     findings=findings,
+                    force_shadow=moderation_shadow_mode,
                 )
 
                 for finding in findings:
@@ -1598,6 +1785,7 @@ def persist_normalized_message(
                         message_id=message_id,
                         platform=message.platform,
                         findings=egregious_findings,
+                        force_shadow=moderation_shadow_mode,
                     )
                     for finding in egregious_findings:
                         penalty_delta, penalty_reason = score_delta_for_moderation(
@@ -1915,7 +2103,25 @@ def upsert_moderation_rule(
     severity: str,
     auto_enforce_action: str | None = None,
     enabled: bool = True,
+    enforcement_mode: str = "enforce",
+    action_duration_seconds: int = 600,
 ) -> int:
+    cleaned_name = name.strip()
+    cleaned_type = rule_type.strip().casefold()
+    cleaned_severity = severity.strip().casefold()
+    cleaned_action = auto_enforce_action.strip().casefold() if auto_enforce_action else None
+    if not cleaned_name:
+        raise ValueError("moderation rule name must not be empty")
+    if cleaned_type not in {"exact_term", "banned_phrase", "streamboo_viewer_spam", "link_restriction", "duplicate_message", "egregious_term"}:
+        raise ValueError("unsupported moderation rule type")
+    if cleaned_severity not in {"low", "medium", "high", "critical"}:
+        raise ValueError("unsupported moderation severity")
+    if cleaned_action not in {None, "warn", "timeout", "ban"}:
+        raise ValueError("unsupported moderation action")
+    normalized_mode = enforcement_mode.strip().casefold()
+    if normalized_mode not in {"enforce", "review", "shadow", "disabled"}:
+        raise ValueError("enforcement_mode must be enforce, review, shadow, or disabled")
+    duration = max(1, min(int(action_duration_seconds), 2_419_200))
     with connection:
         connection.execute(
             """
@@ -1925,8 +2131,10 @@ def upsert_moderation_rule(
                 pattern,
                 severity,
                 auto_enforce_action,
-                enabled
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                enabled,
+                enforcement_mode,
+                action_duration_seconds
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(name)
             DO UPDATE SET
                 rule_type = excluded.rule_type,
@@ -1934,20 +2142,24 @@ def upsert_moderation_rule(
                 severity = excluded.severity,
                 auto_enforce_action = excluded.auto_enforce_action,
                 enabled = excluded.enabled,
+                enforcement_mode = excluded.enforcement_mode,
+                action_duration_seconds = excluded.action_duration_seconds,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
-                name,
-                rule_type,
+                cleaned_name,
+                cleaned_type,
                 pattern,
-                severity,
-                auto_enforce_action,
+                cleaned_severity,
+                cleaned_action,
                 int(enabled),
+                normalized_mode,
+                duration,
             ),
         )
         row = connection.execute(
             "SELECT id FROM moderation_rules WHERE name = ?",
-            (name,),
+            (cleaned_name,),
         ).fetchone()
 
     if row is None:
@@ -1959,7 +2171,8 @@ def upsert_moderation_rule(
 def load_enabled_moderation_rules(connection: sqlite3.Connection) -> list[ModerationRule]:
     rows = connection.execute(
         """
-        SELECT id, name, rule_type, pattern, severity, auto_enforce_action, enabled
+        SELECT id, name, rule_type, pattern, severity, auto_enforce_action, enabled,
+               enforcement_mode, action_duration_seconds
         FROM moderation_rules
         WHERE enabled = 1
         ORDER BY id
@@ -1974,6 +2187,8 @@ def load_enabled_moderation_rules(connection: sqlite3.Connection) -> list[Modera
             severity=str(row[4]),
             auto_enforce_action=str(row[5]) if row[5] is not None else None,
             enabled=bool(row[6]),
+            enforcement_mode=str(row[7]),
+            action_duration_seconds=int(row[8]),
         )
         for row in rows
     ]
@@ -1985,11 +2200,28 @@ def record_moderation_findings(
     message_id: int,
     platform: str,
     findings: list[ModerationFinding],
+    force_shadow: bool = False,
 ) -> None:
     if not findings:
         return
 
+    message_row = connection.execute(
+        "SELECT user_id, observation_id FROM messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    user_id = (
+        int(message_row[0])
+        if message_row is not None and message_row[0] is not None
+        else None
+    )
+    observation_id = (
+        int(message_row[1])
+        if message_row is not None and message_row[1] is not None
+        else None
+    )
+
     for finding in findings:
+        effective_mode = "shadow" if force_shadow else finding.enforcement_mode
         connection.execute(
             """
             INSERT INTO rule_matches (
@@ -2010,7 +2242,30 @@ def record_moderation_findings(
                 finding.auto_enforce_action,
             ),
         )
-        if finding.auto_enforce_action:
+        if finding.severity.strip().casefold() in {"high", "critical"}:
+            title = finding.rule_name.removeprefix("builtin:").replace("_", " ").title()
+            connection.execute(
+                """
+                INSERT INTO intelligence_alerts(
+                    user_id, observation_id, alert_type, severity, title, summary,
+                    confidence, dedupe_key
+                ) VALUES (?, ?, 'moderation_finding', ?, ?, ?, 1.0, ?)
+                ON CONFLICT(dedupe_key) DO NOTHING
+                """,
+                (
+                    user_id,
+                    observation_id,
+                    finding.severity,
+                    title,
+                    f"{finding.reason_code} matched message {message_id} on {platform} ({effective_mode})",
+                    f"moderation:{message_id}:{finding.rule_id}",
+                ),
+            )
+        should_enforce = bool(
+            finding.auto_enforce_action
+            and effective_mode == "enforce"
+        )
+        if should_enforce:
             connection.execute(
                 """
                 INSERT INTO moderation_actions (
@@ -2022,6 +2277,7 @@ def record_moderation_findings(
                     actor_type,
                     actor_id,
                     reason,
+                    duration_seconds,
                     status
                 ) VALUES (
                     ?,
@@ -2031,6 +2287,7 @@ def record_moderation_findings(
                     ?,
                     'system',
                     NULL,
+                    ?,
                     ?,
                     'pending'
                 )
@@ -2042,6 +2299,7 @@ def record_moderation_findings(
                     message_id,
                     finding.auto_enforce_action,
                     finding.reason_code,
+                    finding.action_duration_seconds,
                 ),
             )
         else:
@@ -2057,7 +2315,11 @@ def record_moderation_findings(
                     resolved_at
                 ) VALUES (?, 'open', ?, ?, NULL, CURRENT_TIMESTAMP, NULL)
                 """,
-                (message_id, finding.severity, finding.reason_code),
+                (
+                    message_id,
+                    finding.severity,
+                    finding.reason_code,
+                ),
             )
 
 
@@ -2128,7 +2390,8 @@ def list_pending_moderation_actions_for_message(
             moderation_actions.target_platform_account_id,
             moderation_actions.action_type,
             moderation_actions.reason,
-            platform_accounts.username
+            platform_accounts.username,
+            moderation_actions.duration_seconds
         FROM moderation_actions
         INNER JOIN platform_accounts ON platform_accounts.id = moderation_actions.target_platform_account_id
         WHERE moderation_actions.message_id = ?
@@ -2148,7 +2411,8 @@ def mark_moderation_action_completed(
         connection.execute(
             """
             UPDATE moderation_actions
-            SET status = 'completed'
+            SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
+                error_message = NULL
             WHERE id = ?
             """,
             (action_id,),

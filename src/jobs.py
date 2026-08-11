@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import shutil
 import sqlite3
 import time
 import re
@@ -22,17 +21,21 @@ from .db import (
 	initialize_database,
 	record_twitch_live_announcement,
 	upsert_discord_channel,
+	record_operational_metric,
 )
 from .permissions import _everyone_cannot_view
 from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 from .intelligence.signals import refresh_all_derived_signals
+from .models import Observation
+from .db import collect_observation
 from .intelligence.analytics import (
 	refresh_cohort_baselines,
 	refresh_emerging_topics,
 	refresh_graph_analytics,
 	refresh_identity_suggestions,
 	run_model_evaluation,
+	emit_analytics_alerts,
 )
 from .pipeline.handlers import recover_expired_processing_jobs
 
@@ -91,50 +94,58 @@ def run_maintenance_jobs(
 	*,
 	connection_factory: JobConnectionFactory = connect_database,
 	now: datetime | None = None,
+	perform_maintenance: bool = True,
+	perform_analytics: bool = True,
+	perform_backup: bool = True,
 ) -> MaintenanceReport:
 	current_time = now or datetime.now(UTC)
 	connection = connection_factory(settings.database_path)
 	try:
 		initialize_database(connection)
-		recover_expired_processing_jobs(connection)
-		deleted_messages = purge_expired_messages(connection, current_time, settings.message_retention_days)
-		deleted_observations = purge_expired_observations(
-			connection,
-			current_time,
-			settings.message_retention_days,
-		)
-		deleted_audit_rows = purge_expired_audit_log(connection, current_time, settings.audit_retention_days)
-		deleted_score_runs = purge_expired_score_runs(
-			connection,
-			current_time,
-			settings.message_retention_days,
-		)
-		deleted_signal_runs = purge_expired_signal_runs(
-			connection,
-			current_time,
-			settings.message_retention_days,
-		)
-		deleted_processing_jobs = purge_expired_processing_jobs(
-			connection,
-			current_time,
-			settings.message_retention_days,
-		)
-		refresh_all_derived_signals(connection)
-		with connection:
-			topic_count = refresh_emerging_topics(connection, now=current_time)
-			graph_node_count = refresh_graph_analytics(connection, calculated_at=current_time.isoformat())
-			identity_suggestion_count = refresh_identity_suggestions(connection)
-			cohort_baseline_count, _ = refresh_cohort_baselines(connection, calculated_at=current_time.isoformat())
-			evaluation_run_id = run_model_evaluation(connection)
-		rollup_rows = refresh_metrics_rollups(connection, current_time)
+		deleted_messages = deleted_observations = deleted_audit_rows = 0
+		deleted_score_runs = deleted_signal_runs = deleted_processing_jobs = 0
+		rollup_rows = 0
+		topic_count = graph_node_count = identity_suggestion_count = 0
+		cohort_baseline_count = evaluation_run_id = 0
+		if perform_maintenance:
+			recover_expired_processing_jobs(connection)
+			deleted_messages = purge_expired_messages(connection, current_time, settings.message_retention_days)
+			deleted_observations = purge_expired_observations(connection, current_time, settings.message_retention_days)
+			deleted_audit_rows = purge_expired_audit_log(connection, current_time, settings.audit_retention_days)
+			deleted_score_runs = purge_expired_score_runs(connection, current_time, settings.message_retention_days)
+			deleted_signal_runs = purge_expired_signal_runs(connection, current_time, settings.message_retention_days)
+			deleted_processing_jobs = purge_expired_processing_jobs(connection, current_time, settings.message_retention_days)
+			rollup_rows = refresh_metrics_rollups(connection, current_time)
+		if perform_analytics:
+			refresh_all_derived_signals(connection)
+			with connection:
+				topic_count = refresh_emerging_topics(connection, now=current_time)
+				graph_node_count = refresh_graph_analytics(connection, calculated_at=current_time.isoformat())
+				identity_suggestion_count = refresh_identity_suggestions(connection)
+				cohort_baseline_count, _ = refresh_cohort_baselines(connection, calculated_at=current_time.isoformat())
+				evaluation_run_id = run_model_evaluation(connection)
+				emit_analytics_alerts(connection, calculated_at=current_time.isoformat())
+			record_operational_metric(connection, "analytics.refresh.success", 1.0, observed_at=current_time.isoformat())
+		if perform_maintenance:
+			record_operational_metric(connection, "maintenance.success", 1.0, observed_at=current_time.isoformat())
 	finally:
 		connection.close()
 
-	backup_path, backup_metadata_path, backup_sha256 = create_database_backup(
-		settings.database_path,
-		settings.backup_dir,
-		current_time,
-	)
+	backup_path = backup_metadata_path = ""
+	backup_sha256 = ""
+	if perform_backup:
+		created_path, created_metadata_path, backup_sha256 = create_database_backup(
+			settings.database_path, settings.backup_dir, current_time,
+			retention_count=settings.backup_retention_count,
+		)
+		backup_path, backup_metadata_path = str(created_path), str(created_metadata_path)
+		metric_connection = connection_factory(settings.database_path)
+		try:
+			initialize_database(metric_connection)
+			record_operational_metric(metric_connection, "backup.success", float(created_path.stat().st_size),
+				observed_at=current_time.isoformat())
+		finally:
+			metric_connection.close()
 	return MaintenanceReport(
 		deleted_messages=deleted_messages,
 		deleted_observations=deleted_observations,
@@ -142,8 +153,8 @@ def run_maintenance_jobs(
 		deleted_signal_runs=deleted_signal_runs,
 		deleted_score_runs=deleted_score_runs,
 		deleted_processing_jobs=deleted_processing_jobs,
-		backup_path=str(backup_path),
-		backup_metadata_path=str(backup_metadata_path),
+		backup_path=backup_path,
+		backup_metadata_path=backup_metadata_path,
 		backup_sha256=backup_sha256,
 		rollup_rows=rollup_rows,
 		topic_count=topic_count,
@@ -170,6 +181,7 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 
 	twitch_token_manager = _build_twitch_token_manager(settings)
 	stream = _fetch_twitch_live_stream("its_not_qwerty", twitch_token_manager)
+	_record_twitch_stream_lifecycle(settings.database_path, "its_not_qwerty", stream)
 	if stream is None:
 		JOBS_LOGGER.info("no active twitch stream detected for channel=%s", "its_not_qwerty")
 		return 0
@@ -227,6 +239,51 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 		announcements_sent += 1
 
 	return announcements_sent
+
+
+def _record_twitch_stream_lifecycle(
+	database_path: Path,
+	channel_name: str,
+	stream: TwitchLiveStream | None,
+) -> None:
+	"""Project polling changes into the common observation/analysis pipeline."""
+	connection = connect_database(database_path)
+	try:
+		initialize_database(connection)
+		latest = connection.execute(
+			"""SELECT event_type,external_event_id,attributes_json FROM observations
+			   WHERE platform='twitch' AND context_id=? AND event_type LIKE 'stream.%'
+			   ORDER BY occurred_at DESC,id DESC LIMIT 1""",
+			(channel_name,),
+		).fetchone()
+		if stream is None:
+			if latest is None or str(latest[0]) == "stream.ended":
+				return
+			previous = json.loads(str(latest[2] or "{}"))
+			event_type = "stream.ended"
+			stream_id = str(previous.get("stream_id") or "unknown")
+			attributes = {"stream_id": stream_id, "channel_name": channel_name}
+		else:
+			previous = json.loads(str(latest[2] or "{}")) if latest is not None else {}
+			if latest is None or str(latest[0]) == "stream.ended" or previous.get("stream_id") != stream.stream_id:
+				event_type = "stream.started"
+			elif previous.get("title") != stream.title or previous.get("game_name") != stream.game_name:
+				event_type = "stream.updated"
+			else:
+				return
+			stream_id = stream.stream_id
+			attributes = {"stream_id": stream.stream_id, "channel_name": channel_name,
+				"title": stream.title, "game_name": stream.game_name, "url": stream.url}
+		collect_observation(connection, Observation(
+			platform="twitch", event_type=event_type,
+			external_event_id=f"poll:{channel_name}:{stream_id}:{event_type}:{hashlib.sha256(json.dumps(attributes, sort_keys=True).encode()).hexdigest()[:12]}",
+			actor_platform_user_id=channel_name, actor_username=channel_name,
+			container_id=channel_name, context_id=channel_name,
+			text=stream.title if stream is not None else None,
+			occurred_at=datetime.now(UTC).isoformat(), attributes=attributes,
+		))
+	finally:
+		connection.close()
 
 
 def send_manual_twitch_live_announcements(settings: AppSettings) -> int:
@@ -446,11 +503,28 @@ def refresh_metrics_rollups(connection: sqlite3.Connection, now: datetime) -> in
 	return len(rollups)
 
 
-def create_database_backup(database_path: Path, backup_dir: Path, now: datetime) -> tuple[Path, Path, str]:
+def create_database_backup(
+	database_path: Path,
+	backup_dir: Path,
+	now: datetime,
+	*,
+	retention_count: int = 48,
+) -> tuple[Path, Path, str]:
+	"""Create a transactionally consistent SQLite backup and prune old generations."""
 	backup_dir.mkdir(parents=True, exist_ok=True)
 	timestamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
 	backup_path = backup_dir / f"{database_path.stem}-{timestamp}{database_path.suffix}"
-	shutil.copy2(database_path, backup_path)
+	source = sqlite3.connect(database_path)
+	destination = sqlite3.connect(backup_path)
+	try:
+		source.backup(destination)
+		destination.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+		integrity = destination.execute("PRAGMA integrity_check").fetchone()
+		if integrity is None or str(integrity[0]).casefold() != "ok":
+			raise sqlite3.DatabaseError("backup integrity check failed")
+	finally:
+		destination.close()
+		source.close()
 	backup_sha256 = _sha256sum(backup_path)
 	metadata = {
 		"created_at": now.astimezone(UTC).isoformat(),
@@ -461,6 +535,14 @@ def create_database_backup(database_path: Path, backup_dir: Path, now: datetime)
 	}
 	backup_metadata_path = backup_path.with_suffix(backup_path.suffix + ".json")
 	backup_metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+	_generations = sorted(
+		backup_dir.glob(f"{database_path.stem}-*{database_path.suffix}"),
+		key=lambda path: path.stat().st_mtime,
+		reverse=True,
+	)
+	for expired in _generations[max(1, retention_count):]:
+		expired.unlink(missing_ok=True)
+		expired.with_suffix(expired.suffix + ".json").unlink(missing_ok=True)
 	return backup_path, backup_metadata_path, backup_sha256
 
 

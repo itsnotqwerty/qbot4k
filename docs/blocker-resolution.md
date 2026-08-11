@@ -12,6 +12,7 @@ This revision resolves the operational blockers found during the intelligence-pl
 - Maintenance now removes expired messages by event time, orphaned observations, temporal signal history, all but the latest expired score run per user, and old terminal processing jobs.
 - `requirements.txt` declares the runtime WebSocket dependency.
 - The analytical breadth extension is documented in `docs/analytical-breadth.md`.
+- Streamboo solicitation detection now runs inside the durable moderation analyzer instead of an uncalled connector helper. Matching messages create rule evidence, a high-severity intelligence alert, a reputation penalty, a pending timeout, and a retryable platform action job. The matcher handles case changes, zero-width characters, separators, and `o`/`0` substitution while still requiring solicitation context.
 
 ## Verification
 

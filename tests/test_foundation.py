@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import signal
+import subprocess
+import sys
 import threading
 import unittest
 from dataclasses import replace
@@ -191,6 +193,84 @@ class FoundationTests(unittest.TestCase):
             )
 
         self.assertTrue(settings.discord_allow_bot_messages)
+
+    def test_explicit_environment_file_is_read_and_authoritative(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "from-explicit-file.sqlite3"
+            backup_path = Path(tmpdir) / "backups"
+            env_file = Path(tmpdir) / "qbot4k.env"
+            env_file.write_text(
+                f"QBOT_DATABASE_PATH={database_path}\n"
+                f"QBOT_BACKUP_DIR={backup_path}\n"
+                "QBOT_ENABLED_SERVICES=jobs,analysis\n",
+                encoding="utf-8",
+            )
+            inherited = {
+                "QBOT_DATABASE_PATH": str(Path(tmpdir) / "wrong.sqlite3"),
+                "QBOT_ENABLED_SERVICES": "web",
+            }
+
+            with mock.patch.dict(os.environ, inherited, clear=True):
+                settings = AppSettings.from_env(env_file=env_file)
+
+        self.assertEqual(settings.database_path, database_path)
+        self.assertEqual(settings.backup_dir, backup_path)
+        self.assertEqual(settings.enabled_services, ("jobs", "analysis"))
+
+    def test_explicit_environment_file_must_exist(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            missing_path = Path(tmpdir) / "missing.env"
+            with self.assertRaisesRegex(ConfigError, "does not exist"):
+                AppSettings.from_env(env_file=missing_path)
+
+    def test_absolute_entrypoint_works_outside_project_directory(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        entrypoint = project_root / "src" / "__main__.py"
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "outside-cwd.sqlite3"
+            env_file = Path(tmpdir) / "qbot4k.env"
+            env_file.write_text(
+                f"QBOT_DATABASE_PATH={database_path}\n"
+                "QBOT_ENABLED_SERVICES=jobs,analysis\n",
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(entrypoint),
+                    "--env-file",
+                    str(env_file),
+                    "check-config",
+                ],
+                cwd=tmpdir,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["database_path"], str(database_path))
+
+    def test_systemd_templates_reset_legacy_paths(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        service = (project_root / "deploy" / "qbot4k.service").read_text(
+            encoding="utf-8"
+        )
+        override = (
+            project_root / "deploy" / "zz-qbot4k-installer.conf"
+        ).read_text(encoding="utf-8")
+
+        expected_entrypoint = (
+            "/opt/qbot4k/current/.venv/bin/python "
+            "/opt/qbot4k/current/src/__main__.py "
+            "--env-file /etc/qbot4k/qbot4k.env run"
+        )
+        self.assertIn(f"ExecStart={expected_entrypoint}", service)
+        self.assertIn("ExecStart=\n", override)
+        self.assertIn(f"ExecStart={expected_entrypoint}", override)
+        self.assertIn("ReadWritePaths=\n", override)
+        self.assertIn("/opt/qbot4k/data", override)
 
     def test_settings_fail_fast_when_web_auth_missing(self) -> None:
         with TemporaryDirectory() as tmpdir:

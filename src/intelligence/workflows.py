@@ -7,6 +7,11 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
+from .policy import (
+    AUTO_EXPIRED_DISPOSITION,
+    COORDINATION_ALERT_MEDIUM_EVIDENCE,
+    COORDINATION_ALERT_MIN_EVIDENCE,
+)
 from .signals import SIGNAL_ANALYZER_VERSION
 from .scoring import calculate_social_score, get_current_social_score
 
@@ -324,6 +329,132 @@ def create_case_from_alert(connection: sqlite3.Connection, alert_id: int, *, ope
     return case_id
 
 
+def update_case(
+    connection: sqlite3.Connection,
+    case_id: int,
+    *,
+    title: str | None = None,
+    summary: str | None = None,
+    priority: str | None = None,
+    status: str | None = None,
+    owner_operator_id: int | None = None,
+    operator_id: int | None = None,
+) -> None:
+    """Update case workflow state and append an immutable activity record."""
+    row = connection.execute("SELECT * FROM investigation_cases WHERE id=?", (case_id,)).fetchone()
+    if row is None:
+        raise ValueError("case not found")
+    normalized_priority = (priority or str(row["priority"])).strip().casefold()
+    normalized_status = (status or str(row["status"])).strip().casefold()
+    if normalized_priority not in {"low", "medium", "high", "critical"}:
+        raise ValueError("invalid case priority")
+    if normalized_status not in {"open", "active", "pending", "closed"}:
+        raise ValueError("invalid case status")
+    next_title = (title if title is not None else str(row["title"])).strip()
+    if not next_title:
+        raise ValueError("case title must not be empty")
+    next_summary = summary if summary is not None else str(row["summary"])
+    owner = owner_operator_id if owner_operator_id is not None else row["owner_operator_id"]
+    connection.execute(
+        """UPDATE investigation_cases SET title=?, summary=?, priority=?, status=?,
+           owner_operator_id=?, updated_at=CURRENT_TIMESTAMP,
+           closed_at=CASE WHEN ?='closed' THEN COALESCE(closed_at,CURRENT_TIMESTAMP) ELSE NULL END
+           WHERE id=?""",
+        (next_title, next_summary, normalized_priority, normalized_status, owner,
+         normalized_status, case_id),
+    )
+    _record_case_activity(connection, case_id, operator_id, "case.updated", "", {
+        "title": next_title, "priority": normalized_priority, "status": normalized_status,
+        "owner_operator_id": owner,
+    })
+
+
+def add_case_entity(connection: sqlite3.Connection, case_id: int, user_id: int, *,
+                    role: str = "subject", operator_id: int | None = None) -> None:
+    _require_case(connection, case_id)
+    if connection.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
+        raise ValueError("user not found")
+    normalized_role = role.strip().casefold() or "subject"
+    connection.execute(
+        """INSERT INTO case_entities(case_id,user_id,role) VALUES (?,?,?)
+           ON CONFLICT(case_id,user_id) DO UPDATE SET role=excluded.role""",
+        (case_id, user_id, normalized_role),
+    )
+    _record_case_activity(connection, case_id, operator_id, "entity.added", "", {
+        "user_id": user_id, "role": normalized_role,
+    })
+
+
+def add_case_evidence(connection: sqlite3.Connection, case_id: int, *,
+                      observation_id: int | None = None, message_id: int | None = None,
+                      alert_id: int | None = None, signal_history_id: int | None = None,
+                      note: str = "", operator_id: int | None = None) -> int:
+    _require_case(connection, case_id)
+    if all(value is None for value in (observation_id, message_id, alert_id, signal_history_id)):
+        raise ValueError("case evidence requires an evidence reference")
+    cursor = connection.execute(
+        """INSERT INTO case_evidence(case_id,observation_id,message_id,signal_history_id,alert_id,note)
+           VALUES (?,?,?,?,?,?)""",
+        (case_id, observation_id, message_id, signal_history_id, alert_id, note.strip()),
+    )
+    evidence_id = int(cursor.lastrowid)
+    _record_case_activity(connection, case_id, operator_id, "evidence.added", note.strip(), {
+        "case_evidence_id": evidence_id, "observation_id": observation_id,
+        "message_id": message_id, "alert_id": alert_id, "signal_history_id": signal_history_id,
+    })
+    return evidence_id
+
+
+def add_case_note(connection: sqlite3.Connection, case_id: int, body: str, *,
+                  operator_id: int | None = None) -> int:
+    _require_case(connection, case_id)
+    cleaned = body.strip()
+    if not cleaned:
+        raise ValueError("case note must not be empty")
+    return _record_case_activity(connection, case_id, operator_id, "note.added", cleaned, {})
+
+
+def update_alert_workflow(connection: sqlite3.Connection, alert_id: int, *,
+                          status: str | None = None, assigned_operator_id: int | None = None,
+                          suppress_until: str | None = None, operator_id: int | None = None) -> None:
+    normalized = status.strip().casefold() if status else None
+    if normalized not in {None, "open", "acknowledged", "in_case", "resolved", "suppressed"}:
+        raise ValueError("invalid alert status")
+    cursor = connection.execute(
+        """UPDATE intelligence_alerts SET status=COALESCE(?,status),
+           assigned_operator_id=COALESCE(?,assigned_operator_id),
+           acknowledged_at=CASE WHEN ?='acknowledged' THEN COALESCE(acknowledged_at,CURRENT_TIMESTAMP) ELSE acknowledged_at END,
+           suppressed_until=CASE WHEN ?='suppressed' THEN ? ELSE suppressed_until END,
+           updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+        (normalized, assigned_operator_id, normalized, normalized, suppress_until, alert_id),
+    )
+    if cursor.rowcount != 1:
+        raise ValueError("alert not found")
+    connection.execute(
+        """INSERT INTO audit_log(actor_type,actor_id,action_type,entity_type,entity_id,payload_json)
+           VALUES (?,?, 'alert.workflow_updated','intelligence_alert',?,?)""",
+        ("operator" if operator_id is not None else "system", operator_id, alert_id,
+         json.dumps({"status": normalized, "assigned_operator_id": assigned_operator_id,
+                     "suppress_until": suppress_until}, sort_keys=True)),
+    )
+
+
+def _require_case(connection: sqlite3.Connection, case_id: int) -> None:
+    if connection.execute("SELECT 1 FROM investigation_cases WHERE id=?", (case_id,)).fetchone() is None:
+        raise ValueError("case not found")
+
+
+def _record_case_activity(connection: sqlite3.Connection, case_id: int, operator_id: int | None,
+                          activity_type: str, body: str, payload: Mapping[str, object]) -> int:
+    cursor = connection.execute(
+        """INSERT INTO case_activity(case_id,operator_id,activity_type,body,payload_json)
+           VALUES (?,?,?,?,?)""",
+        (case_id, operator_id, activity_type, body, json.dumps(dict(payload), sort_keys=True)),
+    )
+    connection.execute("UPDATE investigation_cases SET updated_at=CURRENT_TIMESTAMP WHERE id=?", (case_id,))
+    return int(cursor.lastrowid)
+
+
 def dispose_alert(connection: sqlite3.Connection, alert_id: int, disposition: str, *, operator_id: int | None = None) -> None:
     normalized = disposition.strip().casefold()
     if normalized not in {"confirmed", "benign", "unresolved", "escalated"}:
@@ -361,10 +492,10 @@ def dispose_alert(connection: sqlite3.Connection, alert_id: int, disposition: st
 def generate_intelligence_report(connection: sqlite3.Connection, *, user_id: int | None = None, report_type: str = "entity_profile") -> int:
     if user_id is None:
         title = "Daily Intelligence Summary"
-        alerts = [dict(row) for row in connection.execute("SELECT id, severity, title, summary, user_id, created_at FROM intelligence_alerts WHERE status != 'resolved' ORDER BY created_at DESC LIMIT 50").fetchall()]
+        alerts = [dict(row) for row in connection.execute("SELECT id, severity, title, summary, user_id, created_at FROM intelligence_alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50").fetchall()]
         cases = [dict(row) for row in connection.execute("SELECT id, title, priority, status, updated_at FROM investigation_cases WHERE status != 'closed' ORDER BY updated_at DESC LIMIT 50").fetchall()]
         content: Mapping[str, object] = {"alerts": alerts, "cases": cases, "relationship_count": int(connection.execute("SELECT COUNT(*) FROM entity_relationships").fetchone()[0])}
-        summary = f"{len(alerts)} active alerts, {len(cases)} open cases, {content['relationship_count']} relationships."
+        summary = f"{len(alerts)} untriaged alerts, {len(cases)} open cases, {content['relationship_count']} relationships."
         evidence = [{"alert_id": item["id"]} for item in alerts]
     else:
         user = connection.execute("SELECT primary_display_name, current_reputation_score FROM users WHERE id = ?", (user_id,)).fetchone()
@@ -404,7 +535,7 @@ def generate_intelligence_report(connection: sqlite3.Connection, *, user_id: int
 
 def intelligence_summary(connection: sqlite3.Connection) -> IntelligenceSummary:
     return IntelligenceSummary(
-        open_alerts=int(connection.execute("SELECT COUNT(*) FROM intelligence_alerts WHERE status != 'resolved'").fetchone()[0]),
+        open_alerts=int(connection.execute("SELECT COUNT(*) FROM intelligence_alerts WHERE status = 'open'").fetchone()[0]),
         open_cases=int(connection.execute("SELECT COUNT(*) FROM investigation_cases WHERE status != 'closed'").fetchone()[0]),
         relationships=int(connection.execute("SELECT COUNT(*) FROM entity_relationships").fetchone()[0]),
         reports=int(connection.execute("SELECT COUNT(*) FROM intelligence_reports").fetchone()[0]),
@@ -538,20 +669,45 @@ def _upsert_relationship(connection: sqlite3.Connection, source: int, target: in
         (source, target, kind, context),
     ).fetchone()
     relationship_id, evidence_count = int(relationship[0]), int(relationship[1])
-    if evidence_count >= 3:
+    observation_id = evidence.get("observation_id")
+    if observation_id is not None:
+        connection.execute(
+            """INSERT OR IGNORE INTO relationship_evidence(
+                 relationship_id,observation_id,occurred_at,attributes_json
+               ) VALUES (?,?,?,?)""",
+            (relationship_id, int(observation_id), occurred_at,
+             json.dumps(dict(evidence), sort_keys=True)),
+        )
+    if evidence_count >= COORDINATION_ALERT_MIN_EVIDENCE:
         connection.execute(
             """
             INSERT INTO intelligence_alerts (
                 user_id, alert_type, severity, title, summary, confidence, dedupe_key
             ) VALUES (?, 'coordination_pattern', ?, 'Coordination Pattern', ?, ?, ?)
-            ON CONFLICT(dedupe_key) DO NOTHING
+            ON CONFLICT(dedupe_key) DO UPDATE SET
+                severity=excluded.severity,
+                summary=excluded.summary,
+                confidence=excluded.confidence,
+                status=CASE WHEN intelligence_alerts.status='resolved'
+                                  AND intelligence_alerts.disposition=? THEN 'open'
+                            ELSE intelligence_alerts.status END,
+                disposition=CASE WHEN intelligence_alerts.status='resolved'
+                                       AND intelligence_alerts.disposition=? THEN NULL
+                                 ELSE intelligence_alerts.disposition END,
+                resolved_at=CASE WHEN intelligence_alerts.status='resolved'
+                                      AND intelligence_alerts.disposition=? THEN NULL
+                                 ELSE intelligence_alerts.resolved_at END,
+                updated_at=CURRENT_TIMESTAMP
             """,
             (
                 source,
-                "medium" if evidence_count >= 5 else "low",
+                "medium" if evidence_count >= COORDINATION_ALERT_MEDIUM_EVIDENCE else "low",
                 f"{kind.replace('_', ' ').title()} with entity {target} has {evidence_count} supporting observations.",
-                min(1.0, evidence_count / 5.0),
+                min(1.0, evidence_count / COORDINATION_ALERT_MEDIUM_EVIDENCE),
                 f"relationship:{relationship_id}:coordination",
+                AUTO_EXPIRED_DISPOSITION,
+                AUTO_EXPIRED_DISPOSITION,
+                AUTO_EXPIRED_DISPOSITION,
             ),
         )
 

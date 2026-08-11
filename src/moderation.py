@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
@@ -9,6 +10,14 @@ from .models import NormalizedMessage
 
 
 _LINK_PATTERN = re.compile(r"https?://|www\.", re.IGNORECASE)
+_STREAMBOO_BRAND_PATTERN = re.compile(
+	r"s[\W_]*t[\W_]*r[\W_]*e[\W_]*a[\W_]*m[\W_]*b[\W_]*(?:o|0)[\W_]*(?:o|0)",
+	re.IGNORECASE,
+)
+_STREAMBOO_SOLICITATION_PATTERN = re.compile(
+	r"(?<!\w)(?:viewers?|followers?|promotion|promot(?:e|ion)|boost(?:ing)?|audience|engagement)(?!\w)",
+	re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -20,6 +29,8 @@ class ModerationRule:
 	severity: str
 	auto_enforce_action: str | None
 	enabled: bool
+	enforcement_mode: str = "enforce"
+	action_duration_seconds: int = 600
 
 
 @dataclass(frozen=True)
@@ -30,6 +41,8 @@ class ModerationFinding:
 	severity: str
 	reason_code: str
 	auto_enforce_action: str | None = None
+	enforcement_mode: str = "enforce"
+	action_duration_seconds: int = 600
 
 
 def evaluate_egregious_content(
@@ -37,7 +50,7 @@ def evaluate_egregious_content(
 	rule: ModerationRule,
 ) -> list[ModerationFinding]:
 	"""Return an auto-enforceable finding when the message contains a slur or ToS violation."""
-	if message.is_moderator:
+	if message.is_moderator or not rule.enabled or rule.enforcement_mode == "disabled":
 		return []
 	if not is_egregious_content(message.content_raw):
 		return []
@@ -50,7 +63,7 @@ def evaluate_message_moderation(
 ) -> list[ModerationFinding]:
 	findings: list[ModerationFinding] = []
 	for rule in rules:
-		if not rule.enabled:
+		if not rule.enabled or rule.enforcement_mode == "disabled":
 			continue
 
 		if rule.rule_type == "exact_term":
@@ -60,6 +73,11 @@ def evaluate_message_moderation(
 
 		if rule.rule_type == "banned_phrase":
 			if _matches_phrase(message.content_raw, rule.pattern):
+				findings.append(_build_finding(rule))
+			continue
+
+		if rule.rule_type == "streamboo_viewer_spam":
+			if not message.is_moderator and contains_streamboo_viewer_spam(message.content_raw):
 				findings.append(_build_finding(rule))
 			continue
 
@@ -83,8 +101,10 @@ def _build_finding(rule: ModerationRule) -> ModerationFinding:
 		rule_type=rule.rule_type,
 		severity=rule.severity,
 		reason_code=rule.rule_type,
-		auto_enforce_action=rule.auto_enforce_action,
-	)
+        auto_enforce_action=rule.auto_enforce_action,
+        enforcement_mode=rule.enforcement_mode,
+        action_duration_seconds=rule.action_duration_seconds,
+    )
 
 
 def _matches_exact_term(content: str, pattern: str) -> bool:
@@ -94,6 +114,16 @@ def _matches_exact_term(content: str, pattern: str) -> bool:
 
 	content_casefolded = content.casefold()
 	return re.search(rf"(?<!\w){re.escape(normalized_pattern)}(?!\w)", content_casefolded) is not None
+
+
+def contains_streamboo_viewer_spam(content: str) -> bool:
+	"""Match Streamboo solicitation while tolerating common separator and zero-width obfuscation."""
+	normalized = unicodedata.normalize("NFKC", content).casefold()
+	normalized = "".join(character for character in normalized if unicodedata.category(character) != "Cf")
+	return (
+		_STREAMBOO_BRAND_PATTERN.search(normalized) is not None
+		and _STREAMBOO_SOLICITATION_PATTERN.search(normalized) is not None
+	)
 
 
 def _matches_phrase(content: str, pattern: str) -> bool:

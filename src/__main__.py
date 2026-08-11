@@ -100,6 +100,11 @@ def _restore_shutdown_handlers(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="QBot4K bootstrap utilities")
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        help="Read configuration directly from this environment file",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser(
@@ -136,20 +141,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_settings() -> AppSettings:
-    settings = AppSettings.from_env()
+def load_settings(env_file: Path | None = None) -> AppSettings:
+    settings = AppSettings.from_env(env_file=env_file)
     configure_logging(settings.log_level)
     return settings
 
 
-def run_check_config() -> int:
-    settings = load_settings()
+def run_check_config(env_file: Path | None = None) -> int:
+    settings = load_settings(env_file)
     print(json.dumps(settings.safe_summary(), indent=2, sort_keys=True))
     return 0
 
 
-def run_init_db() -> int:
-    settings = load_settings()
+def run_init_db(env_file: Path | None = None) -> int:
+    settings = load_settings(env_file)
     connection = connect_database(settings.database_path)
     try:
         initialize_database(connection)
@@ -163,8 +168,8 @@ def run_init_db() -> int:
         connection.close()
 
 
-def run_application(once: bool) -> int:
-    settings = load_settings()
+def run_application(once: bool, env_file: Path | None = None) -> int:
+    settings = load_settings(env_file)
     app_started_at = datetime.now(timezone.utc).isoformat()
     service_started_at = {
         service: app_started_at
@@ -196,6 +201,7 @@ def run_application(once: bool) -> int:
 
     message_pipeline = MessageAnalysisPipeline(
         settings.database_path,
+        moderation_shadow_mode=settings.moderation_shadow_mode,
     )
 
     analysis_registry.register(
@@ -296,9 +302,19 @@ def run_application(once: bool) -> int:
 
     def job_loop() -> None:
         jobs_logger = logging.getLogger("qbot4k.jobs")
+        next_maintenance = next_analytics = next_backup = 0.0
         while not shutdown_event.is_set():
+            now_monotonic = time.monotonic()
+            do_maintenance = now_monotonic >= next_maintenance
+            do_analytics = now_monotonic >= next_analytics
+            do_backup = now_monotonic >= next_backup
             try:
-                run_maintenance_jobs(settings)
+                run_maintenance_jobs(
+                    settings,
+                    perform_maintenance=do_maintenance,
+                    perform_analytics=do_analytics,
+                    perform_backup=do_backup,
+                )
                 jobs_logger.info("maintenance run complete")
                 if "discord" in settings.enabled_services and "twitch" in settings.enabled_services:
                     announcements = run_twitch_live_announcement_job(settings)
@@ -307,7 +323,15 @@ def run_application(once: bool) -> int:
                             "sent twitch live announcements count=%s", announcements)
             except Exception:
                 jobs_logger.exception("maintenance run failed")
-            shutdown_event.wait(300)
+            else:
+                if do_maintenance:
+                    next_maintenance = now_monotonic + settings.maintenance_interval_seconds
+                if do_analytics:
+                    next_analytics = now_monotonic + settings.analytics_interval_seconds
+                if do_backup:
+                    next_backup = now_monotonic + settings.backup_interval_seconds
+            wait_for = max(0.25, min(next_maintenance, next_analytics, next_backup) - time.monotonic())
+            shutdown_event.wait(wait_for)
 
     if "jobs" in settings.enabled_services:
         service_started_at.setdefault(
@@ -551,11 +575,15 @@ def run_application(once: bool) -> int:
     return 0
 
 
-def run_watch(interval: float, watch_paths: tuple[str, ...]) -> int:
+def run_watch(
+    interval: float,
+    watch_paths: tuple[str, ...],
+    env_file: Path | None = None,
+) -> int:
     if interval <= 0:
         raise ConfigError("watch interval must be greater than zero")
 
-    settings = load_settings()
+    settings = load_settings(env_file)
     logger = logging.getLogger("qbot4k.watch")
     project_root = Path(__file__).resolve().parent.parent
     entrypoint = Path(__file__).resolve()
@@ -622,8 +650,12 @@ def run_watch(interval: float, watch_paths: tuple[str, ...]) -> int:
 
     def spawn_application_process() -> subprocess.Popen[bytes]:
         logger.info("starting application process")
+        command = [sys.executable, str(entrypoint)]
+        if env_file is not None:
+            command.extend(("--env-file", str(env_file)))
+        command.append("run")
         return subprocess.Popen(
-            [sys.executable, str(entrypoint), "run"],
+            command,
             cwd=str(project_root),
         )
 
@@ -706,13 +738,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.command == "check-config":
-            return run_check_config()
+            return run_check_config(args.env_file)
         if args.command == "init-db":
-            return run_init_db()
+            return run_init_db(args.env_file)
         if args.command == "run":
-            return run_application(args.once)
+            return run_application(args.once, args.env_file)
         if args.command == "watch":
-            return run_watch(args.interval, tuple(args.watch_paths or ()))
+            return run_watch(
+                args.interval,
+                tuple(args.watch_paths or ()),
+                args.env_file,
+            )
     except ConfigError as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 2

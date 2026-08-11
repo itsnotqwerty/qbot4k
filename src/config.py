@@ -14,19 +14,46 @@ class ConfigError(ValueError):
 _SYSTEMD_SERVICE_PATTERN = re.compile(r"^[A-Za-z0-9_.@:-]+\.service$")
 
 
-def _load_dotenv(dotenv_path: Path) -> None:
-    if not dotenv_path.exists():
-        return
+_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+
+def _read_environment_file(
+        environment_path: Path, *, required: bool = False) -> dict[str, str]:
+    if not environment_path.exists():
+        if required:
+            raise ConfigError(f"Environment file does not exist: {environment_path}")
+        return {}
+    if not environment_path.is_file():
+        raise ConfigError(f"Environment file is not a regular file: {environment_path}")
+
+    try:
+        raw_contents = environment_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(
+            f"Unable to read environment file {environment_path}: {exc}"
+        ) from exc
+
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(raw_contents.splitlines(), start=1):
         line = raw_line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith(("#", ";")):
             continue
+        if "=" not in line:
+            raise ConfigError(
+                f"Invalid environment assignment at {environment_path}:{line_number}"
+            )
 
         key, value = line.split("=", 1)
         key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if not _ENV_KEY_PATTERN.fullmatch(key):
+            raise ConfigError(
+                f"Invalid environment key at {environment_path}:{line_number}"
+            )
         value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        values[key] = value
+    return values
 
 
 def _parse_csv(raw_value: str | None) -> tuple[str, ...]:
@@ -82,13 +109,33 @@ class AppSettings:
     discord_oauth_client_id: str | None
     discord_oauth_client_secret: str | None
     discord_oauth_redirect_uri: str | None
+    moderation_shadow_mode: bool
+    ingest_api_token: str | None
+    maintenance_interval_seconds: int
+    analytics_interval_seconds: int
+    backup_interval_seconds: int
+    backup_retention_count: int
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> AppSettings:
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        env_file: str | Path | None = None,
+    ) -> AppSettings:
         repo_root = Path(__file__).resolve().parents[1]
-        _load_dotenv(repo_root / ".env")
+        if env is None:
+            env_map = _read_environment_file(repo_root / ".env")
+            env_map.update(os.environ)
+        else:
+            env_map = dict(env)
 
-        env_map = dict(os.environ if env is None else env)
+        if env_file is not None:
+            explicit_path = Path(env_file).expanduser().resolve()
+            # An explicitly selected file is authoritative, including over
+            # inherited values. This makes --env-file deterministic under
+            # systemd, interactive shells, and configuration checks.
+            env_map.update(_read_environment_file(explicit_path, required=True))
 
         database_raw = env_map.get("QBOT_DATABASE_PATH")
         if not database_raw:
@@ -176,6 +223,31 @@ class AppSettings:
             discord_oauth_redirect_uri=env_map.get(
                 "QBOT_DISCORD_OAUTH_REDIRECT_URI"
             ),
+            moderation_shadow_mode=_parse_bool(
+                env_map.get("QBOT_MODERATION_SHADOW_MODE"),
+                default=False,
+            ),
+            ingest_api_token=env_map.get("QBOT_INGEST_API_TOKEN"),
+            maintenance_interval_seconds=_parse_int(
+                "QBOT_MAINTENANCE_INTERVAL_SECONDS",
+                env_map.get("QBOT_MAINTENANCE_INTERVAL_SECONDS"),
+                60,
+            ),
+            analytics_interval_seconds=_parse_int(
+                "QBOT_ANALYTICS_INTERVAL_SECONDS",
+                env_map.get("QBOT_ANALYTICS_INTERVAL_SECONDS"),
+                300,
+            ),
+            backup_interval_seconds=_parse_int(
+                "QBOT_BACKUP_INTERVAL_SECONDS",
+                env_map.get("QBOT_BACKUP_INTERVAL_SECONDS"),
+                3600,
+            ),
+            backup_retention_count=_parse_int(
+                "QBOT_BACKUP_RETENTION_COUNT",
+                env_map.get("QBOT_BACKUP_RETENTION_COUNT"),
+                48,
+            ),
         )
         settings.validate()
         return settings
@@ -193,6 +265,15 @@ class AppSettings:
 
         if self.audit_retention_days <= 0:
             raise ConfigError("QBOT_AUDIT_RETENTION_DAYS must be greater than zero")
+
+        for name, value in (
+            ("QBOT_MAINTENANCE_INTERVAL_SECONDS", self.maintenance_interval_seconds),
+            ("QBOT_ANALYTICS_INTERVAL_SECONDS", self.analytics_interval_seconds),
+            ("QBOT_BACKUP_INTERVAL_SECONDS", self.backup_interval_seconds),
+            ("QBOT_BACKUP_RETENTION_COUNT", self.backup_retention_count),
+        ):
+            if value <= 0:
+                raise ConfigError(f"{name} must be greater than zero")
 
         if "web" in self.enabled_services:
             required_web_values = {
@@ -277,4 +358,10 @@ class AppSettings:
                 and self.twitch_client_secret
             ),
             "discord_configured": bool(self.discord_bot_token),
+            "moderation_shadow_mode": self.moderation_shadow_mode,
+            "ingest_api_token_configured": bool(self.ingest_api_token),
+            "maintenance_interval_seconds": self.maintenance_interval_seconds,
+            "analytics_interval_seconds": self.analytics_interval_seconds,
+            "backup_interval_seconds": self.backup_interval_seconds,
+            "backup_retention_count": self.backup_retention_count,
         }

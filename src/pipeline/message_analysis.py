@@ -16,7 +16,7 @@ from ..db import enqueue_processing_job, get_observation, persist_normalized_mes
 from ..models import NormalizedMessage
 from ..intelligence.signals import refresh_user_derived_signals
 from ..intelligence.workflows import process_intelligence_observation
-from ..intelligence.content import analyze_observation_content
+from ..intelligence.content import analyze_observation_content, emit_content_alert
 from ..server_boosts import is_server_boost_confirmation, process_discord_server_boost
 
 
@@ -67,9 +67,11 @@ class MessageAnalysisPipeline:
         database_path: Path,
         *,
         command_registry: CommandRegistry | None = None,
+        moderation_shadow_mode: bool = False,
     ) -> None:
         self.database_path = Path(database_path)
         self.command_registry = command_registry or build_default_command_registry()
+        self.moderation_shadow_mode = moderation_shadow_mode
 
     def analyze_message_created(
         self,
@@ -120,8 +122,14 @@ class MessageAnalysisPipeline:
                     )
                 return
 
-            _project_message(connection, message, observation_id)
-            analyze_observation_content(connection, observation_id)
+            _project_message(
+                connection,
+                message,
+                observation_id,
+                moderation_shadow_mode=self.moderation_shadow_mode,
+            )
+            content = analyze_observation_content(connection, observation_id)
+            emit_content_alert(connection, observation_id, content)
             _enqueue_moderation_action(
                 connection,
                 observation_id=observation_id,
@@ -278,6 +286,8 @@ def _project_message(
     connection: sqlite3.Connection,
     message: NormalizedMessage,
     observation_id: int,
+    *,
+    moderation_shadow_mode: bool = False,
 ) -> None:
     existing = connection.execute(
         "SELECT id FROM messages WHERE observation_id = ?",
@@ -290,6 +300,7 @@ def _project_message(
         connection,
         message,
         observation_id=observation_id,
+        moderation_shadow_mode=moderation_shadow_mode,
     )
     if result.status == "duplicate":
         if message.platform_message_id is not None:

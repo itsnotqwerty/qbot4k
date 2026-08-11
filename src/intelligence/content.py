@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from urllib.parse import urlparse
 
 
-ANALYZER_VERSION = 2
+ANALYZER_VERSION = 3
 _WORD = re.compile(r"[\w'-]+", re.UNICODE)
 _URL = re.compile(r"https?://[^\s<>]+", re.I)
 _EMAIL = re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b")
@@ -152,6 +152,48 @@ def analyze_observation_content(connection: sqlite3.Connection, observation_id: 
         ((observation_id, *entity) for entity in result.entities),
     )
     return result
+
+
+def emit_content_alert(
+    connection: sqlite3.Connection,
+    observation_id: int,
+    result: ContentUnderstanding,
+) -> int | None:
+    """Turn high-confidence content findings into evidence-linked triage work."""
+    if result.threat_level not in {"high", "critical"}:
+        return None
+    observation = connection.execute(
+        """
+        SELECT actor.user_id, target.user_id
+        FROM observations AS o
+        LEFT JOIN platform_accounts AS actor ON actor.id=o.actor_platform_account_id
+        LEFT JOIN platform_accounts AS target ON target.id=o.target_platform_account_id
+        WHERE o.id=?
+        """,
+        (observation_id,),
+    ).fetchone()
+    if observation is None:
+        return None
+    user_id = observation[0] if observation[0] is not None else observation[1]
+    severity = "critical" if result.threat_level == "critical" else "high"
+    cursor = connection.execute(
+        """
+        INSERT INTO intelligence_alerts(
+            user_id, observation_id, alert_type, severity, title, summary,
+            confidence, dedupe_key
+        ) VALUES (?, ?, 'content_threat', ?, 'Potential Threat', ?, ?, ?)
+        ON CONFLICT(dedupe_key) DO NOTHING
+        """,
+        (
+            user_id,
+            observation_id,
+            severity,
+            "Content analysis identified: " + ", ".join(result.indicators),
+            result.threat_score,
+            f"content-threat:{observation_id}:v{ANALYZER_VERSION}",
+        ),
+    )
+    return int(cursor.lastrowid) if cursor.rowcount == 1 else None
 
 
 def _detect_language(words: list[str], text: str) -> tuple[str, float]:

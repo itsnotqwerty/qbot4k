@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import csv
+import io
 import hashlib
 import hmac
 import json
@@ -21,6 +23,7 @@ from ..db import (
     connect_database,
 	collect_observation,
 	database_health,
+	operational_readiness_snapshot,
 	delete_simple_command_definition,
 	initialize_database,
 	list_service_reliability_buckets,
@@ -48,10 +51,15 @@ from ..intelligence.signals import (
 )
 from ..intelligence.scoring import get_current_social_score
 from ..intelligence.workflows import (
+	add_case_entity,
+	add_case_evidence,
+	add_case_note,
 	create_case_from_alert,
 	dispose_alert,
 	generate_intelligence_report,
 	intelligence_summary,
+	update_alert_workflow,
+	update_case,
 )
 from ..intelligence.search import list_saved_queries, observation_pivots, save_query, search_observations
 from ..intelligence.analytics import analytics_snapshot, review_identity_suggestion
@@ -68,7 +76,13 @@ from .auth import (
     fetch_discord_identity,
     parse_session_cookie,
 )
-from .moderation import list_open_reviews, list_recent_actions
+from .moderation import (
+	list_moderation_rules,
+	list_open_reviews,
+	list_recent_actions,
+	resolve_review,
+	save_moderation_rule,
+)
 from .overview import load_overview_snapshot
 from .users import (
 	get_user_moderation_status,
@@ -93,6 +107,14 @@ def _restart_systemd_service(service_name: str) -> None:
 	if result.returncode != 0:
 		detail = (result.stderr or result.stdout or "systemctl restart failed").strip()
 		raise RuntimeError(detail[:500])
+
+
+def _optional_string(value: object) -> str | None:
+	return str(value) if value is not None else None
+
+
+def _optional_int(value: object) -> int | None:
+	return int(value) if value not in (None, "") else None
 
 
 @dataclass(frozen=True)
@@ -120,6 +142,9 @@ class DashboardApp:
 	def dispatch(self, handler: BaseHTTPRequestHandler) -> bool:
 		parsed = urlparse(handler.path)
 		path = parsed.path
+		if handler.command in {"POST", "PUT", "PATCH", "DELETE"} and not self._valid_request_origin(handler):
+			self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "origin_mismatch"})
+			return True
 
 		if handler.command == "GET" and path in {"/", "/dashboard"}:
 			self._serve_dashboard(handler, parse_qs(parsed.query))
@@ -148,6 +173,9 @@ class DashboardApp:
 		if handler.command == "GET" and path == "/search":
 			self._serve_search(handler, parse_qs(parsed.query))
 			return True
+		if handler.command == "GET" and path == "/search/export.csv":
+			self._serve_search_export(handler, parse_qs(parsed.query))
+			return True
 		if handler.command == "POST" and path == "/search/saved":
 			self._serve_search_save(handler)
 			return True
@@ -157,11 +185,20 @@ class DashboardApp:
 		if handler.command == "GET" and path.startswith("/intelligence/cases/"):
 			self._serve_intelligence_case(handler, path)
 			return True
+		if handler.command == "POST" and path.startswith("/intelligence/cases/") and path.endswith("/action"):
+			self._serve_intelligence_case_action(handler, path)
+			return True
+		if handler.command == "GET" and path == "/audit":
+			self._serve_audit(handler, parse_qs(parsed.query))
+			return True
 		if handler.command == "POST" and path.startswith("/intelligence/alerts/") and path.endswith("/case"):
 			self._serve_intelligence_alert_case(handler, path)
 			return True
 		if handler.command == "POST" and path.startswith("/intelligence/alerts/") and path.endswith("/disposition"):
 			self._serve_intelligence_alert_disposition(handler, path)
+			return True
+		if handler.command == "POST" and path.startswith("/intelligence/alerts/") and path.endswith("/workflow"):
+			self._serve_intelligence_alert_workflow(handler, path)
 			return True
 		if handler.command == "POST" and path == "/intelligence/reports/generate":
 			self._serve_intelligence_report_generate(handler)
@@ -180,7 +217,13 @@ class DashboardApp:
 			self._serve_user_messages(handler, path, parse_qs(parsed.query))
 			return True
 		if handler.command == "GET" and path == "/moderation":
-			self._serve_moderation(handler)
+			self._serve_moderation(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "POST" and path.startswith("/moderation/reviews/") and path.endswith("/resolve"):
+			self._serve_moderation_review_resolve(handler, path)
+			return True
+		if handler.command == "POST" and path == "/moderation/rules":
+			self._serve_moderation_rule_save(handler)
 			return True
 		if handler.command == "GET" and path == "/commands":
 			self._serve_commands(handler, parse_qs(parsed.query))
@@ -234,6 +277,15 @@ class DashboardApp:
 		if handler.command == "GET" and path.startswith("/api/intelligence/reports/"):
 			self._serve_api_intelligence_report(handler, path)
 			return True
+		if handler.command == "GET" and path.startswith("/api/intelligence/cases/") and path.endswith("/export"):
+			self._serve_api_case_export(handler, path)
+			return True
+		if handler.command in {"GET", "POST"} and path.startswith("/api/intelligence/cases/"):
+			self._serve_api_case(handler, path)
+			return True
+		if handler.command == "POST" and path.startswith("/api/intelligence/alerts/"):
+			self._serve_api_alert_workflow(handler, path)
+			return True
 		if handler.command == "GET" and path.startswith("/api/users/"):
 			self._serve_api_user_detail(handler, path)
 			return True
@@ -250,8 +302,20 @@ class DashboardApp:
 		if handler.command == "GET" and path == "/api/moderation/reviews":
 			self._serve_api_reviews(handler)
 			return True
+		if handler.command == "POST" and path.startswith("/api/moderation/reviews/") and path.endswith("/resolve"):
+			self._serve_api_review_resolve(handler, path)
+			return True
+		if handler.command == "GET" and path == "/api/moderation/rules":
+			self._serve_api_rules(handler)
+			return True
+		if handler.command == "POST" and path == "/api/moderation/rules":
+			self._serve_api_rule_save(handler)
+			return True
 		if handler.command == "GET" and path == "/api/health":
 			self._serve_api_health(handler)
+			return True
+		if handler.command == "GET" and path == "/api/audit":
+			self._serve_api_audit(handler, parse_qs(parsed.query))
 			return True
 		return False
 
@@ -288,6 +352,13 @@ class DashboardApp:
 			return None
 		return f"{scheme}://{host}"
 
+	def _valid_request_origin(self, handler: BaseHTTPRequestHandler) -> bool:
+		origin = (handler.headers.get("Origin") or "").strip().rstrip("/")
+		if not origin:
+			return True
+		expected = self._request_origin(handler)
+		return bool(expected) and hmac.compare_digest(origin, expected.rstrip("/"))
+
 	def _log_exception(self, message: str, exc: Exception) -> None:
 		logging.getLogger("qbot4k.dashboard").exception("%s: %s", message, exc)
 
@@ -321,10 +392,32 @@ class DashboardApp:
 		if session is None:
 			self._redirect(handler, "/login")
 			return None
-		if admin_only and session.role != "admin":
+		try:
+			operator_id = int(session.user_id)
+		except ValueError:
+			self._redirect(handler, "/login")
+			return None
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			operator = connection.execute(
+				"SELECT discord_username,role FROM operator_accounts WHERE id=?", (operator_id,)
+			).fetchone()
+		finally:
+			connection.close()
+		if operator is None:
+			self._redirect(handler, "/login")
+			return None
+		current_session = DashboardSession(
+			user_id=session.user_id,
+			username=str(operator[0]),
+			role=str(operator[1]),
+			expires_at=session.expires_at,
+		)
+		if admin_only and current_session.role != "admin":
 			self._send_text(handler, HTTPStatus.FORBIDDEN, "Forbidden")
 			return None
-		return session
+		return current_session
 
 	def _serve_login(self, handler: BaseHTTPRequestHandler) -> None:
 		if not self.settings.discord_oauth_client_id or not self.settings.dashboard_session_secret:
@@ -341,7 +434,7 @@ class DashboardApp:
 			state,
 		)
 		self._redirect(handler, redirect_target, cookies=(
-		    f"qbot4k_oauth_state={state}; Path=/; HttpOnly; SameSite=Lax",))
+		    f"qbot4k_oauth_state={state}; Path=/; HttpOnly; SameSite=Lax{self._secure_cookie_suffix(handler)}",))
 
 	def _serve_oauth_callback(
 	    self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
@@ -399,6 +492,12 @@ class DashboardApp:
 				discord_username=identity.username,
 				role=role,
 			)
+			connection.execute(
+				"""INSERT INTO audit_log(actor_type,actor_id,action_type,entity_type,entity_id,payload_json)
+				   VALUES ('operator',?,'auth.login','operator_account',?,?)""",
+				(operator_id, operator_id, json.dumps({"discord_user_id": identity.user_id, "role": role}, sort_keys=True)),
+			)
+			connection.commit()
 		finally:
 			connection.close()
 
@@ -409,17 +508,26 @@ class DashboardApp:
 			handler,
 			"/dashboard",
 			cookies=(
-				f"qbot4k_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax",
-				"qbot4k_oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",
+				f"qbot4k_session={cookie_value}; Path=/; HttpOnly; SameSite=Lax{self._secure_cookie_suffix(handler)}",
+				f"qbot4k_oauth_state=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{self._secure_cookie_suffix(handler)}",
 			),
 		)
 
 	def _serve_logout(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._read_session(handler)
+		if session is not None and session.user_id.isdigit():
+			self._audit_operator_action(int(session.user_id), "auth.logout", "operator_account", int(session.user_id), {})
 		self._redirect(
 			handler,
 			"/login",
-			cookies=("qbot4k_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax",),
+			cookies=(f"qbot4k_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{self._secure_cookie_suffix(handler)}",),
 		)
+
+	def _secure_cookie_suffix(self, handler: BaseHTTPRequestHandler) -> str:
+		scheme = (handler.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().casefold()
+		if scheme == "https" or str(self.settings.discord_oauth_redirect_uri or "").casefold().startswith("https://"):
+			return "; Secure"
+		return ""
 
 	def _serve_dashboard(self, handler: BaseHTTPRequestHandler,
 	                     query: Mapping[str, list[str]]) -> None:
@@ -1251,7 +1359,7 @@ class DashboardApp:
 
 		self._redirect(handler, f"/users/{user_id}?mod_status={quote(f'Moderation action {action_type} recorded')}")
 
-	def _serve_moderation(self, handler: BaseHTTPRequestHandler) -> None:
+	def _serve_moderation(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
 		if session is None:
 			return
@@ -1260,23 +1368,103 @@ class DashboardApp:
 			initialize_database(connection)
 			reviews = list_open_reviews(connection)
 			actions = list_recent_actions(connection)
+			rules = list_moderation_rules(connection)
 		finally:
 			connection.close()
 		review_rows = "".join(
-			f"<tr><td>{item.review_id}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.severity)}</td><td>{self._escape(item.reason_code)}</td><td>{self._escape(item.status)}</td></tr>"
+			"<tr>"
+			+ f"<td>{item.review_id}</td><td>{self._escape(item.platform)}</td><td>{self._escape(item.target_username)}</td>"
+			+ f"<td>{self._escape(item.severity)}</td><td>{self._escape(item.reason_code)}</td><td>{self._escape(item.content)}</td>"
+			+ f"<td><form method='post' action='/moderation/reviews/{item.review_id}/resolve' class='row-actions'>"
+			+ "<select name='resolution'><option value='dismissed'>Dismiss</option><option value='confirmed'>Confirm</option><option value='escalated'>Escalate</option></select>"
+			+ "<select name='action_type'><option value=''>No action</option><option value='warn'>Warn</option><option value='timeout'>Timeout</option><option value='ban'>Ban</option></select>"
+			+ "<input name='duration_seconds' type='number' min='1' max='2419200' value='600' aria-label='Duration seconds'>"
+			+ "<input name='note' placeholder='Analyst note'><button type='submit'>Resolve</button></form></td></tr>"
 			for item in reviews
 		)
 		action_rows = "".join(
-			f"<tr><td>{self._escape(item.platform)}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.action_type)}</td><td>{self._escape(item.status)}</td><td>{self._escape(item.reason or '')}</td></tr>"
+			f"<tr><td>{self._escape(item.platform)}</td><td>{self._escape(item.target_username)}</td><td>{self._escape(item.action_type)}</td><td>{self._escape(item.status)}</td><td>{self._escape(item.reason or '')}</td><td>{self._escape(item.error_message or '')}</td><td>{self._escape(item.created_at)}</td></tr>"
 			for item in actions
 		)
+		rule_rows = "".join(
+			f"<tr><td>{self._escape(item.name)}</td><td>{self._escape(item.rule_type)}</td><td><code>{self._escape(item.pattern)}</code></td>"
+			f"<td>{self._escape(item.severity)}</td><td>{self._escape(item.enforcement_mode)}</td><td>{self._escape(item.auto_enforce_action or '—')}</td>"
+			f"<td>{item.action_duration_seconds}</td><td>{'yes' if item.enabled else 'no'}</td></tr>"
+			for item in rules
+		)
+		status = self._escape((query.get("status") or [""])[0])
+		status_html = f"<p class='status-banner'>{status}</p>" if status else ""
+		rule_form = ""
+		if session.role == "admin":
+			rule_form = (
+				"<form method='post' action='/moderation/rules' class='search'>"
+				"<input name='name' placeholder='Rule name' required><select name='rule_type'><option value='exact_term'>Exact term</option><option value='banned_phrase'>Phrase</option><option value='streamboo_viewer_spam'>Streamboo spam</option><option value='link_restriction'>Link restriction</option><option value='duplicate_message'>Duplicate</option><option value='egregious_term'>Egregious</option></select>"
+				"<input name='pattern' placeholder='Pattern' required><select name='severity'><option>low</option><option>medium</option><option>high</option><option>critical</option></select>"
+				"<select name='enforcement_mode'><option value='shadow'>Shadow</option><option value='review'>Review</option><option value='enforce'>Enforce</option><option value='disabled'>Disabled</option></select>"
+				"<select name='auto_enforce_action'><option value=''>No action</option><option value='warn'>Warn</option><option value='timeout'>Timeout</option><option value='ban'>Ban</option></select>"
+				"<input name='action_duration_seconds' type='number' min='1' max='2419200' value='600'><label><input type='checkbox' name='enabled' value='1' checked> Enabled</label><button type='submit'>Save rule</button></form>"
+			)
 		body = self._render_page(
 			"Moderation",
 			session,
-			"<section class='hero'><div><p class='eyebrow'>Moderation</p><h1>Review and action queue</h1><p class='lede'>Open cases and recent actions are surfaced here for operators.</p></div></section>"  # noqa: E501
-			+ f"<section class='card'><h2>Open reviews</h2><div class='table-scroll'><table class='table'><thead><tr><th>ID</th><th>Target</th><th>Severity</th><th>Reason</th><th>Status</th></tr></thead><tbody>{review_rows or '<tr><td colspan=5>No open reviews</td></tr>'}</tbody></table></div></section><section class='card'><h2>Recent actions</h2><div class='table-scroll'><table class='table'><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th></tr></thead><tbody>{action_rows or '<tr><td colspan=5>No actions yet</td></tr>'}</tbody></table></div></section>"
+			"<section class='hero'><div><p class='eyebrow'>Moderation</p><h1>Review and policy operations</h1><p class='lede'>Adjudicate queued findings, execute bounded actions, and manage rule enforcement modes.</p></div></section>"
+			+ status_html
+			+ f"<section class='card'><h2>Open reviews</h2><div class='table-scroll'><table class='table'><thead><tr><th>ID</th><th>Platform</th><th>Target</th><th>Severity</th><th>Reason</th><th>Content</th><th>Resolution</th></tr></thead><tbody>{review_rows or '<tr><td colspan=7>No open reviews</td></tr>'}</tbody></table></div></section>"
+			+ f"<section class='card'><h2>Rules</h2>{rule_form}<div class='table-scroll'><table class='table'><thead><tr><th>Name</th><th>Type</th><th>Pattern</th><th>Severity</th><th>Mode</th><th>Action</th><th>Duration</th><th>Enabled</th></tr></thead><tbody>{rule_rows or '<tr><td colspan=8>No rules</td></tr>'}</tbody></table></div></section>"
+			+ f"<section class='card'><h2>Recent actions</h2><div class='table-scroll'><table class='table'><thead><tr><th>Platform</th><th>Target</th><th>Action</th><th>Status</th><th>Reason</th><th>Error</th><th>Created</th></tr></thead><tbody>{action_rows or '<tr><td colspan=7>No actions yet</td></tr>'}</tbody></table></div></section>"
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_moderation_review_resolve(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+		try:
+			review_id = int(path.split("/")[3])
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				resolve_review(connection, review_id, resolution=(form.get("resolution") or [""])[0],
+					operator_id=int(session.user_id), note=(form.get("note") or [""])[0],
+					action_type=(form.get("action_type") or [""])[0] or None,
+					duration_seconds=int((form.get("duration_seconds") or ["600"])[0]))
+		except (ValueError, IndexError) as exc:
+			self._redirect(handler, f"/moderation?status={quote(str(exc))}")
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._redirect(handler, "/moderation?status=Review+resolved")
+
+	def _serve_moderation_rule_save(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+		try:
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				save_moderation_rule(connection, name=(form.get("name") or [""])[0],
+					rule_type=(form.get("rule_type") or [""])[0], pattern=(form.get("pattern") or [""])[0],
+					severity=(form.get("severity") or [""])[0],
+					auto_enforce_action=(form.get("auto_enforce_action") or [""])[0] or None,
+					enabled=(form.get("enabled") or [""])[0] == "1",
+					enforcement_mode=(form.get("enforcement_mode") or ["shadow"])[0],
+					action_duration_seconds=int((form.get("action_duration_seconds") or ["600"])[0]),
+					operator_id=int(session.user_id))
+		except ValueError as exc:
+			self._redirect(handler, f"/moderation?status={quote(str(exc))}")
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._redirect(handler, "/moderation?status=Rule+saved")
 
 	def _serve_commands(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler, admin_only=True)
@@ -1443,7 +1631,7 @@ class DashboardApp:
 		try:
 			initialize_database(connection)
 			items = self._search_items(connection, query)
-			saved = list_saved_queries(connection)
+			saved = list_saved_queries(connection, operator_id=int(session.user_id))
 		finally:
 			connection.close()
 		rows = "".join(
@@ -1451,36 +1639,138 @@ class DashboardApp:
 			f"<td>{self._escape(item['event_type'])}</td><td>{self._escape(item.get('text_raw') or '')}</td>"
 			f"<td><a href='/api/observations/{item['id']}/pivots'>Pivots</a></td></tr>" for item in items
 		) or "<tr><td colspan='6'>No matching observations.</td></tr>"
-		saved_options = "".join(f"<li><a href='/search?q={quote(str(item['query_text']))}'>{self._escape(item['name'])}</a></li>" for item in saved) or "<li>No saved queries.</li>"
+		def _saved_href(item: Mapping[str, object]) -> str:
+			params = {key: str(value) for key, value in dict(item.get("filters") or {}).items() if value not in (None, "")}
+			params["q"] = str(item["query_text"])
+			return "/search?" + urlencode(params)
+		saved_options = "".join(f"<li><a href='{self._escape(_saved_href(item))}'>{self._escape(item['name'])}</a></li>" for item in saved) or "<li>No saved queries.</li>"
+		filter_fields = ("start_at", "end_at", "platform", "event_type", "user_id", "container_id", "context_id", "entity_type", "entity_value")
+		hidden_filters = "".join(
+			f"<input type='hidden' name='{key}' value='{self._escape((query.get(key) or [''])[0])}'>"
+			for key in filter_fields
+		)
+		limit_raw = (query.get("limit") or ["100"])[0]
+		offset_raw = (query.get("offset") or ["0"])[0]
+		page_limit = max(1, min(int(limit_raw) if limit_raw.isdigit() else 100, 500))
+		page_offset = max(0, int(offset_raw) if offset_raw.isdigit() else 0)
+		base_params = {key: values[0] for key, values in query.items() if values and key not in {"offset", "limit"}}
+		base_params["limit"] = str(page_limit)
+		pagination = ""
+		if page_offset > 0:
+			pagination += f"<a href='/search?{urlencode({**base_params, 'offset': str(max(0, page_offset-page_limit))})}'>Previous</a> "
+		if len(items) == page_limit:
+			pagination += f"<a href='/search?{urlencode({**base_params, 'offset': str(page_offset+page_limit)})}'>Next</a>"
 		content = (
 			"<section class='hero'><div><p class='eyebrow'>Investigation</p><h1>Observation search</h1>"
 			"<p class='lede'>Full-text search with temporal, entity, user, platform, and event filters.</p></div></section>"
 			"<section class='card'><form class='search' method='get' action='/search'>"
 			f"<input name='q' placeholder='Terms or phrases' value='{self._escape((query.get('q') or [''])[0])}'>"
-			"<input name='start_at' placeholder='Start ISO timestamp'><input name='end_at' placeholder='End ISO timestamp'>"
-			"<input name='platform' placeholder='Platform'><input name='event_type' placeholder='Event type'>"
-			"<input name='user_id' placeholder='User ID'><input name='context_id' placeholder='Context'>"
-			"<input name='entity_type' placeholder='Entity type'><input name='entity_value' placeholder='Entity value'>"
+			f"<input name='start_at' value='{self._escape((query.get('start_at') or [''])[0])}' placeholder='Start ISO timestamp'><input name='end_at' value='{self._escape((query.get('end_at') or [''])[0])}' placeholder='End ISO timestamp'>"
+			f"<input name='platform' value='{self._escape((query.get('platform') or [''])[0])}' placeholder='Platform'><input name='event_type' value='{self._escape((query.get('event_type') or [''])[0])}' placeholder='Event type'>"
+			f"<input name='user_id' value='{self._escape((query.get('user_id') or [''])[0])}' placeholder='User ID'><input name='context_id' value='{self._escape((query.get('context_id') or [''])[0])}' placeholder='Context'>"
+			f"<input name='entity_type' value='{self._escape((query.get('entity_type') or [''])[0])}' placeholder='Entity type'><input name='entity_value' value='{self._escape((query.get('entity_value') or [''])[0])}' placeholder='Entity value'>"
 			"<button type='submit'>Search</button></form></section>"
-			f"<section class='card'><h2>Results</h2><div class='table-scroll'><table class='table'><thead><tr><th>ID</th><th>Time</th><th>Platform</th><th>Event</th><th>Content</th><th>Investigate</th></tr></thead><tbody>{rows}</tbody></table></div></section>"
-			f"<section class='card'><h2>Saved queries</h2><form class='toolbar' method='post' action='/search/saved'><input name='name' placeholder='Query name' required><input name='q' value='{self._escape((query.get('q') or [''])[0])}' placeholder='Full-text query'><button type='submit'>Save query</button></form><ul>{saved_options}</ul></section>"
+			f"<section class='card'><h2>Results</h2><div class='toolbar'><a href='/search/export.csv?{urlencode({key: values[0] for key, values in query.items() if values})}'>Export CSV</a>{pagination}</div><table><thead><tr><th>ID</th><th>Time</th><th>Platform</th><th>Event</th><th>Content</th><th>Investigate</th></tr></thead><tbody>{rows}</tbody></table></section>"
+			f"<section class='card'><h2>Saved queries</h2><form class='toolbar' method='post' action='/search/saved'><input name='name' placeholder='Query name' required><input name='q' value='{self._escape((query.get('q') or [''])[0])}' placeholder='Full-text query'>{hidden_filters}<button type='submit'>Save query</button></form><ul>{saved_options}</ul></section>"
 		)
 		self._send_html(handler, HTTPStatus.OK, self._render_page("Search", session, content))
 
 	def _serve_search_save(self, handler: BaseHTTPRequestHandler) -> None:
-		if self._require_session(handler) is None:
+		session = self._require_session(handler)
+		if session is None:
 			return
 		form = self._read_form_body(handler)
 		if form is None: return
 		name = (form.get("name") or [""])[0]; query_text = (form.get("q") or [""])[0]
+		filters = {
+			key: (form.get(key) or [""])[0]
+			for key in ("start_at", "end_at", "platform", "event_type", "user_id", "container_id", "context_id", "entity_type", "entity_value")
+			if (form.get(key) or [""])[0]
+		}
 		try:
 			connection = connect_database(self.settings.database_path); initialize_database(connection)
-			with connection: save_query(connection, name, query_text, {})
+			with connection: save_query(connection, name, query_text, filters, operator_id=int(session.user_id))
 		except ValueError as exc:
 			self._send_text(handler, HTTPStatus.BAD_REQUEST, str(exc)); return
 		finally:
 			if 'connection' in locals(): connection.close()
 		self._redirect(handler, f"/search?q={quote(query_text)}")
+
+	def _serve_search_export(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			export_query = dict(query)
+			export_query["limit"] = ["500"]
+			export_query["offset"] = ["0"]
+			items = self._search_items(connection, export_query)
+		finally:
+			connection.close()
+		output = io.StringIO()
+		fields = ("id", "occurred_at", "platform", "event_type", "external_event_id", "container_id",
+			"context_id", "actor_user_id", "target_user_id", "language_code", "sentiment_label",
+			"intent_label", "threat_level", "text_raw")
+		writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+		writer.writeheader()
+		writer.writerows(items)
+		self._audit_operator_action(int(session.user_id), "search.exported", "observation", None,
+			{"rows": len(items), "filters": {key: values[0] for key, values in query.items() if values}})
+		self._send_bytes(handler, HTTPStatus.OK, output.getvalue().encode("utf-8"),
+			"text/csv; charset=utf-8", "qbot4k-observations.csv")
+
+	def _serve_audit(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		items = self._audit_items(query)
+		rows = "".join(
+			f"<tr><td>{self._escape(item['created_at'])}</td><td>{self._escape(item['actor_type'])}:{self._escape(item['actor_id'] or 'system')}</td>"
+			f"<td>{self._escape(item['action_type'])}</td><td>{self._escape(item['entity_type'])}</td><td>{self._escape(item['entity_id'] or '—')}</td>"
+			f"<td><code>{self._escape(item['payload_json'])}</code></td></tr>" for item in items
+		) or "<tr><td colspan='6'>No audit events.</td></tr>"
+		content = (
+			"<section class='hero'><p class='eyebrow'>Governance</p><h1>Audit trail</h1><p class='lede'>Review authentication, analyst decisions, policy changes, account links, exports, and administrative actions.</p></section>"
+			+ "<section class='card'><form method='get' action='/audit' class='search'>"
+			+ f"<input name='action_type' value='{self._escape((query.get('action_type') or [''])[0])}' placeholder='Action type'>"
+			+ f"<input name='actor_id' value='{self._escape((query.get('actor_id') or [''])[0])}' placeholder='Operator ID'>"
+			+ f"<input name='entity_type' value='{self._escape((query.get('entity_type') or [''])[0])}' placeholder='Entity type'>"
+			+ f"<input name='start_at' value='{self._escape((query.get('start_at') or [''])[0])}' placeholder='Start ISO time'>"
+			+ "<button type='submit'>Filter</button><a href='/audit'>Clear</a></form>"
+			+ f"<div class='table-scroll'><table class='table'><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Entity</th><th>ID</th><th>Payload</th></tr></thead><tbody>{rows}</tbody></table></div></section>"
+		)
+		self._send_html(handler, HTTPStatus.OK, self._render_page("Audit", session, content))
+
+	def _audit_items(self, query: Mapping[str, list[str]]) -> list[dict[str, object]]:
+		where: list[str] = []
+		params: list[object] = []
+		for key in ("action_type", "entity_type"):
+			value = (query.get(key) or [""])[0].strip()
+			if value:
+				where.append(f"{key}=?")
+				params.append(value)
+		actor_id = (query.get("actor_id") or [""])[0].strip()
+		if actor_id.isdigit():
+			where.append("actor_id=?")
+			params.append(int(actor_id))
+		start_at = (query.get("start_at") or [""])[0].strip()
+		if start_at:
+			where.append("created_at>=?")
+			params.append(start_at)
+		limit_raw = (query.get("limit") or ["200"])[0]
+		offset_raw = (query.get("offset") or ["0"])[0]
+		limit = max(1, min(int(limit_raw) if limit_raw.isdigit() else 200, 500))
+		offset = max(0, int(offset_raw) if offset_raw.isdigit() else 0)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			sql = "SELECT * FROM audit_log" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?"
+			params.extend((limit, offset))
+			return [dict(row) for row in connection.execute(sql, params).fetchall()]
+		finally:
+			connection.close()
 
 	def _serve_analytics(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
@@ -1538,15 +1828,20 @@ class DashboardApp:
 	def _search_items(self, connection, query: Mapping[str, list[str]]) -> list[dict[str, object]]:
 		value = lambda key: (query.get(key) or [""])[0].strip() or None
 		user_raw = value("user_id")
+		limit_raw = value("limit") or "100"
+		offset_raw = value("offset") or "0"
+		limit = max(1, min(int(limit_raw) if limit_raw.isdigit() else 100, 500))
+		offset = max(0, int(offset_raw) if offset_raw.isdigit() else 0)
 		return search_observations(
 			connection, query=value("q") or "", start_at=value("start_at"), end_at=value("end_at"),
 			platform=value("platform"), event_type=value("event_type"), user_id=int(user_raw) if user_raw and user_raw.isdigit() else None,
 			container_id=value("container_id"), context_id=value("context_id"), entity_type=value("entity_type"),
-			entity_value=value("entity_value"), limit=int(value("limit") or 100), offset=int(value("offset") or 0),
+			entity_value=value("entity_value"), limit=limit, offset=offset,
 		)
 
 	def _serve_api_save_query(self, handler: BaseHTTPRequestHandler) -> None:
-		if self._require_session(handler) is None:
+		session = self._require_session(handler)
+		if session is None:
 			return
 		payload = self._read_json_body(handler)
 		if payload is None:
@@ -1554,7 +1849,7 @@ class DashboardApp:
 		try:
 			connection = connect_database(self.settings.database_path); initialize_database(connection)
 			with connection:
-				query_id = save_query(connection, str(payload.get("name") or ""), str(payload.get("query") or ""), payload.get("filters") if isinstance(payload.get("filters"), dict) else {})
+				query_id = save_query(connection, str(payload.get("name") or ""), str(payload.get("query") or ""), payload.get("filters") if isinstance(payload.get("filters"), dict) else {}, operator_id=int(session.user_id))
 		finally:
 			connection.close()
 		self._send_json(handler, HTTPStatus.OK, {"id": query_id, "status": "saved"})
@@ -1599,7 +1894,7 @@ class DashboardApp:
 		self._send_json(handler, HTTPStatus.OK, {"status": "reviewed"})
 
 	def _serve_api_external_observation(self, handler: BaseHTTPRequestHandler) -> None:
-		if self._require_session(handler, admin_only=True) is None:
+		if not self._require_ingest_auth(handler):
 			return
 		payload = self._read_json_body(handler)
 		if payload is None: return
@@ -1619,7 +1914,7 @@ class DashboardApp:
 		self._send_json(handler, HTTPStatus.CREATED, {"status": result.status, "observation_id": result.observation_id, "analysis_job_id": result.analysis_job_id})
 
 	def _serve_api_event(self, handler: BaseHTTPRequestHandler) -> None:
-		if self._require_session(handler, admin_only=True) is None:
+		if not self._require_ingest_auth(handler):
 			return
 		payload = self._read_json_body(handler)
 		if payload is None: return
@@ -1648,6 +1943,17 @@ class DashboardApp:
 			if 'connection' in locals(): connection.close()
 		self._send_json(handler, HTTPStatus.CREATED, {"status": result.status, "observation_id": result.observation_id, "analysis_job_id": result.analysis_job_id})
 
+	def _require_ingest_auth(self, handler: BaseHTTPRequestHandler) -> bool:
+		authorization = (handler.headers.get("Authorization") or "").strip()
+		if authorization.casefold().startswith("bearer "):
+			provided = authorization[7:].strip()
+			expected = self.settings.ingest_api_token or ""
+			if expected and hmac.compare_digest(provided, expected):
+				return True
+			self._send_json(handler, HTTPStatus.UNAUTHORIZED, {"error": "invalid_bearer_token"})
+			return False
+		return self._require_session(handler, admin_only=True) is not None
+
 	def _serve_api_users(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
 		if session is None:
@@ -1675,6 +1981,27 @@ class DashboardApp:
 		alert_order = self._alert_order_clause(alert_sort, alert_dir)
 		case_order = self._case_order_clause(case_sort, case_dir)
 		relationship_order = self._relationship_order_clause(relationship_sort, relationship_dir)
+		alert_severity = (query.get("severity") or [""])[0].strip().casefold()
+		alert_status_raw = (query.get("alert_status") or ["open"])[0].strip().casefold()
+		alert_status = "" if alert_status_raw == "all" else alert_status_raw
+		alert_assignee = (query.get("assignee") or [""])[0].strip()
+		alert_query = (query.get("alert_q") or [""])[0].strip()
+		alert_where: list[str] = []
+		alert_params: list[object] = []
+		if alert_severity in {"low", "medium", "high", "critical"}:
+			alert_where.append("lower(intelligence_alerts.severity)=?")
+			alert_params.append(alert_severity)
+		if alert_status in {"open", "acknowledged", "in_case", "resolved", "suppressed"}:
+			alert_where.append("lower(intelligence_alerts.status)=?")
+			alert_params.append(alert_status)
+		if alert_assignee.isdigit():
+			alert_where.append("intelligence_alerts.assigned_operator_id=?")
+			alert_params.append(int(alert_assignee))
+		if alert_query:
+			like = f"%{alert_query}%"
+			alert_where.append("(intelligence_alerts.title LIKE ? OR intelligence_alerts.summary LIKE ? OR users.primary_display_name LIKE ?)")
+			alert_params.extend((like, like, like))
+		alert_where_sql = " WHERE " + " AND ".join(alert_where) if alert_where else ""
 		connection = connect_database(self.settings.database_path)
 		try:
 			initialize_database(connection)
@@ -1684,10 +2011,11 @@ class DashboardApp:
 				SELECT intelligence_alerts.*, users.primary_display_name
 				FROM intelligence_alerts
 				LEFT JOIN users ON users.id = intelligence_alerts.user_id
+				""" + alert_where_sql + """
 				ORDER BY """ + alert_order + """
 				LIMIT 100
 				"""
-			).fetchall()
+			, alert_params).fetchall()
 			cases = connection.execute(
 				"""
 				SELECT investigation_cases.*, COUNT(DISTINCT case_entities.user_id) AS entity_count,
@@ -1721,6 +2049,8 @@ class DashboardApp:
 				"alert_sort": alert_sort, "alert_dir": alert_dir,
 				"case_sort": case_sort, "case_dir": case_dir,
 				"relationship_sort": relationship_sort, "relationship_dir": relationship_dir,
+				"severity": alert_severity, "alert_status": alert_status_raw,
+				"assignee": alert_assignee, "alert_q": alert_query,
 			}
 			params.update({key: str(value) for key, value in overrides.items()})
 			return urlencode(params)
@@ -1741,6 +2071,23 @@ class DashboardApp:
 		def _relationship_header(label: str, key: str) -> str:
 			return _sort_header(label, key, table="relationship", current_sort=relationship_sort, current_dir=relationship_dir, ascending_keys={"source", "relationship", "target"})
 
+		severity_options = "".join(
+			f"<option value='{value}'{' selected' if alert_severity == value else ''}>{value}</option>"
+			for value in ("critical", "high", "medium", "low")
+		)
+		alert_status_options = "".join(
+			f"<option value='{value}'{' selected' if alert_status == value else ''}>{value.replace('_', ' ')}</option>"
+			for value in ("open", "acknowledged", "in_case", "suppressed", "resolved")
+		)
+		alert_filters = (
+			"<form method='get' action='/intelligence' class='search'>"
+			+ f"<input name='alert_q' value='{self._escape(alert_query)}' placeholder='Subject or finding'>"
+			+ f"<select name='severity'><option value=''>All severities</option>{severity_options}</select>"
+			+ f"<select name='alert_status'><option value='all'{' selected' if not alert_status else ''}>All statuses</option>{alert_status_options}</select>"
+			+ f"<input name='assignee' value='{self._escape(alert_assignee)}' placeholder='Operator ID'>"
+			+ "<button type='submit'>Filter alerts</button><a href='/intelligence'>Clear</a></form>"
+		)
+
 		alert_rows = "".join(
 			"<tr>"
 			+ f"<td>{self._escape(row['severity'])}</td>"
@@ -1748,8 +2095,9 @@ class DashboardApp:
 			+ f"<td><strong>{self._escape(row['title'])}</strong><br><span class='muted'>{self._escape(row['summary'])}</span></td>"
 			+ f"<td>{float(row['confidence']) * 100:.0f}%</td><td>{self._escape(row['status'])}</td>"
 			+ (f"<td><div class='row-actions'><form method='post' action='/intelligence/alerts/{row['id']}/case'><button type='submit'>Open case</button></form>"
-			   f"<form method='post' action='/intelligence/alerts/{row['id']}/disposition'><select name='disposition'><option value='confirmed'>Confirmed</option><option value='benign'>Benign</option><option value='unresolved'>Unresolved</option><option value='escalated'>Escalated</option></select><button type='submit'>Resolve</button></form></div></td>"
-			   if row['status'] == 'open' else f"<td>{self._escape(row['disposition'] or '—')}</td>")
+			   + (f"<form method='post' action='/intelligence/alerts/{row['id']}/workflow'><input type='hidden' name='status' value='acknowledged'><input type='hidden' name='assigned_operator_id' value='{session.user_id}'><button type='submit'>Acknowledge</button></form>" if row['status'] == 'open' else "")
+			   + f"<form method='post' action='/intelligence/alerts/{row['id']}/disposition'><select name='disposition'><option value='confirmed'>Confirmed</option><option value='benign'>Benign</option><option value='unresolved'>Unresolved</option><option value='escalated'>Escalated</option></select><button type='submit'>Resolve</button></form></div></td>"
+			   if row['status'] != 'resolved' else f"<td>{self._escape(row['disposition'] or '—')}</td>")
 			+ "</tr>"
 			for row in alerts
 		)
@@ -1772,8 +2120,8 @@ class DashboardApp:
 			session,
 			"<section class='hero'><p class='eyebrow'>Operations</p><h1>Intelligence workspace</h1><p class='lede'>Temporal signals, evidence-backed alerts, investigations, entity relationships, and reproducible reports.</p></section>"
 			+ status_html
-			+ f"<div class='grid'><div class='metric'><div class='label'>Active alerts</div><div class='value'>{summary.open_alerts}</div></div><div class='metric'><div class='label'>Open cases</div><div class='value'>{summary.open_cases}</div></div><div class='metric'><div class='label'>Relationships</div><div class='value'>{summary.relationships}</div></div><div class='metric'><div class='label'>Reports</div><div class='value'>{summary.reports}</div></div></div>"
-			+ f"<section class='card'><h2>Alerts</h2><div class='table-scroll'><table class='table'><thead><tr><th>{_alert_header('Severity', 'severity')}</th><th>{_alert_header('Subject', 'subject')}</th><th>{_alert_header('Finding', 'finding')}</th><th>{_alert_header('Confidence', 'confidence')}</th><th>{_alert_header('Status', 'status')}</th><th>Disposition</th></tr></thead><tbody>{alert_rows or '<tr><td colspan=6>No alerts</td></tr>'}</tbody></table></div></section>"
+			+ f"<div class='grid'><div class='metric'><div class='label'>Untriaged alerts</div><div class='value'>{summary.open_alerts}</div></div><div class='metric'><div class='label'>Open cases</div><div class='value'>{summary.open_cases}</div></div><div class='metric'><div class='label'>Relationships</div><div class='value'>{summary.relationships}</div></div><div class='metric'><div class='label'>Reports</div><div class='value'>{summary.reports}</div></div></div>"
+			+ f"<section class='card'><h2>Alerts</h2>{alert_filters}<div class='table-scroll'><table class='table'><thead><tr><th>{_alert_header('Severity', 'severity')}</th><th>{_alert_header('Subject', 'subject')}</th><th>{_alert_header('Finding', 'finding')}</th><th>{_alert_header('Confidence', 'confidence')}</th><th>{_alert_header('Status', 'status')}</th><th>Disposition</th></tr></thead><tbody>{alert_rows or '<tr><td colspan=6>No alerts</td></tr>'}</tbody></table></div></section>"
 			+ f"<section class='card'><h2>Cases</h2><div class='table-scroll'><table class='table'><thead><tr><th>{_case_header('Case', 'case')}</th><th>{_case_header('Priority', 'priority')}</th><th>{_case_header('Status', 'status')}</th><th>{_case_header('Entities', 'entities')}</th><th>{_case_header('Evidence', 'evidence')}</th><th>{_case_header('Updated', 'updated')}</th></tr></thead><tbody>{case_rows or '<tr><td colspan=6>No cases</td></tr>'}</tbody></table></div></section>"
 			+ f"<section class='card'><h2>Relationships</h2><div class='table-scroll'><table class='table'><thead><tr><th>{_relationship_header('Source', 'source')}</th><th>{_relationship_header('Relationship', 'relationship')}</th><th>{_relationship_header('Target', 'target')}</th><th>{_relationship_header('Strength', 'strength')}</th><th>{_relationship_header('Evidence', 'evidence')}</th><th>{_relationship_header('Last observed', 'last_observed')}</th></tr></thead><tbody>{relationship_rows or '<tr><td colspan=6>No relationships</td></tr>'}</tbody></table></div></section>"
 			+ "<section class='card'><h2>Reports</h2><form class='toolbar' method='post' action='/intelligence/reports/generate'><select name='report_type'><option value='daily_summary'>Daily summary</option><option value='entity_profile'>Entity profile</option></select><input name='user_id' type='number' min='1' placeholder='User ID (entity only)'><button type='submit'>Generate report</button></form>"
@@ -1796,6 +2144,7 @@ class DashboardApp:
 			case = connection.execute("SELECT * FROM investigation_cases WHERE id=?", (case_id,)).fetchone()
 			entities = connection.execute("SELECT case_entities.*, users.primary_display_name FROM case_entities INNER JOIN users ON users.id=case_entities.user_id WHERE case_id=?", (case_id,)).fetchall()
 			evidence = connection.execute("SELECT * FROM case_evidence WHERE case_id=? ORDER BY added_at, id", (case_id,)).fetchall()
+			activity = connection.execute("SELECT * FROM case_activity WHERE case_id=? ORDER BY created_at DESC,id DESC", (case_id,)).fetchall()
 		finally:
 			connection.close()
 		if case is None:
@@ -1803,13 +2152,64 @@ class DashboardApp:
 			return
 		entity_rows = "".join(f"<tr><td><a href='/users/{row['user_id']}'>{self._escape(row['primary_display_name'])}</a></td><td>{self._escape(row['role'])}</td><td>{self._escape(row['added_at'])}</td></tr>" for row in entities)
 		evidence_rows = "".join(f"<tr><td>{self._escape(row['added_at'])}</td><td>{self._escape(row['note'])}</td><td>{self._escape(row['alert_id'] or '—')}</td><td>{self._escape(row['observation_id'] or '—')}</td><td>{self._escape(row['message_id'] or '—')}</td></tr>" for row in evidence)
+		activity_rows = "".join(f"<tr><td>{self._escape(row['created_at'])}</td><td>{self._escape(row['operator_id'] or 'system')}</td><td>{self._escape(row['activity_type'])}</td><td>{self._escape(row['body'])}</td></tr>" for row in activity)
+		priority_options = "".join(
+			f"<option value='{value}'{' selected' if case['priority'] == value else ''}>{value}</option>"
+			for value in ("low", "medium", "high", "critical")
+		)
+		case_status_options = "".join(
+			f"<option value='{value}'{' selected' if case['status'] == value else ''}>{value}</option>"
+			for value in ("open", "active", "pending", "closed")
+		)
 		body = self._render_page(
 			f"Case {case_id}", session,
-			f"<section class='hero'><p class='eyebrow'>Investigation case {case_id}</p><h1>{self._escape(case['title'])}</h1><p class='lede'>{self._escape(case['summary'])}</p><div class='status-row'><span class='status-pill'>{self._escape(case['priority'])}</span><span class='status-pill'>{self._escape(case['status'])}</span></div></section>"
+			f"<section class='hero'><p class='eyebrow'>Investigation case {case_id}</p><h1>{self._escape(case['title'])}</h1><p class='lede'>{self._escape(case['summary'])}</p><div class='status-row'><span class='status-pill'>{self._escape(case['priority'])}</span><span class='status-pill'>{self._escape(case['status'])}</span><a href='/api/intelligence/cases/{case_id}/export'>Export case JSON</a></div></section>"
+			+ f"<section class='card'><h2>Case controls</h2><form method='post' action='/intelligence/cases/{case_id}/action' class='search'><input type='hidden' name='action' value='update'><input name='title' value='{self._escape(case['title'])}' required><input name='summary' value='{self._escape(case['summary'])}' placeholder='Summary'><select name='priority'>{priority_options}</select><select name='status'>{case_status_options}</select><input name='owner_operator_id' type='number' min='1' value='{self._escape(case['owner_operator_id'] or '')}' placeholder='Owner operator ID'><button type='submit'>Update case</button></form><form method='post' action='/intelligence/cases/{case_id}/action' class='search'><input type='hidden' name='action' value='add_note'><input name='body' placeholder='Analyst note' required><button type='submit'>Add note</button></form><form method='post' action='/intelligence/cases/{case_id}/action' class='search'><input type='hidden' name='action' value='add_entity'><input name='user_id' type='number' min='1' placeholder='User ID' required><input name='role' value='subject' placeholder='Role'><button type='submit'>Add entity</button></form><form method='post' action='/intelligence/cases/{case_id}/action' class='search'><input type='hidden' name='action' value='add_evidence'><input name='observation_id' type='number' min='1' placeholder='Observation ID'><input name='message_id' type='number' min='1' placeholder='Message ID'><input name='alert_id' type='number' min='1' placeholder='Alert ID'><input name='note' placeholder='Evidence note'><button type='submit'>Add evidence</button></form></section>"
 			+ f"<section class='card'><h2>Entities</h2><div class='table-scroll'><table class='table'><thead><tr><th>Entity</th><th>Role</th><th>Added</th></tr></thead><tbody>{entity_rows or '<tr><td colspan=3>No entities</td></tr>'}</tbody></table></div></section>"
-			+ f"<section class='card'><h2>Evidence timeline</h2><div class='table-scroll'><table class='table'><thead><tr><th>Added</th><th>Note</th><th>Alert</th><th>Observation</th><th>Message</th></tr></thead><tbody>{evidence_rows or '<tr><td colspan=5>No evidence</td></tr>'}</tbody></table></div></section>",
+			+ f"<section class='card'><h2>Evidence timeline</h2><div class='table-scroll'><table class='table'><thead><tr><th>Added</th><th>Note</th><th>Alert</th><th>Observation</th><th>Message</th></tr></thead><tbody>{evidence_rows or '<tr><td colspan=5>No evidence</td></tr>'}</tbody></table></div></section>"
+			+ f"<section class='card'><h2>Activity</h2><div class='table-scroll'><table class='table'><thead><tr><th>Time</th><th>Operator</th><th>Activity</th><th>Note</th></tr></thead><tbody>{activity_rows or '<tr><td colspan=4>No activity</td></tr>'}</tbody></table></div></section>",
 		)
 		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_intelligence_case_action(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+		try:
+			case_id = int(path.split("/")[3])
+			action = (form.get("action") or [""])[0]
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				if action == "update":
+					update_case(connection, case_id, title=(form.get("title") or [""])[0],
+						summary=(form.get("summary") or [""])[0], priority=(form.get("priority") or [""])[0],
+						status=(form.get("status") or [""])[0],
+						owner_operator_id=_optional_int((form.get("owner_operator_id") or [""])[0]),
+						operator_id=int(session.user_id))
+				elif action == "add_note":
+					add_case_note(connection, case_id, (form.get("body") or [""])[0], operator_id=int(session.user_id))
+				elif action == "add_entity":
+					add_case_entity(connection, case_id, int((form.get("user_id") or [""])[0]),
+						role=(form.get("role") or ["subject"])[0], operator_id=int(session.user_id))
+				elif action == "add_evidence":
+					add_case_evidence(connection, case_id,
+						observation_id=_optional_int((form.get("observation_id") or [""])[0]),
+						message_id=_optional_int((form.get("message_id") or [""])[0]),
+						alert_id=_optional_int((form.get("alert_id") or [""])[0]),
+						note=(form.get("note") or [""])[0], operator_id=int(session.user_id))
+				else:
+					raise ValueError("unsupported case action")
+		except (ValueError, IndexError):
+			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Invalid case update")
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._redirect(handler, f"/intelligence/cases/{case_id}")
 
 	def _serve_intelligence_alert_case(self, handler: BaseHTTPRequestHandler, path: str) -> None:
 		session = self._require_session(handler)
@@ -1853,6 +2253,31 @@ class DashboardApp:
 			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Invalid disposition")
 			return
 		self._redirect(handler, "/intelligence?status=Alert+resolved")
+
+	def _serve_intelligence_alert_workflow(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+		try:
+			alert_id = int(path.split("/")[3])
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				update_alert_workflow(connection, alert_id,
+					status=(form.get("status") or [""])[0] or None,
+					assigned_operator_id=_optional_int((form.get("assigned_operator_id") or [""])[0]),
+					suppress_until=(form.get("suppress_until") or [""])[0] or None,
+					operator_id=int(session.user_id))
+		except (ValueError, IndexError):
+			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Invalid alert update")
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._redirect(handler, "/intelligence?status=Alert+updated")
 
 	def _serve_intelligence_report_generate(self, handler: BaseHTTPRequestHandler) -> None:
 		session = self._require_session(handler)
@@ -1954,6 +2379,110 @@ class DashboardApp:
 		payload["content"] = json.loads(str(payload.pop("content_json")))
 		payload["evidence"] = json.loads(str(payload.pop("evidence_json")))
 		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _serve_api_case(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		try:
+			case_id = int(path.rstrip("/").split("/")[-1])
+		except ValueError:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_case_id"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			if handler.command == "POST":
+				payload = self._read_json_body(handler)
+				if payload is None:
+					return
+				action = str(payload.get("action") or "update").strip().casefold()
+				with connection:
+					if action == "update":
+						update_case(connection, case_id, title=_optional_string(payload.get("title")),
+							summary=_optional_string(payload.get("summary")), priority=_optional_string(payload.get("priority")),
+							status=_optional_string(payload.get("status")), owner_operator_id=_optional_int(payload.get("owner_operator_id")),
+							operator_id=int(session.user_id))
+					elif action == "add_entity":
+						add_case_entity(connection, case_id, int(payload["user_id"]), role=str(payload.get("role") or "subject"), operator_id=int(session.user_id))
+					elif action == "add_evidence":
+						add_case_evidence(connection, case_id, observation_id=_optional_int(payload.get("observation_id")),
+							message_id=_optional_int(payload.get("message_id")), alert_id=_optional_int(payload.get("alert_id")),
+							signal_history_id=_optional_int(payload.get("signal_history_id")), note=str(payload.get("note") or ""),
+							operator_id=int(session.user_id))
+					elif action == "add_note":
+						add_case_note(connection, case_id, str(payload.get("body") or ""), operator_id=int(session.user_id))
+					else:
+						raise ValueError("unsupported case action")
+			case = connection.execute("SELECT * FROM investigation_cases WHERE id=?", (case_id,)).fetchone()
+			if case is None:
+				raise ValueError("case not found")
+			entities = [dict(row) for row in connection.execute("SELECT * FROM case_entities WHERE case_id=? ORDER BY added_at", (case_id,))]
+			evidence = [dict(row) for row in connection.execute("SELECT * FROM case_evidence WHERE case_id=? ORDER BY added_at,id", (case_id,))]
+			activity = [dict(row) for row in connection.execute("SELECT * FROM case_activity WHERE case_id=? ORDER BY created_at,id", (case_id,))]
+		except (ValueError, KeyError, TypeError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+			return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"case": dict(case), "entities": entities, "evidence": evidence, "activity": activity})
+
+	def _serve_api_case_export(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		try:
+			case_id = int(path.rstrip("/").split("/")[-2])
+		except ValueError:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_case_id"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			case = connection.execute("SELECT * FROM investigation_cases WHERE id=?", (case_id,)).fetchone()
+			if case is None:
+				self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "case_not_found"})
+				return
+			payload = {
+				"case": dict(case),
+				"entities": [dict(row) for row in connection.execute(
+					"""SELECT ce.*,u.primary_display_name FROM case_entities ce JOIN users u ON u.id=ce.user_id
+					   WHERE ce.case_id=? ORDER BY ce.added_at""", (case_id,))],
+				"evidence": [dict(row) for row in connection.execute(
+					"SELECT * FROM case_evidence WHERE case_id=? ORDER BY added_at,id", (case_id,))],
+				"activity": [dict(row) for row in connection.execute(
+					"SELECT * FROM case_activity WHERE case_id=? ORDER BY created_at,id", (case_id,))],
+				"exported_at": datetime.now(timezone.utc).isoformat(),
+				"exported_by_operator_id": int(session.user_id),
+			}
+		finally:
+			connection.close()
+		self._audit_operator_action(int(session.user_id), "case.exported", "investigation_case", case_id, {})
+		self._send_bytes(handler, HTTPStatus.OK, json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+			"application/json", f"qbot4k-case-{case_id}.json")
+
+	def _serve_api_alert_workflow(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		try:
+			alert_id = int(path.rstrip("/").split("/")[-1])
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				update_alert_workflow(connection, alert_id, status=_optional_string(payload.get("status")),
+					assigned_operator_id=_optional_int(payload.get("assigned_operator_id")),
+					suppress_until=_optional_string(payload.get("suppress_until")), operator_id=int(session.user_id))
+		except (ValueError, TypeError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"status": "updated", "alert_id": alert_id})
 
 	def _serve_api_signals(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
@@ -2236,11 +2765,79 @@ class DashboardApp:
 			connection.close()
 		self._send_json(handler, HTTPStatus.OK, {"items": [review.__dict__ for review in reviews]})
 
+	def _serve_api_review_resolve(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		try:
+			review_id = int(path.split("/")[4])
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				action_id = resolve_review(connection, review_id,
+					resolution=str(payload.get("resolution") or ""), operator_id=int(session.user_id),
+					note=str(payload.get("note") or ""), action_type=_optional_string(payload.get("action_type")),
+					duration_seconds=int(payload.get("duration_seconds") or 600))
+		except (ValueError, IndexError, TypeError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"status": "resolved", "review_id": review_id, "action_id": action_id})
+
+	def _serve_api_rules(self, handler: BaseHTTPRequestHandler) -> None:
+		if self._require_session(handler) is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			rules = list_moderation_rules(connection)
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"items": [item.__dict__ for item in rules]})
+
+	def _serve_api_rule_save(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		try:
+			connection = connect_database(self.settings.database_path)
+			initialize_database(connection)
+			with connection:
+				rule_id = save_moderation_rule(connection, name=str(payload.get("name") or ""),
+					rule_type=str(payload.get("rule_type") or ""), pattern=str(payload.get("pattern") or ""),
+					severity=str(payload.get("severity") or ""),
+					auto_enforce_action=_optional_string(payload.get("auto_enforce_action")),
+					enabled=bool(payload.get("enabled", True)),
+					enforcement_mode=str(payload.get("enforcement_mode") or "shadow"),
+					action_duration_seconds=int(payload.get("action_duration_seconds") or 600),
+					operator_id=int(session.user_id))
+		except (ValueError, TypeError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+			return
+		finally:
+			if "connection" in locals():
+				connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"status": "saved", "rule_id": rule_id})
+
 	def _serve_api_health(self, handler: BaseHTTPRequestHandler) -> None:
 		session = self._require_session(handler)
 		if session is None:
 			return
 		database_state = database_health(self.settings.database_path)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			operations = operational_readiness_snapshot(connection)
+		finally:
+			connection.close()
 		now = datetime.now(timezone.utc)
 		services = ("web", "jobs", "twitch", "discord")
 		services_detail = {
@@ -2255,6 +2852,7 @@ class DashboardApp:
 			"status": self._overall_status(database_state, services),
 			"table_count": int(database_state.get("table_count") or 0),
 			"database": database_state,
+			"operations": operations,
 			"services": {service_name: details["status"] for service_name, details in services_detail.items()},
 			"services_detail": services_detail,
 			"uptime": {
@@ -2263,6 +2861,25 @@ class DashboardApp:
 			},
 		}
 		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _serve_api_audit(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		if self._require_session(handler, admin_only=True) is None:
+			return
+		self._send_json(handler, HTTPStatus.OK, {"items": self._audit_items(query)})
+
+	def _audit_operator_action(self, operator_id: int, action_type: str, entity_type: str,
+		entity_id: int | None, payload: Mapping[str, object]) -> None:
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			with connection:
+				connection.execute(
+					"""INSERT INTO audit_log(actor_type,actor_id,action_type,entity_type,entity_id,payload_json)
+					   VALUES ('operator',?,?,?,?,?)""",
+					(operator_id, action_type, entity_type, entity_id, json.dumps(dict(payload), sort_keys=True)),
+				)
+		finally:
+			connection.close()
 
 	def _service_status(self, service_name: str) -> str:
 		if service_name not in self.settings.enabled_services:
@@ -2612,7 +3229,8 @@ table textarea {{
 <a href='/analytics'>Analytics</a>
 <a href='/users'>Users</a>
 <a href='/moderation'>Moderation</a>
-		<a href='/commands'>Commands</a>
+{"<a href='/audit'>Audit</a>" if session.role == "admin" else ""}
+<a href='/commands'>Commands</a>
 <form method='post' action='/logout'><button type='submit'>Logout</button></form>
 </nav>
 </aside>
@@ -2653,6 +3271,17 @@ document.addEventListener("DOMContentLoaded", () => {{
 		response = json.dumps(payload, sort_keys=True).encode("utf-8")
 		handler.send_response(status)
 		handler.send_header("Content-Type", "application/json")
+		self._send_security_headers(handler)
+		handler.send_header("Content-Length", str(len(response)))
+		handler.end_headers()
+		handler.wfile.write(response)
+
+	def _send_bytes(self, handler: BaseHTTPRequestHandler, status: HTTPStatus, response: bytes,
+		content_type: str, filename: str) -> None:
+		handler.send_response(status)
+		handler.send_header("Content-Type", content_type)
+		self._send_security_headers(handler)
+		handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
 		handler.send_header("Content-Length", str(len(response)))
 		handler.end_headers()
 		handler.wfile.write(response)
@@ -2661,6 +3290,7 @@ document.addEventListener("DOMContentLoaded", () => {{
 		response = body.encode("utf-8")
 		handler.send_response(status)
 		handler.send_header("Content-Type", "text/html; charset=utf-8")
+		self._send_security_headers(handler)
 		handler.send_header("Content-Length", str(len(response)))
 		handler.end_headers()
 		handler.wfile.write(response)
@@ -2669,6 +3299,7 @@ document.addEventListener("DOMContentLoaded", () => {{
 		response = text.encode("utf-8")
 		handler.send_response(status)
 		handler.send_header("Content-Type", "text/plain; charset=utf-8")
+		self._send_security_headers(handler)
 		handler.send_header("Content-Length", str(len(response)))
 		handler.end_headers()
 		handler.wfile.write(response)
@@ -2682,16 +3313,34 @@ document.addEventListener("DOMContentLoaded", () => {{
 	) -> None:
 		handler.send_response(HTTPStatus.FOUND)
 		handler.send_header("Location", location)
+		self._send_security_headers(handler)
 		for key, value in (extra_headers or {}).items():
 			handler.send_header(key, value)
 		for cookie in cookies:
 			handler.send_header("Set-Cookie", cookie)
 		handler.end_headers()
 
+	@staticmethod
+	def _send_security_headers(handler: BaseHTTPRequestHandler) -> None:
+		handler.send_header("X-Content-Type-Options", "nosniff")
+		handler.send_header("X-Frame-Options", "DENY")
+		handler.send_header("Referrer-Policy", "same-origin")
+		handler.send_header("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self'")
+		handler.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		if (handler.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().casefold() == "https":
+			handler.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+
 	def _read_json_body(self, handler: BaseHTTPRequestHandler) -> dict[str, object] | None:
-		length = int(handler.headers.get("Content-Length", "0") or 0)
+		try:
+			length = int(handler.headers.get("Content-Length", "0") or 0)
+		except (TypeError, ValueError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
+			return None
 		if length <= 0:
 			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "missing_body"})
+			return None
+		if length > 1_048_576:
+			self._send_json(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "body_too_large"})
 			return None
 		try:
 			payload = json.loads(handler.rfile.read(length).decode("utf-8"))
@@ -2704,9 +3353,16 @@ document.addEventListener("DOMContentLoaded", () => {{
 		return payload
 
 	def _read_form_body(self, handler: BaseHTTPRequestHandler) -> Mapping[str, list[str]] | None:
-		length = int(handler.headers.get("Content-Length", "0") or 0)
+		try:
+			length = int(handler.headers.get("Content-Length", "0") or 0)
+		except (TypeError, ValueError):
+			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Invalid Content-Length")
+			return None
 		if length <= 0:
 			self._send_text(handler, HTTPStatus.BAD_REQUEST, "Missing form body")
+			return None
+		if length > 1_048_576:
+			self._send_text(handler, HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Form body too large")
 			return None
 		try:
 			raw_body = handler.rfile.read(length).decode("utf-8")

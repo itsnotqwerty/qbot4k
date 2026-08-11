@@ -10,13 +10,21 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from urllib.parse import urlparse
 
+from .policy import (
+    AUTO_EXPIRED_DISPOSITION,
+    COHORT_MIN_CONFIDENCE,
+    COHORT_MIN_SAMPLE_SIZE,
+    COORDINATION_ALERT_MIN_EVIDENCE,
+    TOPIC_ALERT_LIMIT,
+    TOPIC_ALERT_POLICIES,
+    TOPIC_BASELINE_MIN_ACTIVE_DAYS,
+)
 from .userprofiles import link_platform_account
 
 
 _TOKENS = re.compile(r"[\w'-]{3,}", re.UNICODE)
 _URL = re.compile(r"https?://[^\s<>]+", re.I)
 _STOP = {"the", "and", "that", "this", "with", "from", "have", "your", "you", "for", "are", "was", "not", "but", "they", "our", "will", "just", "into", "about", "http", "https", "www"}
-
 
 def refresh_emerging_topics(connection: sqlite3.Connection, *, now: datetime | None = None) -> int:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -30,7 +38,9 @@ def refresh_emerging_topics(connection: sqlite3.Connection, *, now: datetime | N
     for row in rows:
         text = str(row[1])
         tokens = [token.casefold() for token in _TOKENS.findall(text) if token.casefold() not in _STOP]
-        context = str(row[2] or row[3] or "")
+        # A channel/container is the useful local diffusion boundary. Sources
+        # without one fall back to their broader guild/community context.
+        context = str(row[3] or row[2] or "")
         seen: set[str] = set()
         for token in tokens:
             seen.add(f"term:{token}")
@@ -89,7 +99,11 @@ def refresh_emerging_topics(connection: sqlite3.Connection, *, now: datetime | N
 
 
 def refresh_graph_analytics(connection: sqlite3.Connection, *, calculated_at: str | None = None) -> int:
-    rows = connection.execute("SELECT source_user_id, target_user_id, strength FROM entity_relationships").fetchall()
+    timestamp = calculated_at or datetime.now(timezone.utc).isoformat()
+    reference_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+    rows = connection.execute(
+        "SELECT source_user_id, target_user_id, strength, last_observed_at FROM entity_relationships"
+    ).fetchall()
     nodes = {int(value) for row in rows for value in row[:2]}
     if not nodes:
         connection.execute("DELETE FROM graph_metrics")
@@ -97,11 +111,20 @@ def refresh_graph_analytics(connection: sqlite3.Connection, *, calculated_at: st
     outgoing: dict[int, dict[int, float]] = defaultdict(dict)
     incoming: dict[int, dict[int, float]] = defaultdict(dict)
     undirected: dict[int, set[int]] = defaultdict(set)
-    for source, target, strength in rows:
-        source, target, weight = int(source), int(target), float(strength)
+    weighted_neighbors: dict[int, dict[int, float]] = defaultdict(dict)
+    for source, target, strength, last_observed_at in rows:
+        source, target = int(source), int(target)
+        try:
+            observed = datetime.fromisoformat(str(last_observed_at).replace("Z", "+00:00")).astimezone(timezone.utc)
+            age_days = max(0.0, (reference_time - observed).total_seconds() / 86400.0)
+        except ValueError:
+            age_days = 0.0
+        weight = float(strength) * math.exp(-math.log(2) * age_days / 30.0)
         outgoing[source][target] = outgoing[source].get(target, 0.0) + weight
         incoming[target][source] = incoming[target].get(source, 0.0) + weight
         undirected[source].add(target); undirected[target].add(source)
+        weighted_neighbors[source][target] = weighted_neighbors[source].get(target, 0.0) + weight
+        weighted_neighbors[target][source] = weighted_neighbors[target].get(source, 0.0) + weight
     pagerank = {node: 1.0 / len(nodes) for node in nodes}
     for _ in range(30):
         next_rank = {node: 0.15 / len(nodes) for node in nodes}
@@ -115,9 +138,8 @@ def refresh_graph_analytics(connection: sqlite3.Connection, *, calculated_at: st
         pagerank = next_rank
     betweenness = _brandes(nodes, undirected)
     bridges = _articulation_points(nodes, undirected)
-    clusters = _components(nodes, undirected)
+    clusters = _label_propagation(nodes, weighted_neighbors)
     max_weight = max(sum(outgoing[n].values()) + sum(incoming[n].values()) for n in nodes) or 1.0
-    timestamp = calculated_at or datetime.now(timezone.utc).isoformat()
     connection.execute("DELETE FROM graph_metrics")
     for node in nodes:
         in_degree = sum(incoming[node].values()); out_degree = sum(outgoing[node].values())
@@ -131,16 +153,35 @@ def refresh_graph_analytics(connection: sqlite3.Connection, *, calculated_at: st
 
 
 def propagation_path(connection: sqlite3.Connection, source_user_id: int, target_user_id: int) -> list[int]:
-    adjacency: dict[int, set[int]] = defaultdict(set)
-    for row in connection.execute("SELECT source_user_id, target_user_id FROM entity_relationships"):
-        adjacency[int(row[0])].add(int(row[1]))
-    queue = deque([(source_user_id, [source_user_id])]); seen = {source_user_id}
+    adjacency: dict[int, list[tuple[int, str]]] = defaultdict(list)
+    evidence_rows = connection.execute(
+        """SELECT r.source_user_id,r.target_user_id,e.occurred_at
+           FROM relationship_evidence e JOIN entity_relationships r ON r.id=e.relationship_id
+           ORDER BY e.occurred_at,e.observation_id"""
+    ).fetchall()
+    if evidence_rows:
+        for source, target, occurred_at in evidence_rows:
+            adjacency[int(source)].append((int(target), str(occurred_at)))
+    else:
+        for source, target, occurred_at in connection.execute(
+            "SELECT source_user_id,target_user_id,last_observed_at FROM entity_relationships"
+        ):
+            adjacency[int(source)].append((int(target), str(occurred_at)))
+    queue = deque([(source_user_id, [source_user_id], "")])
+    best_time: dict[int, str] = {source_user_id: ""}
     while queue:
-        node, path = queue.popleft()
+        node, path, prior_time = queue.popleft()
         if node == target_user_id:
             return path
-        for nxt in adjacency[node] - seen:
-            seen.add(nxt); queue.append((nxt, path + [nxt]))
+        for nxt, occurred_at in adjacency[node]:
+            if occurred_at < prior_time:
+                continue
+            if nxt in path:
+                continue
+            if nxt in best_time and best_time[nxt] <= occurred_at:
+                continue
+            best_time[nxt] = occurred_at
+            queue.append((nxt, path + [nxt], occurred_at))
     return []
 
 
@@ -153,9 +194,18 @@ def refresh_identity_suggestions(connection: sqlite3.Connection, *, minimum_conf
         for right in accounts[index + 1:]:
             if left[1] == right[1] or (left[4] is not None and left[4] == right[4]):
                 continue
-            name_score = SequenceMatcher(None, _identity_name(str(left[3])), _identity_name(str(right[3]))).ratio()
-            id_score = SequenceMatcher(None, _identity_name(str(left[2])), _identity_name(str(right[2]))).ratio()
+            left_name = _identity_name(str(left[3]))
+            right_name = _identity_name(str(right[3]))
             context_match = bool(left[5] and right[5] and str(left[5]).casefold() == str(right[5]).casefold())
+            # Candidate blocking avoids an unbounded all-pairs comparison while retaining
+            # exact-prefix and shared-context candidates for analyst review.
+            if not context_match and (
+                not left_name or not right_name or left_name[0] != right_name[0]
+                or abs(len(left_name) - len(right_name)) > 4
+            ):
+                continue
+            name_score = SequenceMatcher(None, left_name, right_name).ratio()
+            id_score = SequenceMatcher(None, _identity_name(str(left[2])), _identity_name(str(right[2]))).ratio()
             confidence = min(0.99, 0.55 * name_score + 0.30 * id_score + 0.15 * int(context_match))
             if confidence < minimum_confidence:
                 continue
@@ -171,6 +221,192 @@ def refresh_identity_suggestions(connection: sqlite3.Connection, *, minimum_conf
             )
             inserted += int(cursor.rowcount > 0)
     return inserted
+
+
+def emit_analytics_alerts(connection: sqlite3.Connection, *, calculated_at: str | None = None) -> int:
+    """Promote material findings into bounded, stable, self-expiring triage work."""
+    timestamp = calculated_at or datetime.now(timezone.utc).isoformat()
+    created = 0
+
+    topic_rows = _qualifying_topic_alerts(connection) if _topic_baseline_ready(connection, timestamp) else []
+    topic_keys = {f"topic:{row['topic_key']}" for row in topic_rows}
+    _auto_expire_alerts(connection, "emerging_topic", topic_keys, timestamp)
+    for row in topic_rows:
+        unusualness = float(row["unusualness"])
+        created += _upsert_stable_analytics_alert(
+            connection,
+            dedupe_key=f"topic:{row['topic_key']}",
+            alert_type="emerging_topic",
+            severity="high" if unusualness >= 18 else "medium",
+            title="Emerging Topic",
+            summary=(f"{row['label']} rose to {row['current_count']} observations across "
+                     f"{row['context_count']} contexts (unusualness {unusualness:.2f})."),
+            confidence=min(0.99, unusualness / 20.0),
+            observation_id=int(row["observation_id"]) if row["observation_id"] is not None else None,
+            timestamp=timestamp,
+        )
+
+    cohort_rows = connection.execute(
+        """SELECT a.user_id,a.cohort_type,a.cohort_key,a.signal_key,a.z_score,a.confidence
+           FROM cohort_anomalies a
+           JOIN cohort_baselines b ON b.cohort_type=a.cohort_type
+             AND b.cohort_key=a.cohort_key AND b.signal_key=a.signal_key
+           WHERE abs(a.z_score)>=3 AND a.confidence>=? AND b.sample_size>=?
+           ORDER BY abs(a.z_score) DESC,a.confidence DESC""",
+        (COHORT_MIN_CONFIDENCE, COHORT_MIN_SAMPLE_SIZE),
+    ).fetchall()
+    cohort_keys = {
+        f"cohort:{row['user_id']}:{row['cohort_type']}:{row['cohort_key']}:{row['signal_key']}"
+        for row in cohort_rows
+    }
+    _auto_expire_alerts(connection, "cohort_anomaly", cohort_keys, timestamp)
+    for row in cohort_rows:
+        created += _upsert_stable_analytics_alert(
+            connection,
+            dedupe_key=(f"cohort:{row['user_id']}:{row['cohort_type']}:"
+                        f"{row['cohort_key']}:{row['signal_key']}"),
+            alert_type="cohort_anomaly",
+            severity="high",
+            title="Cohort Anomaly",
+            summary=(f"{row['signal_key']} deviates {float(row['z_score']):.2f}σ from "
+                     f"{row['cohort_type']}:{row['cohort_key']} peers."),
+            confidence=float(row["confidence"]),
+            user_id=int(row["user_id"]),
+            timestamp=timestamp,
+        )
+
+    graph_rows = connection.execute(
+        """SELECT user_id,influence_score FROM graph_metrics
+           WHERE is_bridge=1 AND influence_score>=0.45
+           ORDER BY influence_score DESC"""
+    ).fetchall()
+    graph_keys = {f"graph-bridge:{row['user_id']}" for row in graph_rows}
+    _auto_expire_alerts(connection, "graph_bridge", graph_keys, timestamp)
+    for row in graph_rows:
+        created += _upsert_stable_analytics_alert(
+            connection,
+            dedupe_key=f"graph-bridge:{row['user_id']}",
+            alert_type="graph_bridge",
+            severity="medium",
+            title="Network Bridge",
+            summary=f"Entity is a high-influence bridge ({float(row['influence_score']):.3f}).",
+            confidence=min(0.95, float(row["influence_score"])),
+            user_id=int(row["user_id"]),
+            timestamp=timestamp,
+        )
+
+    coordination_rows = connection.execute(
+        """SELECT id FROM entity_relationships
+           WHERE evidence_count>=? ORDER BY evidence_count DESC,id""",
+        (COORDINATION_ALERT_MIN_EVIDENCE,),
+    ).fetchall()
+    _auto_expire_alerts(
+        connection,
+        "coordination_pattern",
+        {f"relationship:{row['id']}:coordination" for row in coordination_rows},
+        timestamp,
+    )
+    return created
+
+
+def _topic_baseline_ready(connection: sqlite3.Connection, timestamp: str) -> bool:
+    current = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+    baseline_start = (current - timedelta(days=8)).isoformat()
+    current_start = (current - timedelta(hours=24)).isoformat()
+    active_days = int(connection.execute(
+        """SELECT COUNT(DISTINCT date(occurred_at)) FROM observations
+           WHERE occurred_at>=? AND occurred_at<?
+             AND text_raw IS NOT NULL AND trim(text_raw)<>''""",
+        (baseline_start, current_start),
+    ).fetchone()[0])
+    return active_days >= TOPIC_BASELINE_MIN_ACTIVE_DAYS
+
+
+def _qualifying_topic_alerts(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+    clauses: list[str] = []
+    parameters: list[object] = []
+    for kind, (minimum_count, minimum_contexts, minimum_unusualness) in TOPIC_ALERT_POLICIES.items():
+        clauses.append("(t.topic_kind=? AND t.current_count>=? AND t.context_count>=? AND t.unusualness>=?)")
+        parameters.extend((kind, minimum_count, minimum_contexts, minimum_unusualness))
+    return list(connection.execute(
+        f"""SELECT t.topic_key,t.topic_kind,t.label,t.unusualness,t.current_count,t.context_count,
+                   (SELECT e.observation_id FROM topic_evidence e WHERE e.topic_key=t.topic_key
+                    ORDER BY e.occurred_at DESC,e.observation_id DESC LIMIT 1) observation_id
+            FROM emerging_topics t WHERE {' OR '.join(clauses)}
+            ORDER BY t.unusualness DESC,t.current_count DESC,t.topic_key
+            LIMIT ?""",
+        (*parameters, TOPIC_ALERT_LIMIT),
+    ).fetchall())
+
+
+def _auto_expire_alerts(
+    connection: sqlite3.Connection,
+    alert_type: str,
+    active_dedupe_keys: set[str],
+    timestamp: str,
+) -> int:
+    parameters: list[object] = [AUTO_EXPIRED_DISPOSITION, timestamp, timestamp, alert_type]
+    exclusion = ""
+    if active_dedupe_keys:
+        exclusion = f" AND dedupe_key NOT IN ({','.join('?' for _ in active_dedupe_keys)})"
+        parameters.extend(sorted(active_dedupe_keys))
+    cursor = connection.execute(
+        """UPDATE intelligence_alerts
+           SET status='resolved',disposition=?,resolved_at=?,updated_at=?
+           WHERE alert_type=? AND status IN ('open','acknowledged','suppressed')""" + exclusion,
+        parameters,
+    )
+    expired = int(cursor.rowcount)
+    if expired:
+        connection.execute(
+            """INSERT INTO audit_log(actor_type,action_type,entity_type,payload_json)
+               VALUES ('system','alert.auto_expired','intelligence_alert',?)""",
+            (json.dumps({"alert_type": alert_type, "count": expired}, sort_keys=True),),
+        )
+    return expired
+
+
+def _upsert_stable_analytics_alert(
+    connection: sqlite3.Connection,
+    *,
+    dedupe_key: str,
+    alert_type: str,
+    severity: str,
+    title: str,
+    summary: str,
+    confidence: float,
+    timestamp: str,
+    user_id: int | None = None,
+    observation_id: int | None = None,
+) -> int:
+    existed = connection.execute(
+        "SELECT 1 FROM intelligence_alerts WHERE dedupe_key=?", (dedupe_key,)
+    ).fetchone() is not None
+    connection.execute(
+        """INSERT INTO intelligence_alerts(
+             user_id,observation_id,alert_type,severity,title,summary,confidence,dedupe_key,
+             created_at,updated_at
+           ) VALUES (?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(dedupe_key) DO UPDATE SET
+             user_id=COALESCE(excluded.user_id,intelligence_alerts.user_id),
+             observation_id=COALESCE(excluded.observation_id,intelligence_alerts.observation_id),
+             severity=excluded.severity,title=excluded.title,summary=excluded.summary,
+             confidence=excluded.confidence,
+             status=CASE WHEN intelligence_alerts.status='resolved'
+                               AND intelligence_alerts.disposition=? THEN 'open'
+                         ELSE intelligence_alerts.status END,
+             disposition=CASE WHEN intelligence_alerts.status='resolved'
+                                    AND intelligence_alerts.disposition=? THEN NULL
+                              ELSE intelligence_alerts.disposition END,
+             resolved_at=CASE WHEN intelligence_alerts.status='resolved'
+                                   AND intelligence_alerts.disposition=? THEN NULL
+                              ELSE intelligence_alerts.resolved_at END,
+             updated_at=excluded.updated_at""",
+        (user_id, observation_id, alert_type, severity, title, summary, confidence,
+         dedupe_key, timestamp, timestamp, AUTO_EXPIRED_DISPOSITION,
+         AUTO_EXPIRED_DISPOSITION, AUTO_EXPIRED_DISPOSITION),
+    )
+    return 0 if existed else 1
 
 
 def review_identity_suggestion(connection: sqlite3.Connection, suggestion_id: int, decision: str, *, operator_id: int | None = None) -> None:
@@ -229,16 +465,25 @@ def refresh_cohort_baselines(connection: sqlite3.Connection, *, calculated_at: s
                stddev_value, median_value, p90_value, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (cohort_type, cohort_key, signal, len(numbers), mean, stddev, statistics.median(numbers), p90, timestamp),
         ); baselines += 1
-        if len(numbers) < 3 or stddev == 0:
+        if len(numbers) < COHORT_MIN_SAMPLE_SIZE or stddev == 0:
             continue
         for user_id, value, confidence in values:
-            z = (value - mean) / stddev
+            if confidence < COHORT_MIN_CONFIDENCE:
+                continue
+            peer_numbers = [peer_value for peer_id, peer_value, _ in values if peer_id != user_id]
+            if len(peer_numbers) < COHORT_MIN_SAMPLE_SIZE - 1:
+                continue
+            peer_mean = statistics.fmean(peer_numbers)
+            peer_stddev = statistics.pstdev(peer_numbers)
+            if peer_stddev == 0:
+                continue
+            z = (value - peer_mean) / peer_stddev
             if abs(z) < 1.25:
                 continue
             connection.execute(
                 """INSERT INTO cohort_anomalies(user_id, cohort_type, cohort_key, signal_key, observed_value,
                    baseline_mean, z_score, direction, confidence, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (user_id, cohort_type, cohort_key, signal, value, mean, z, "above" if z > 0 else "below", confidence, timestamp),
+                (user_id, cohort_type, cohort_key, signal, value, peer_mean, z, "above" if z > 0 else "below", confidence, timestamp),
             ); anomalies += 1
 
     histories: dict[tuple[int, str], list[float]] = defaultdict(list)
@@ -247,7 +492,7 @@ def refresh_cohort_baselines(connection: sqlite3.Connection, *, calculated_at: s
     ):
         histories[(int(user_id), str(signal))].append(float(value))
     for (user_id, signal), numbers in histories.items():
-        if len(numbers) < 3 or (user_id, signal) not in current_values:
+        if len(numbers) < COHORT_MIN_SAMPLE_SIZE or (user_id, signal) not in current_values:
             continue
         mean = statistics.fmean(numbers); stddev = statistics.pstdev(numbers)
         ordered = sorted(numbers); p90 = ordered[min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1)]
@@ -257,7 +502,7 @@ def refresh_cohort_baselines(connection: sqlite3.Connection, *, calculated_at: s
             (str(user_id), signal, len(numbers), mean, stddev, statistics.median(numbers), p90, timestamp),
         ); baselines += 1
         value, confidence = current_values[(user_id, signal)]
-        if stddev:
+        if stddev and confidence >= COHORT_MIN_CONFIDENCE:
             z = (value - mean) / stddev
             if abs(z) >= 1.25:
                 connection.execute(
@@ -272,6 +517,27 @@ def record_evaluation_label(connection: sqlite3.Connection, *, label_key: str, l
                             observation_id: int | None = None, alert_id: int | None = None,
                             user_id: int | None = None, operator_id: int | None = None,
                             source: str = "operator") -> int:
+    score_key = "risk.composite"
+    score_row = None
+    if alert_id is not None:
+        score_row = connection.execute(
+            """SELECT h.signal_key, h.value_real, h.analyzer_version
+               FROM intelligence_alerts a
+               JOIN derived_signal_history h ON h.id=a.signal_history_id
+               WHERE a.id=?""",
+            (alert_id,),
+        ).fetchone()
+    if score_row is None and user_id is not None:
+        score_row = connection.execute(
+            """SELECT signal_key, value_real, analyzer_version
+               FROM derived_signal_windows
+               WHERE user_id=? AND signal_key=?
+               ORDER BY calculated_at DESC LIMIT 1""",
+            (user_id, score_key),
+        ).fetchone()
+    score_value = float(score_row[1]) if score_row is not None else None
+    captured_score_key = str(score_row[0]) if score_row is not None else None
+    captured_model_version = int(score_row[2]) if score_row is not None else None
     if alert_id is not None:
         previous = connection.execute(
             "SELECT id FROM evaluation_labels WHERE alert_id=? AND label_key=? AND source=? ORDER BY id DESC LIMIT 1",
@@ -279,28 +545,34 @@ def record_evaluation_label(connection: sqlite3.Connection, *, label_key: str, l
         ).fetchone()
         if previous is not None:
             connection.execute(
-                """UPDATE evaluation_labels SET observation_id=?, user_id=?, label_value=?, operator_id=?, created_at=CURRENT_TIMESTAMP
+                """UPDATE evaluation_labels SET observation_id=?, user_id=?, label_value=?,
+                   score_key=?, score_value=?, model_version=?, operator_id=?, created_at=CURRENT_TIMESTAMP
                    WHERE id=?""",
-                (observation_id, user_id, label_value.strip().casefold(), operator_id, int(previous[0])),
+                (observation_id, user_id, label_value.strip().casefold(), captured_score_key,
+                 score_value, captured_model_version, operator_id, int(previous[0])),
             )
             return int(previous[0])
     cursor = connection.execute(
         """INSERT INTO evaluation_labels(observation_id, alert_id, user_id, label_key, label_value,
-           operator_id, source) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (observation_id, alert_id, user_id, label_key.strip(), label_value.strip().casefold(), operator_id, source),
+           score_key, score_value, model_version, operator_id, source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (observation_id, alert_id, user_id, label_key.strip(), label_value.strip().casefold(),
+         captured_score_key, score_value, captured_model_version, operator_id, source),
     )
     return int(cursor.lastrowid)
 
 
 def run_model_evaluation(connection: sqlite3.Connection, *, model_key: str = "risk.composite", model_version: int = 2) -> int:
     rows = connection.execute(
-        """SELECT l.label_value, COALESCE(h.value_real, d.value_real, u.current_reputation_score) score,
+        """SELECT l.label_value, COALESCE(l.score_value, h.value_real, d.value_real) score,
                   a.alert_type FROM evaluation_labels l
            LEFT JOIN intelligence_alerts a ON a.id=l.alert_id
            LEFT JOIN derived_signal_history h ON h.id=a.signal_history_id AND h.signal_key=?
            LEFT JOIN derived_signals d ON d.user_id=COALESCE(l.user_id,a.user_id) AND d.signal_key=?
-           LEFT JOIN users u ON u.id=COALESCE(l.user_id,a.user_id)
-           WHERE l.label_value IN ('positive','negative')""", (model_key, model_key),
+           WHERE l.label_value IN ('positive','negative')
+             AND COALESCE(l.score_key, h.signal_key, d.signal_key)=?
+             AND COALESCE(l.model_version, h.analyzer_version, d.analyzer_version, ?)=?""",
+        (model_key, model_key, model_key, model_version, model_version),
     ).fetchall()
     thresholds = (25.0, 50.0, 75.0)
     backtests = []
@@ -316,8 +588,13 @@ def run_model_evaluation(connection: sqlite3.Connection, *, model_key: str = "ri
         fpr = fp / (fp + tn) if fp + tn else 0.0
         backtests.append((threshold, tp, fp, tn, fn, precision, recall, fpr))
     false_positive_types = Counter(str(row[2] or "untyped") for row in rows if row[0] == "negative" and float(row[1] or 0) >= 50)
-    score_values = [float(row[0]) for row in connection.execute("SELECT current_reputation_score FROM users")]
-    distribution = {f"{low}-{low+24}": sum(low <= value < low + 25 for value in score_values) for low in range(0, 100, 25)}
+    score_values = [max(0.0, min(100.0, float(row[1]))) for row in rows]
+    distribution = {
+        "0-24": sum(0 <= value < 25 for value in score_values),
+        "25-49": sum(25 <= value < 50 for value in score_values),
+        "50-74": sum(50 <= value < 75 for value in score_values),
+        "75-100": sum(75 <= value <= 100 for value in score_values),
+    }
     current = next(item for item in backtests if item[0] == 50.0)
     metrics = {"precision": current[5], "recall": current[6], "false_positive_rate": current[7],
                "false_positive_alert_types": dict(false_positive_types), "labeled_positive": sum(row[0] == "positive" for row in rows),
@@ -401,6 +678,27 @@ def graph_temporal_changes(connection: sqlite3.Connection, *, limit: int = 25) -
 
 def _identity_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _label_propagation(nodes: set[int], graph: dict[int, dict[int, float]]) -> dict[int, int]:
+    """Deterministic weighted community detection for operationally stable cluster IDs."""
+    labels = {node: node for node in nodes}
+    for _ in range(25):
+        changed = False
+        for node in sorted(nodes):
+            if not graph[node]:
+                continue
+            scores: dict[int, float] = defaultdict(float)
+            for neighbor, weight in graph[node].items():
+                scores[labels[neighbor]] += weight
+            next_label = min(scores, key=lambda label: (-scores[label], label))
+            if labels[node] != next_label:
+                labels[node] = next_label
+                changed = True
+        if not changed:
+            break
+    canonical = {label: index + 1 for index, label in enumerate(sorted(set(labels.values())))}
+    return {node: canonical[label] for node, label in labels.items()}
 
 
 def _components(nodes: set[int], graph: dict[int, set[int]]) -> dict[int, int]:

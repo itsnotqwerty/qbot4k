@@ -107,4 +107,19 @@ def observation_pivots(connection: sqlite3.Connection, observation_id: int) -> d
            WHERE o2.id<>? AND (a2.user_id IN (?, ?) OR t2.user_id IN (?, ?) OR o2.context_id=?)""",
         (observation_id, row["actor_user_id"], row["target_user_id"], row["actor_user_id"], row["target_user_id"], row["context_id"]),
     ).fetchone()[0])
+    filters: dict[str, object] = {}
+    for key in ("platform", "event_type", "container_id", "context_id"):
+        if row[key] not in (None, ""):
+            filters[key] = row[key]
+    pivots["search_links"] = {
+        "actor": {"user_id": row["actor_user_id"]} if row["actor_user_id"] is not None else None,
+        "target": {"user_id": row["target_user_id"]} if row["target_user_id"] is not None else None,
+        "context": {"context_id": row["context_id"]} if row["context_id"] else None,
+        "container": {"container_id": row["container_id"]} if row["container_id"] else None,
+        "event": filters,
+        "entities": [
+            {"entity_type": item["entity_type"], "entity_value": item["normalized_value"]}
+            for item in entities
+        ],
+    }
     return pivots

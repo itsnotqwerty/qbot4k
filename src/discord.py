@@ -176,7 +176,10 @@ def build_discord_message_payload(payload: Mapping[str, object]) -> dict[str, ob
 
 	member = payload.get("member")
 	role_names: tuple[str, ...] = ()
-	if isinstance(member, Mapping):
+	resolved_roles = payload.get("resolved_role_names")
+	if isinstance(resolved_roles, (list, tuple)):
+		role_names = tuple(str(role).strip() for role in resolved_roles if str(role).strip())
+	elif isinstance(member, Mapping):
 		roles = member.get("roles")
 		if isinstance(roles, (list, tuple)):
 			role_names = tuple(str(role).strip() for role in roles if str(role).strip())
@@ -307,6 +310,11 @@ class DiscordConnector:
 		self._logger = logging.getLogger("qbot4k.discord")
 		self._stop_event = threading.Event()
 		self._active_websocket: WebSocket | None = None
+		self._guild_roles: dict[str, dict[str, tuple[str, int]]] = {}
+		self._guild_owner_ids: dict[str, str] = {}
+		self._session_id: str | None = None
+		self._resume_gateway_url: str | None = None
+		self._sequence: int | None = None
 
 	def stop(self) -> None:
 		self._stop_event.set()
@@ -436,6 +444,7 @@ class DiscordConnector:
 			action_id = int(action[0])
 			action_type = str(action[3]).strip().casefold()
 			reason = str(action[4]) if action[4] is not None else action_type
+			duration_seconds = int(action[6]) if len(action) > 6 else 600
 			try:
 				if action_type == "timeout":
 					if platform_message_id:
@@ -454,6 +463,7 @@ class DiscordConnector:
 							message_id=normalization_result.message_id,
 							action_type=action_type,
 							reason=reason,
+							duration_seconds=duration_seconds,
 							outcome="skipped_moderator",
 						)
 						continue
@@ -462,6 +472,7 @@ class DiscordConnector:
 							guild_id=guild_id,
 							user_id=normalized.platform_user_id,
 							reason=reason,
+							duration_seconds=duration_seconds,
 						)
 						mark_moderation_action_completed(connection, action_id)
 						self._log_moderation_event_to_modlogs(
@@ -573,6 +584,7 @@ class DiscordConnector:
 		action_type: str,
 		reason: str,
 		outcome: str,
+		duration_seconds: int | None = None,
 		error_message: str | None = None,
 	) -> None:
 		if not guild_id:
@@ -605,6 +617,14 @@ class DiscordConnector:
 					"name": "Error",
 					"value": error_message[:1024],
 					"inline": False,
+				}
+			)
+		if duration_seconds is not None and action_type == "timeout":
+			embed["fields"].append(
+				{
+					"name": "Duration",
+					"value": f"{duration_seconds} seconds",
+					"inline": True,
 				}
 			)
 
@@ -706,8 +726,14 @@ class DiscordConnector:
 			f"/channels/{channel_id}/messages/{message_id}",
 		)
 
-	def _timeout_discord_member(self, *, guild_id: str, user_id: str, reason: str) -> None:
-		until = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+	def _timeout_discord_member(
+		self, *, guild_id: str, user_id: str, reason: str,
+		duration_seconds: int = 600,
+	) -> None:
+		until = (
+			datetime.now(timezone.utc)
+			+ timedelta(seconds=max(1, min(duration_seconds, 2_419_200)))
+		).isoformat()
 		self._discord_api_request(
 			"PATCH",
 			f"/guilds/{guild_id}/members/{user_id}",
@@ -748,26 +774,41 @@ class DiscordConnector:
 			data = json.dumps(payload).encode("utf-8")
 		if audit_log_reason:
 			headers["X-Audit-Log-Reason"] = audit_log_reason
-		request = Request(
-			f"https://discord.com/api/v10{path}",
-			data=data,
-			headers=headers,
-			method=method,
-		)
-		try:
-			with urlopen(request, timeout=15) as response:
-				body = response.read().decode("utf-8")
-				return json.loads(body) if body else {}
-		except HTTPError as exc:
-			message = self._read_http_error_body(exc)
-			raise DiscordConnectionError(
-				f"Discord API request failed for {method} {path}: HTTP {exc.code}{f' - {message}' if message else ''}"
-			) from exc
-		except URLError as exc:
-			raise DiscordConnectionError(f"Discord API request failed for {method} {path}: {exc.reason}") from exc
+		for attempt in range(3):
+			request = Request(
+				f"https://discord.com/api/v10{path}", data=data, headers=headers, method=method,
+			)
+			try:
+				with urlopen(request, timeout=15) as response:
+					body = response.read().decode("utf-8")
+					return json.loads(body) if body else {}
+			except HTTPError as exc:
+				message = self._read_http_error_body(exc)
+				if exc.code == 429 or 500 <= exc.code < 600:
+					if attempt < 2:
+						retry_after = exc.headers.get("Retry-After") if exc.headers else None
+						try:
+							delay = min(5.0, max(0.1, float(retry_after or 2 ** attempt)))
+						except ValueError:
+							delay = float(2 ** attempt)
+						time.sleep(delay)
+						continue
+				raise DiscordConnectionError(
+					f"Discord API request failed for {method} {path}: HTTP {exc.code}{f' - {message}' if message else ''}"
+				) from exc
+			except URLError as exc:
+				if attempt < 2:
+					time.sleep(float(2 ** attempt))
+					continue
+				raise DiscordConnectionError(f"Discord API request failed for {method} {path}: {exc.reason}") from exc
+		raise DiscordConnectionError(f"Discord API request failed for {method} {path}")
 
 	def _connect_and_listen(self, bot_token: str) -> None:
-		gateway_url = self._fetch_gateway_url(bot_token)
+		gateway_url = (
+			f"{self._resume_gateway_url}?v=10&encoding=json"
+			if self._resume_gateway_url and self._session_id and self._sequence is not None
+			else self._fetch_gateway_url(bot_token)
+		)
 		identify_token = bot_token.removeprefix("Bot ").strip()
 		ws = create_connection(gateway_url, timeout=1)
 		self._active_websocket = ws
@@ -777,17 +818,31 @@ class DiscordConnector:
 				raise DiscordConnectionError("Discord gateway did not send hello")
 
 			heartbeat_interval = float(hello["d"]["heartbeat_interval"]) / 1000.0
-			sequence: int | None = None
-			self._send_json(
-				ws,
-				self._build_identify_payload(identify_token),
-			)
+			sequence: int | None = self._sequence
+			if self._session_id and sequence is not None:
+				self._send_json(ws, {
+					"op": 6,
+					"d": {
+						"token": identify_token,
+						"session_id": self._session_id,
+						"seq": sequence,
+					},
+				})
+			else:
+				self._send_json(
+					ws,
+					self._build_identify_payload(identify_token),
+				)
 			heartbeat_due = time.monotonic() + heartbeat_interval
+			awaiting_heartbeat_ack = False
 			self._last_status = "connecting"
 
 			while not self._stop_event.is_set():
 				if time.monotonic() >= heartbeat_due:
+					if awaiting_heartbeat_ack:
+						raise DiscordConnectionError("Discord heartbeat was not acknowledged")
 					self._send_json(ws, {"op": 1, "d": sequence})
+					awaiting_heartbeat_ack = True
 					heartbeat_due = time.monotonic() + heartbeat_interval
 
 				try:
@@ -800,6 +855,8 @@ class DiscordConnector:
 
 				if frame.opcode == ABNF.OPCODE_CLOSE:
 					close_description = self._describe_close_frame(frame.data)
+					if self._close_code(frame.data) in {4004, 4013, 4014}:
+						raise DiscordAuthError(f"Discord websocket closed{close_description}")
 					raise DiscordConnectionError(f"Discord websocket closed{close_description}")
 
 				if frame.opcode != ABNF.OPCODE_TEXT:
@@ -808,11 +865,23 @@ class DiscordConnector:
 				message = json.loads(frame.data)
 				if message.get("s") is not None:
 					sequence = int(message["s"])
+					self._sequence = sequence
 
 				opcode = message.get("op")
-				if opcode == 11:
+				if opcode == 1:
+					self._send_json(ws, {"op": 1, "d": sequence})
+					awaiting_heartbeat_ack = True
 					continue
-				if opcode in {7, 9}:
+				if opcode == 11:
+					awaiting_heartbeat_ack = False
+					continue
+				if opcode == 9:
+					if not bool(message.get("d")):
+						self._session_id = None
+						self._resume_gateway_url = None
+						self._sequence = None
+					raise DiscordConnectionError("Discord gateway invalidated the session")
+				if opcode == 7:
 					raise DiscordConnectionError(f"Discord gateway requested reconnect: op={opcode}")
 				if opcode != 0:
 					continue
@@ -823,6 +892,8 @@ class DiscordConnector:
 					continue
 
 				if event_type == "READY":
+					self._session_id = str(data.get("session_id") or "").strip() or None
+					self._resume_gateway_url = str(data.get("resume_gateway_url") or "").strip() or None
 					self._last_status = "ready"
 					self._logger.info("connected to discord gateway")
 					if self.guild_ids:
@@ -851,6 +922,13 @@ class DiscordConnector:
 						bool(self._gateway_intents() & (1 << 15)),
 					)
 					continue
+				if event_type == "RESUMED":
+					self._last_status = "ready"
+					self._logger.info("resumed discord gateway session")
+					continue
+				if event_type in {"GUILD_CREATE", "GUILD_ROLE_CREATE", "GUILD_ROLE_UPDATE", "GUILD_ROLE_DELETE"}:
+					self._cache_guild_metadata(str(event_type), data)
+					continue
 				guild_id = str(data.get("guild_id") or "").strip()
 				if self.guild_ids and guild_id not in self.guild_ids:
 					if guild_id not in self._guild_filter_warned_guilds:
@@ -869,7 +947,7 @@ class DiscordConnector:
 						self._logger.info("ingested discord event type=%s status=%s", event_type, result.status)
 					continue
 
-				payload = build_discord_message_payload(data)
+				payload = build_discord_message_payload(self._decorate_gateway_message(data))
 				result = self.ingest_message(payload)
 				self._logger.info(
 					"ingested discord message guild=%s channel=%s user=%s status=%s",
@@ -961,9 +1039,83 @@ class DiscordConnector:
 
 	def _gateway_intents(self) -> int:
 		guilds = 1 << 0
+		guild_members = 1 << 1
+		guild_moderation = 1 << 2
 		guild_messages = 1 << 9
+		guild_message_reactions = 1 << 10
 		message_content = 1 << 15
-		return guilds | guild_messages | message_content
+		return (
+			guilds
+			| guild_members
+			| guild_moderation
+			| guild_messages
+			| guild_message_reactions
+			| message_content
+		)
+
+	def _cache_guild_metadata(self, event_type: str, data: Mapping[str, object]) -> None:
+		guild_id = str(data.get("guild_id") or data.get("id") or "").strip()
+		if not guild_id:
+			return
+		if event_type == "GUILD_CREATE":
+			self._guild_owner_ids[guild_id] = str(data.get("owner_id") or "").strip()
+			roles: dict[str, tuple[str, int]] = {}
+			for role in data.get("roles", ()):
+				if not isinstance(role, Mapping):
+					continue
+				role_id = str(role.get("id") or "").strip()
+				if role_id:
+					roles[role_id] = (
+						str(role.get("name") or role_id).strip(),
+						int(str(role.get("permissions") or "0")),
+					)
+			self._guild_roles[guild_id] = roles
+			return
+		role = data.get("role")
+		if event_type in {"GUILD_ROLE_CREATE", "GUILD_ROLE_UPDATE"} and isinstance(role, Mapping):
+			role_id = str(role.get("id") or "").strip()
+			if role_id:
+				self._guild_roles.setdefault(guild_id, {})[role_id] = (
+					str(role.get("name") or role_id).strip(),
+					int(str(role.get("permissions") or "0")),
+				)
+		elif event_type == "GUILD_ROLE_DELETE":
+			self._guild_roles.setdefault(guild_id, {}).pop(
+				str(data.get("role_id") or "").strip(), None
+			)
+
+	def _decorate_gateway_message(self, data: Mapping[str, object]) -> dict[str, object]:
+		payload = dict(data)
+		guild_id = str(data.get("guild_id") or "").strip()
+		member = data.get("member")
+		role_ids = (
+			[str(value) for value in member.get("roles", ())]
+			if isinstance(member, Mapping)
+			else []
+		)
+		resolved_names: list[str] = []
+		permissions = 0
+		for role_id in role_ids:
+			role = self._guild_roles.get(guild_id, {}).get(role_id)
+			if role is None:
+				continue
+			resolved_names.append(role[0])
+			permissions |= role[1]
+		author = data.get("author")
+		author_id = str(author.get("id") or "").strip() if isinstance(author, Mapping) else ""
+		moderation_permissions = (1 << 2) | (1 << 3) | (1 << 13) | (1 << 40)
+		payload["resolved_role_names"] = resolved_names
+		payload["author_is_moderator"] = bool(
+			permissions & moderation_permissions
+			or (guild_id and author_id == self._guild_owner_ids.get(guild_id))
+		)
+		return payload
+
+	@staticmethod
+	def _close_code(data: object) -> int | None:
+		if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
+			return None
+		return int.from_bytes(data[:2], "big")
 
 	def _read_http_error_body(self, exc: HTTPError) -> str:
 		try:

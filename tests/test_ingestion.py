@@ -1371,57 +1371,77 @@ class IngestionTests(unittest.TestCase):
 
         self.assertTrue(connector._contains_streamboo_viewer_spam("Get viewers from streamboo now"))
         self.assertTrue(connector._contains_streamboo_viewer_spam("Get viewer from streamboo now"))
+        self.assertTrue(connector._contains_streamboo_viewer_spam("BEST followers at STREAM-B00 now"))
+        self.assertTrue(connector._contains_streamboo_viewer_spam("cheap viewers at s\u200bt\u200br\u200be\u200ba\u200bm\u200bb\u200bo\u200bo"))
         self.assertFalse(connector._contains_streamboo_viewer_spam("Get viewers now"))
         self.assertFalse(connector._contains_streamboo_viewer_spam("streamboo is bad"))
 
-    def test_record_moderation_action_persists_completed_twitch_action(self) -> None:
+    def test_streamboo_rule_runs_through_live_analysis_and_action_pipeline(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        result = ingest_and_analyze(connector, 
+        result = ingest_and_analyze(connector,
             {
                 "message_id": "twitch-msg-streamboo-1",
                 "timestamp": "2026-08-06T05:30:00Z",
                 "channel": "its_not_qwerty",
-                "content": "buy viewers from streamboo",
+                "content": "Get the best viewers from streamboo.com now",
                 "user_id": "viewer-streamboo-1",
                 "username": "spam_viewer",
             }
         )
         self.assertEqual(result.status, "persisted")
         assert result.message_id is not None
-        assert result.platform_account_id is not None
-
-        connector._record_moderation_action(
-            message_id=result.message_id,
-            target_platform_account_id=result.platform_account_id,
-            action_type="timeout",
-            reason="streamboo_viewer_spam",
-        )
 
         connection = connect_database(self.database_path)
         try:
             initialize_database(connection)
+            rule_row = connection.execute(
+                """SELECT moderation_rules.name, rule_matches.severity, rule_matches.reason_code,
+                          rule_matches.recommended_action
+                   FROM rule_matches JOIN moderation_rules ON moderation_rules.id=rule_matches.moderation_rule_id
+                   WHERE rule_matches.message_id=?""",
+                (result.message_id,),
+            ).fetchone()
             action_row = connection.execute(
                 """
                 SELECT platform, message_id, action_type, reason, status
                 FROM moderation_actions
-                ORDER BY id DESC
-                LIMIT 1
+                WHERE message_id=?
                 """
+                , (result.message_id,)
+            ).fetchone()
+            job_row = connection.execute(
+                """SELECT stage, job_type, status FROM processing_jobs
+                   WHERE observation_id=(SELECT observation_id FROM messages WHERE id=?)
+                     AND stage='action'""", (result.message_id,),
+            ).fetchone()
+            alert_row = connection.execute(
+                """SELECT alert_type, severity, title, confidence, status
+                   FROM intelligence_alerts WHERE user_id=(SELECT user_id FROM messages WHERE id=?)""",
+                (result.message_id,),
+            ).fetchone()
+            penalty_row = connection.execute(
+                """SELECT delta, reason_code, source_type, source_id FROM reputation_events
+                   WHERE user_id=(SELECT user_id FROM messages WHERE id=?) AND source_type='moderation'""",
+                (result.message_id,),
             ).fetchone()
         finally:
             connection.close()
 
+        self.assertEqual(tuple(rule_row), ("builtin:streamboo_viewer_spam", "high", "streamboo_viewer_spam", "timeout"))
         self.assertEqual(action_row[0], "twitch")
         self.assertEqual(action_row[1], result.message_id)
         self.assertEqual(action_row[2], "timeout")
         self.assertEqual(action_row[3], "streamboo_viewer_spam")
-        self.assertEqual(action_row[4], "completed")
+        self.assertEqual(action_row[4], "pending")
+        self.assertEqual(tuple(job_row), ("action", "twitch.moderation.execute", "pending"))
+        self.assertEqual(tuple(alert_row), ("moderation_finding", "high", "Streamboo Viewer Spam", 1.0, "open"))
+        self.assertEqual(tuple(penalty_row), (-70, "moderation_penalty", "moderation", result.message_id))
 
-    def test_streamboo_auto_moderation_applies_reputation_penalty(self) -> None:
+    def test_streamboo_rule_exempts_moderators(self) -> None:
         connector = TwitchConnector(self.database_path)
 
-        result = ingest_and_analyze(connector, 
+        result = ingest_and_analyze(connector,
             {
                 "message_id": "twitch-msg-streamboo-2",
                 "timestamp": "2026-08-06T05:31:00Z",
@@ -1429,60 +1449,22 @@ class IngestionTests(unittest.TestCase):
                 "content": "buy viewer from streamboo",
                 "user_id": "viewer-streamboo-2",
                 "username": "spam_viewer_two",
+                "is_moderator": True,
             }
         )
         self.assertEqual(result.status, "persisted")
         assert result.message_id is not None
-        assert result.platform_account_id is not None
-
-        class _FakeIrcSocket:
-            def __init__(self) -> None:
-                self.lines: list[bytes] = []
-
-            def sendall(self, payload: bytes) -> None:
-                self.lines.append(payload)
-
-        fake_socket = _FakeIrcSocket()
-        connector._maybe_auto_moderate_streamboo_viewer_spam(
-            fake_socket,
-            {
-                "channel": "its_not_qwerty",
-                "content": "buy viewer from streamboo",
-                "user_id": "viewer-streamboo-2",
-                "username": "spam_viewer_two",
-                "display_name": "spam_viewer_two",
-                "is_moderator": False,
-            },
-            result,
-        )
-
-        self.assertTrue(fake_socket.lines)
 
         connection = connect_database(self.database_path)
         try:
             initialize_database(connection)
-            user_row = connection.execute(
-                "SELECT id, current_reputation_score FROM users WHERE primary_display_name = 'spam_viewer_two'"
-            ).fetchone()
-            self.assertIsNotNone(user_row)
-            penalty_row = connection.execute(
-                """
-                SELECT delta, reason_code, source_type, source_id
-                FROM reputation_events
-                WHERE user_id = ?
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (int(user_row[0]),),
-            ).fetchone()
+            match_count = int(connection.execute("SELECT COUNT(*) FROM rule_matches WHERE message_id=?", (result.message_id,)).fetchone()[0])
+            action_count = int(connection.execute("SELECT COUNT(*) FROM moderation_actions WHERE message_id=?", (result.message_id,)).fetchone()[0])
         finally:
             connection.close()
 
-        self.assertEqual(int(user_row[1]), 431)
-        self.assertEqual(int(penalty_row[0]), -70)
-        self.assertEqual(str(penalty_row[1]), "moderation_penalty")
-        self.assertEqual(str(penalty_row[2]), "moderation")
-        self.assertEqual(int(penalty_row[3]), result.message_id)
+        self.assertEqual(match_count, 0)
+        self.assertEqual(action_count, 0)
 
 
 if __name__ == "__main__":

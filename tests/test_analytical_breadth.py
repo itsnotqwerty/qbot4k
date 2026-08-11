@@ -110,7 +110,7 @@ def test_topics_graph_identity_cohorts_and_evaluation(tmp_path: Path) -> None:
         assert domain is not None and domain["community_count"] == 3 and domain["velocity"] > 0
 
         users = []
-        for name in ("Alpha", "Bridge", "Omega"):
+        for name in ("Alpha", "Bridge", "Omega", "Delta", "Echo", "Foxtrot"):
             users.append(int(connection.execute("INSERT INTO users(primary_display_name) VALUES (?)", (name,)).lastrowid))
         for source, target in zip(users, users[1:]):
             connection.execute(
@@ -119,7 +119,7 @@ def test_topics_graph_identity_cohorts_and_evaluation(tmp_path: Path) -> None:
                 (source, target),
             )
         assert refresh_graph_analytics(connection) >= 3
-        assert propagation_path(connection, users[0], users[2]) == users
+        assert propagation_path(connection, users[0], users[2]) == users[:3]
         assert connection.execute("SELECT is_bridge FROM graph_metrics WHERE user_id=?", (users[1],)).fetchone()[0] == 1
 
         left_account = ensure_platform_account(connection, platform="discord", platform_user_id="same_name", username="SignalWatcher", guild_or_channel_context="room")
@@ -143,7 +143,7 @@ def test_topics_graph_identity_cohorts_and_evaluation(tmp_path: Path) -> None:
             connection.execute(
                 """INSERT INTO derived_signal_windows(user_id,signal_key,window_name,analyzer_version,value_real,
                    confidence,evidence_count,calculated_at) VALUES (?,'risk.composite','24h',2,?,0.9,10,'2026-08-11')""",
-                (user_id, (10.0, 12.0, 90.0)[index]),
+                (user_id, (10.0, 12.0, 90.0, 14.0, 16.0, 18.0)[index]),
             )
         baselines, anomalies = refresh_cohort_baselines(connection)
         assert baselines >= 1 and anomalies >= 1

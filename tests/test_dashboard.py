@@ -198,6 +198,26 @@ class DashboardTests(unittest.TestCase):
 		self.assertIn("case_sort=priority", body)
 		self.assertIn("relationship_sort=source", body)
 
+	def test_intelligence_page_defaults_to_untriaged_alerts(self) -> None:
+		self._seed_sortable_intelligence()
+		cookie = self._issue_operator_session_cookie()
+		with self.opener.open(Request(
+			f"{self.base_url}/intelligence", headers={"Cookie": cookie}
+		)) as response:
+			default_body = response.read().decode("utf-8")
+		self.assertIn("Alpha finding", default_body)
+		self.assertNotIn("Zulu finding", default_body)
+		self.assertNotIn("Middle finding", default_body)
+		self.assertIn("Untriaged alerts", default_body)
+
+		with self.opener.open(Request(
+			f"{self.base_url}/intelligence?alert_status=all", headers={"Cookie": cookie}
+		)) as response:
+			all_body = response.read().decode("utf-8")
+		self.assertIn("Alpha finding", all_body)
+		self.assertIn("Zulu finding", all_body)
+		self.assertIn("Middle finding", all_body)
+
 	def test_analytics_tables_expose_independent_sort_headers_and_api_state(self) -> None:
 		cookie = self._issue_operator_session_cookie()
 		query = (
@@ -317,7 +337,7 @@ class DashboardTests(unittest.TestCase):
 			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]), 0)
 			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM operator_accounts").fetchone()[0]), 0)
 			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM command_definitions").fetchone()[0]), 1)
-			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM moderation_rules").fetchone()[0]), 1)
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM moderation_rules").fetchone()[0]), 2)
 			self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 		finally:
 			connection.close()
@@ -1636,3 +1656,74 @@ class DashboardTests(unittest.TestCase):
 		self.assertIsNotNone(rows[0][1])
 		self.assertEqual(rows[1][0], "legacy-target")
 		self.assertEqual(rows[0][1], rows[1][1])
+
+	def test_analyst_mvp_workflows_export_and_readiness_end_to_end(self) -> None:
+		cookie = self._issue_operator_session_cookie()
+		connector = DiscordConnector(self.database_path)
+		ingest_and_analyze(connector, {
+			"id": "analyst-mvp-review-1",
+			"timestamp": "2026-08-11T12:00:00Z",
+			"channel_id": "analyst-ops",
+			"guild_id": "guild-1",
+			"content": "review this analyst evidence",
+			"author": {"id": "analyst-subject", "username": "subject", "bot": False},
+		})
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			with connection:
+				message = connection.execute(
+					"SELECT id,observation_id FROM messages WHERE platform_message_id='analyst-mvp-review-1'"
+				).fetchone()
+				review_id = int(connection.execute(
+					"INSERT INTO review_queue(message_id,severity,queue_reason_code) VALUES (?,'high','manual_review')",
+					(int(message[0]),),
+				).lastrowid)
+				case_id = int(connection.execute(
+					"INSERT INTO investigation_cases(title,summary,priority,status) VALUES ('Analyst case','Evidence package','high','active')"
+				).lastrowid)
+				connection.execute(
+					"INSERT INTO case_evidence(case_id,observation_id,note) VALUES (?,?,?)",
+					(case_id, int(message[1]), "source evidence"),
+				)
+		finally:
+			connection.close()
+
+		resolution = Request(
+			f"{self.base_url}/api/moderation/reviews/{review_id}/resolve",
+			data=json.dumps({"resolution": "confirmed", "action_type": "warn", "note": "validated"}).encode(),
+			headers={"Cookie": cookie, "Content-Type": "application/json"},
+			method="POST",
+		)
+		with self.opener.open(resolution) as response:
+			resolved = json.loads(response.read().decode())
+		self.assertEqual(resolved["status"], "resolved")
+		self.assertIsNotNone(resolved["action_id"])
+
+		with self.opener.open(Request(
+			f"{self.base_url}/api/intelligence/cases/{case_id}/export",
+			headers={"Cookie": cookie},
+		)) as response:
+			case_export = json.loads(response.read().decode())
+			self.assertIn(f"qbot4k-case-{case_id}.json", response.headers["Content-Disposition"])
+		self.assertEqual(case_export["case"]["title"], "Analyst case")
+		self.assertEqual(case_export["evidence"][0]["note"], "source evidence")
+
+		with self.opener.open(Request(
+			f"{self.base_url}/search/export.csv?q=analyst",
+			headers={"Cookie": cookie},
+		)) as response:
+			csv_export = response.read().decode()
+			self.assertEqual(response.headers.get_content_type(), "text/csv")
+		self.assertIn("external_event_id", csv_export.splitlines()[0])
+		self.assertIn("analyst-mvp-review-1", csv_export)
+
+		with self.opener.open(Request(f"{self.base_url}/api/health", headers={"Cookie": cookie})) as response:
+			health = json.loads(response.read().decode())
+		self.assertEqual(health["database"]["integrity"], "ok")
+		self.assertIn("failed_actions_24h", health["operations"]["counters"])
+
+		with self.opener.open(Request(f"{self.base_url}/api/audit", headers={"Cookie": cookie})) as response:
+			audit = json.loads(response.read().decode())
+		actions = {item["action_type"] for item in audit["items"]}
+		self.assertTrue({"auth.login", "moderation.review_resolved", "case.exported", "search.exported"} <= actions)

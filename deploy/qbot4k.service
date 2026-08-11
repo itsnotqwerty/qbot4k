@@ -1,0 +1,24 @@
+[Unit]
+Description=QBot4K intelligence platform
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qbot4k
+Group=qbot4k
+WorkingDirectory=/opt/qbot4k/current
+EnvironmentFile=/etc/qbot4k/qbot4k.env
+ExecStart=/opt/qbot4k/current/.venv/bin/python -m src watch
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/qbot4k/data /var/lib/qbot4k /var/backups/qbot4k
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import socket
 import ssl
 import threading
@@ -16,15 +15,12 @@ from .db import (
 	list_pending_moderation_actions_for_message,
 	list_twitch_channels,
 	mark_moderation_action_completed,
-	record_moderation_action,
 	update_twitch_channel_status,
 	upsert_twitch_channel,
 	collect_observation
 )
-from .intelligence.powerusers import record_reputation_evidence, score_delta_for_moderation
-from .intelligence.scoring import calculate_social_score
-from .intelligence.signals import refresh_user_derived_signals
 from .intelligence.events import ingest_event, observation_from_twitch_irc_event
+from .moderation import contains_streamboo_viewer_spam
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
@@ -162,7 +158,6 @@ class TwitchConnector:
 		self._active_irc_token: str | None = None
 		self._last_status = "idle"
 		self._logger = logging.getLogger("qbot4k.twitch")
-		self._streamboo_term_pattern = re.compile(r"(?<!\\w)(viewers?|promotion)(?!\\w)", re.IGNORECASE)
 		self._stop_event = threading.Event()
 		self._active_socket: ssl.SSLSocket | None = None
 		self._send_lock = threading.Lock()
@@ -435,6 +430,7 @@ class TwitchConnector:
 			action_type = str(action[3]).strip().casefold()
 			reason = str(action[4] or action_type).strip()
 			username = str(action[5]).strip()
+			duration_seconds = int(action[6]) if len(action) > 6 else 600
 			channel_id = str(message[0]).strip()
 			if not username or not channel_id:
 				raise ValueError(
@@ -442,7 +438,7 @@ class TwitchConnector:
 				)
 
 			if action_type == "timeout":
-				command = f"/timeout {username} 600 {reason}"
+				command = f"/timeout {username} {duration_seconds} {reason}"
 			elif action_type == "ban":
 				command = f"/ban {username} {reason}"
 			elif action_type == "warn":
@@ -526,109 +522,5 @@ class TwitchConnector:
 		finally:
 			connection.close()
 
-	def _maybe_auto_moderate_streamboo_viewer_spam(
-		self,
-		irc_socket: ssl.SSLSocket,
-		payload: Mapping[str, object],
-		result: IngestionResult,
-	) -> None:
-		if result.status != "persisted":
-			return
-		if result.message_id is None or result.platform_account_id is None:
-			return
-		if bool(payload.get("is_moderator")):
-			return
-
-		content = str(payload.get("content") or "")
-		if not self._contains_streamboo_viewer_spam(content):
-			return
-
-		target_username = str(payload.get("username") or payload.get("display_name") or "").strip()
-		channel_name = str(payload.get("channel") or "").strip()
-		if not target_username or not channel_name:
-			return
-
-		reason = "streamboo_viewer_spam"
-		self._send_privmsg(
-			irc_socket,
-			channel_name,
-			f"/timeout {target_username} 600 Streamboo viewer-buying spam",
-		)
-		self._record_moderation_action(
-			message_id=result.message_id,
-			target_platform_account_id=result.platform_account_id,
-			action_type="timeout",
-			reason=reason,
-		)
-		self._apply_streamboo_penalty(
-			target_platform_account_id=result.platform_account_id,
-			message_id=result.message_id,
-		)
-		self._logger.warning(
-			"auto-moderated twitch message channel=%s user=%s reason=%s",
-			channel_name,
-			target_username,
-			reason,
-		)
-
 	def _contains_streamboo_viewer_spam(self, content: str) -> bool:
-		normalized = content.casefold()
-		if "streamboo" not in normalized:
-			return False
-		return self._streamboo_term_pattern.search(normalized) is not None
-
-	def _record_moderation_action(
-		self,
-		*,
-		message_id: int,
-		target_platform_account_id: int,
-		action_type: str,
-		reason: str,
-	) -> None:
-		connection = connect_database(self.database_path)
-		try:
-			initialize_database(connection)
-			record_moderation_action(
-				connection,
-				platform="twitch",
-				message_id=message_id,
-				target_platform_account_id=target_platform_account_id,
-				action_type=action_type,
-				reason=reason,
-				status="completed",
-			)
-		finally:
-			connection.close()
-
-	def _apply_streamboo_penalty(
-		self,
-		*,
-		target_platform_account_id: int,
-		message_id: int,
-	) -> None:
-		connection = connect_database(self.database_path)
-		try:
-			initialize_database(connection)
-			user_row = connection.execute(
-				"SELECT user_id FROM platform_accounts WHERE id = ?",
-				(target_platform_account_id,),
-			).fetchone()
-			if user_row is None or user_row[0] is None:
-				return
-			delta, penalty_reason = score_delta_for_moderation(
-				severity="high",
-				action_type="timeout",
-				reason_code="streamboo_viewer_spam",
-			)
-			record_reputation_evidence(
-				connection,
-				user_id=int(user_row[0]),
-				delta=delta,
-				reason_code=penalty_reason,
-				source_type="moderation",
-				source_id=message_id,
-			)
-			refresh_user_derived_signals(connection, int(user_row[0]))
-			calculate_social_score(connection, int(user_row[0]))
-		finally:
-			connection.close()
+		return contains_streamboo_viewer_spam(content)

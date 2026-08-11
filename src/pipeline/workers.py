@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from pathlib import Path
 
-from ..db import connect_database
+from ..db import connect_database, record_operational_metric
 from .handlers import (
     claim_processing_job,
     complete_processing_job,
@@ -82,6 +83,8 @@ class AnalysisWorker:
                 return False
 
             job = AnalysisJob.from_row(row)
+            started_at = time.perf_counter()
+            outcome = "completed"
 
             try:
                 self.registry.dispatch(
@@ -89,6 +92,7 @@ class AnalysisWorker:
                     job,
                 )
             except PermanentAnalysisError as exc:
+                outcome = "permanent_failure"
                 permanently_fail_processing_job(
                     connection,
                     job.id,
@@ -103,6 +107,7 @@ class AnalysisWorker:
                     exc,
                 )
             except Exception as exc:
+                outcome = "retry"
                 retry_scheduled = retry_processing_job(
                     connection,
                     job.id,
@@ -122,6 +127,11 @@ class AnalysisWorker:
                     job.id,
                 )
                 self._last_status = "ready"
+            finally:
+                record_operational_metric(connection, "worker.jobs", 1.0,
+                    dimension_key=f"analysis:{outcome}")
+                record_operational_metric(connection, "worker.latency_ms",
+                    (time.perf_counter() - started_at) * 1000.0, dimension_key="analysis")
 
             return True
         finally:
@@ -195,6 +205,8 @@ class DiscordWorker:
                 return False
 
             job = AnalysisJob.from_row(row)
+            started_at = time.perf_counter()
+            outcome = "completed"
 
             try:
                 self.registry.dispatch(
@@ -202,6 +214,7 @@ class DiscordWorker:
                     job,
                 )
             except PermanentActionError as exc:
+                outcome = "permanent_failure"
                 permanently_fail_processing_job(
                     connection,
                     job.id,
@@ -217,6 +230,7 @@ class DiscordWorker:
                     exc,
                 )
             except Exception as exc:
+                outcome = "retry"
                 retrying = retry_processing_job(
                     connection,
                     job.id,
@@ -238,6 +252,11 @@ class DiscordWorker:
                     job.id,
                 )
                 self._last_status = "ready"
+            finally:
+                record_operational_metric(connection, "worker.jobs", 1.0,
+                    dimension_key=f"action:{outcome}")
+                record_operational_metric(connection, "worker.latency_ms",
+                    (time.perf_counter() - started_at) * 1000.0, dimension_key="action")
 
             return True
         finally:
@@ -265,8 +284,9 @@ def _fail_moderation_actions_for_job(
         connection.execute(
             """
             UPDATE moderation_actions
-            SET status = 'failed'
+            SET status = 'failed', completed_at = CURRENT_TIMESTAMP,
+                error_message = ?
             WHERE message_id = ? AND status = 'pending'
             """,
-            (message_id,),
+            ("Associated action job exhausted retries", message_id),
         )
