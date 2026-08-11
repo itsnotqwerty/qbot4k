@@ -26,19 +26,7 @@ def ingest_and_analyze(
     *,
     reply_sink: Callable[[str], None] | None = None,
 ) -> IngestionResult | CollectionResult:
-    restore_bot_setting = None
-    if connector.__class__.__name__ == "DiscordConnector":
-        content = str(payload.get("content") or "").casefold()
-        author = payload.get("author")
-        is_bot = isinstance(author, Mapping) and bool(author.get("bot"))
-        if is_bot and any(term in content for term in ("bump done", "bumped successfully", "bump successful", "server bumped", "boop done", "booped successfully", "boop successful", "server booped")):
-            restore_bot_setting = connector.allow_bot_messages
-            connector.allow_bot_messages = True
-    try:
-        result = connector.ingest_message(payload)
-    finally:
-        if restore_bot_setting is not None:
-            connector.allow_bot_messages = restore_bot_setting
+    result = connector.ingest_message(payload)
 
     if result.status == "duplicate":
         platform = "discord" if connector.__class__.__name__ == "DiscordConnector" else "twitch"
@@ -91,27 +79,6 @@ def ingest_and_analyze(
             from src.discord import normalize_discord_message
 
             normalized = normalize_discord_message(payload)
-            successful_command = connector._detect_server_boost_success(
-                normalized.content_raw,
-                str(normalized.metadata.get("interaction_command_name") or ""),
-            )
-            if successful_command is not None:
-                rewarded = connector._reward_server_boost_from_interaction(
-                    connection,
-                    normalized,
-                    successful_command,
-                )
-                if rewarded is None:
-                    from src.db import reward_server_boost_request
-
-                    reward_server_boost_request(
-                        connection,
-                        platform="discord",
-                        channel_id=normalized.channel_id,
-                        command_names=(successful_command,),
-                    )
-            else:
-                connector._maybe_record_server_boost_request(connection, normalized, projected)
             connector._execute_pending_moderation_actions(connection, normalized, projected)
             if connector._bot_token:
                 registry = ActionRegistry()

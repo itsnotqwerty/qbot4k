@@ -90,7 +90,7 @@ def link_platform_account(
 ) -> None:
 	account = connection.execute(
 		"""
-		SELECT id, user_id, username
+	SELECT id, user_id, username, detached_from_user_id
 		FROM platform_accounts
 		WHERE platform = ? AND platform_user_id = ?
 		""",
@@ -107,6 +107,7 @@ def link_platform_account(
 		raise ValueError("canonical user not found")
 
 	existing_user_id = account[1]
+	detached_from_user_id = account[3]
 	merged_from_user_id: int | None = None
 	if existing_user_id is not None and int(existing_user_id) != user_id:
 		source_user = connection.execute(
@@ -118,14 +119,28 @@ def link_platform_account(
 		merged_from_user_id = int(source_user[0])
 
 	with connection:
-		connection.execute(
-			"""
-			UPDATE platform_accounts
-			SET user_id = ?, updated_at = CURRENT_TIMESTAMP
-			WHERE id = ?
-			""",
-			(user_id, account[0]),
-		)
+		if merged_from_user_id is not None:
+			_merge_canonical_users(
+				connection,
+				source_user_id=merged_from_user_id,
+				target_user_id=user_id,
+			)
+		else:
+			connection.execute(
+				"""
+				UPDATE platform_accounts
+				SET user_id = ?, detached_from_user_id = NULL, updated_at = CURRENT_TIMESTAMP
+				WHERE id = ?
+				""",
+				(user_id, account[0]),
+			)
+			if detached_from_user_id is not None and int(detached_from_user_id) != user_id:
+				_reattribute_detached_account_history(
+					connection,
+					platform_account_id=int(account[0]),
+					source_user_id=int(detached_from_user_id),
+					target_user_id=user_id,
+				)
 		connection.execute(
 			"""
 			INSERT INTO audit_log (
@@ -148,9 +163,13 @@ def link_platform_account(
 		)
 		refresh_user_derived_signals(connection, user_id)
 		calculate_social_score(connection, user_id)
-		if merged_from_user_id is not None:
-			refresh_user_derived_signals(connection, merged_from_user_id)
-			calculate_social_score(connection, merged_from_user_id)
+		if (
+			detached_from_user_id is not None
+			and int(detached_from_user_id) != user_id
+			and connection.execute("SELECT 1 FROM users WHERE id = ?", (int(detached_from_user_id),)).fetchone()
+		):
+			refresh_user_derived_signals(connection, int(detached_from_user_id))
+			calculate_social_score(connection, int(detached_from_user_id))
 
 
 def unlink_platform_account(
@@ -175,10 +194,12 @@ def unlink_platform_account(
 		connection.execute(
 			"""
 			UPDATE platform_accounts
-			SET user_id = NULL, updated_at = CURRENT_TIMESTAMP
+			SET user_id = NULL,
+			    detached_from_user_id = ?,
+			    updated_at = CURRENT_TIMESTAMP
 			WHERE id = ?
 			""",
-			(account[0],),
+			(account[1], account[0]),
 		)
 		connection.execute(
 			"""
@@ -195,14 +216,137 @@ def unlink_platform_account(
 				'user_account_unlink',
 				'platform_account',
 				?,
-				json_object('platform', ?, 'platform_user_id', ?)
+				json_object('platform', ?, 'platform_user_id', ?, 'user_id', ?)
 			)
 			""",
-			(operator_id, account[0], platform, platform_user_id),
+			(operator_id, account[0], platform, platform_user_id, account[1]),
 		)
 		if account[1] is not None:
 			refresh_user_derived_signals(connection, int(account[1]))
 			calculate_social_score(connection, int(account[1]))
+
+
+def _reattribute_detached_account_history(
+	connection: sqlite3.Connection,
+	*,
+	platform_account_id: int,
+	source_user_id: int,
+	target_user_id: int,
+) -> None:
+	connection.execute(
+		"UPDATE messages SET user_id = ? WHERE platform_account_id = ? AND user_id = ?",
+		(target_user_id, platform_account_id, source_user_id),
+	)
+	connection.execute(
+		"""
+		UPDATE reputation_events
+		SET user_id = ?
+		WHERE user_id = ?
+		  AND source_type IN ('message', 'moderation')
+		  AND source_id IN (
+			SELECT id FROM messages WHERE platform_account_id = ?
+		  )
+		""",
+		(target_user_id, source_user_id, platform_account_id),
+	)
+	connection.execute(
+		"UPDATE moderation_actions SET user_id = ? WHERE target_platform_account_id = ? AND user_id = ?",
+		(target_user_id, platform_account_id, source_user_id),
+	)
+
+
+def _merge_canonical_users(
+	connection: sqlite3.Connection,
+	*,
+	source_user_id: int,
+	target_user_id: int,
+) -> None:
+	if source_user_id == target_user_id:
+		return
+
+	connection.execute(
+		"UPDATE platform_accounts SET user_id = ?, detached_from_user_id = NULL, updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+		(target_user_id, source_user_id),
+	)
+	connection.execute(
+		"UPDATE platform_accounts SET detached_from_user_id = ? WHERE detached_from_user_id = ?",
+		(target_user_id, source_user_id),
+	)
+	connection.execute("UPDATE messages SET user_id = ? WHERE user_id = ?", (target_user_id, source_user_id))
+	connection.execute(
+		"UPDATE moderation_actions SET user_id = ? WHERE user_id = ?",
+		(target_user_id, source_user_id),
+	)
+	connection.execute(
+		"UPDATE reputation_events SET user_id = ? WHERE user_id = ? AND source_type != 'initial_calibration'",
+		(target_user_id, source_user_id),
+	)
+	connection.execute("UPDATE user_notes SET user_id = ? WHERE user_id = ?", (target_user_id, source_user_id))
+	connection.execute(
+		"UPDATE server_boost_requests SET requester_user_id = ? WHERE requester_user_id = ?",
+		(target_user_id, source_user_id),
+	)
+	connection.execute(
+		"UPDATE intelligence_alerts SET user_id = ? WHERE user_id = ?",
+		(target_user_id, source_user_id),
+	)
+	connection.execute(
+		"UPDATE intelligence_reports SET subject_user_id = ? WHERE subject_user_id = ?",
+		(target_user_id, source_user_id),
+	)
+	connection.execute(
+		"""
+		INSERT OR IGNORE INTO case_entities (case_id, user_id, role, added_at)
+		SELECT case_id, ?, role, added_at FROM case_entities WHERE user_id = ?
+		""",
+		(target_user_id, source_user_id),
+	)
+	connection.execute("DELETE FROM case_entities WHERE user_id = ?", (source_user_id,))
+
+	relationships = connection.execute(
+		"""
+		SELECT source_user_id, target_user_id, relationship_type, context_key,
+		       strength, evidence_count, first_observed_at, last_observed_at, evidence_json
+		FROM entity_relationships
+		WHERE source_user_id = ? OR target_user_id = ?
+		""",
+		(source_user_id, source_user_id),
+	).fetchall()
+	connection.execute(
+		"DELETE FROM entity_relationships WHERE source_user_id = ? OR target_user_id = ?",
+		(source_user_id, source_user_id),
+	)
+	for relationship in relationships:
+		source = target_user_id if int(relationship[0]) == source_user_id else int(relationship[0])
+		target = target_user_id if int(relationship[1]) == source_user_id else int(relationship[1])
+		if source == target:
+			continue
+		source, target = sorted((source, target))
+		connection.execute(
+			"""
+			INSERT INTO entity_relationships (
+				source_user_id, target_user_id, relationship_type, context_key,
+				strength, evidence_count, first_observed_at, last_observed_at, evidence_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(source_user_id, target_user_id, relationship_type, context_key)
+			DO UPDATE SET
+				strength = MAX(entity_relationships.strength, excluded.strength),
+				evidence_count = entity_relationships.evidence_count + excluded.evidence_count,
+				first_observed_at = MIN(entity_relationships.first_observed_at, excluded.first_observed_at),
+				last_observed_at = MAX(entity_relationships.last_observed_at, excluded.last_observed_at)
+			""",
+			(source, target, *relationship[2:]),
+		)
+
+	connection.execute(
+		"""
+		INSERT INTO audit_log (
+			actor_type, actor_id, action_type, entity_type, entity_id, payload_json
+		) VALUES ('system', NULL, 'user_merge', 'user', ?, json_object('source_user_id', ?))
+		""",
+		(target_user_id, source_user_id),
+	)
+	connection.execute("DELETE FROM users WHERE id = ?", (source_user_id,))
 
 
 def get_canonical_user_profile(

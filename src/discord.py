@@ -18,12 +18,11 @@ from .db import (
 	initialize_database,
 	list_pending_moderation_actions_for_message,
 	mark_moderation_action_completed,
-	record_server_boost_request,
-	reward_server_boost_request,
 	collect_observation
 )
 from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
+from .server_boosts import is_server_boost_confirmation
 
 
 class DiscordPayloadError(ValueError):
@@ -102,6 +101,7 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 			reply_to_author_is_bot = bool(referenced_author.get("bot"))
 
 	interaction_user_id = str(payload.get("interaction_user_id") or "").strip()
+	interaction_username = str(payload.get("interaction_username") or "").strip()
 	interaction_command_name = str(payload.get("interaction_command_name") or "").strip()
 	interaction = payload.get("interaction")
 	if isinstance(interaction, Mapping):
@@ -109,6 +109,9 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 			interaction_user = interaction.get("user")
 			if isinstance(interaction_user, Mapping):
 				interaction_user_id = str(interaction_user.get("id") or "").strip()
+				interaction_username = str(
+					interaction_user.get("username") or interaction_user.get("global_name") or ""
+				).strip()
 		if not interaction_command_name:
 			interaction_command_name = str(interaction.get("name") or "").strip()
 
@@ -118,6 +121,9 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 			interaction_user = interaction_metadata.get("user")
 			if isinstance(interaction_user, Mapping):
 				interaction_user_id = str(interaction_user.get("id") or "").strip()
+				interaction_username = str(
+					interaction_user.get("username") or interaction_user.get("global_name") or ""
+				).strip()
 		if not interaction_command_name:
 			interaction_command_name = str(interaction_metadata.get("name") or "").strip()
 
@@ -125,6 +131,13 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 		interaction_user = payload.get("interaction_user")
 		if isinstance(interaction_user, Mapping):
 			interaction_user_id = str(interaction_user.get("id") or "").strip()
+			interaction_username = str(
+				interaction_user.get("username") or interaction_user.get("global_name") or ""
+			).strip()
+
+	embed_text = str(payload.get("embed_text") or "").strip()
+	if not embed_text:
+		embed_text = _extract_discord_embed_text(payload)
 
 	metadata = {
 		"guild_id": str(guild_id) if guild_id is not None else None,
@@ -133,7 +146,9 @@ def normalize_discord_message(payload: Mapping[str, object]) -> NormalizedMessag
 		"attachment_urls": attachment_urls,
 		"reply_to_author_is_bot": reply_to_author_is_bot,
 		"interaction_user_id": interaction_user_id or None,
+		"interaction_username": interaction_username or None,
 		"interaction_command_name": interaction_command_name or None,
+		"embed_text": embed_text or None,
 	}
 
 	return NormalizedMessage(
@@ -164,12 +179,16 @@ def build_discord_message_payload(payload: Mapping[str, object]) -> dict[str, ob
 			role_names = tuple(str(role).strip() for role in roles if str(role).strip())
 
 	interaction_user_id = ""
+	interaction_username = ""
 	interaction_command_name = ""
 	interaction = payload.get("interaction")
 	if isinstance(interaction, Mapping):
 		interaction_user = interaction.get("user")
 		if isinstance(interaction_user, Mapping):
 			interaction_user_id = str(interaction_user.get("id") or "").strip()
+			interaction_username = str(
+				interaction_user.get("username") or interaction_user.get("global_name") or ""
+			).strip()
 		interaction_command_name = str(interaction.get("name") or "").strip()
 
 	if not interaction_user_id:
@@ -178,6 +197,9 @@ def build_discord_message_payload(payload: Mapping[str, object]) -> dict[str, ob
 			interaction_user = interaction_metadata.get("user")
 			if isinstance(interaction_user, Mapping):
 				interaction_user_id = str(interaction_user.get("id") or "").strip()
+				interaction_username = str(
+					interaction_user.get("username") or interaction_user.get("global_name") or ""
+				).strip()
 			if not interaction_command_name:
 				interaction_command_name = str(interaction_metadata.get("name") or "").strip()
 
@@ -185,6 +207,9 @@ def build_discord_message_payload(payload: Mapping[str, object]) -> dict[str, ob
 		interaction_user = payload.get("interaction_user")
 		if isinstance(interaction_user, Mapping):
 			interaction_user_id = str(interaction_user.get("id") or "").strip()
+			interaction_username = str(
+				interaction_user.get("username") or interaction_user.get("global_name") or ""
+			).strip()
 
 	if not interaction_command_name:
 		interaction_command_name = str(payload.get("interaction_command_name") or "").strip()
@@ -220,10 +245,42 @@ def build_discord_message_payload(payload: Mapping[str, object]) -> dict[str, ob
 		),
 		"reply_to_author_is_bot": reply_to_author_is_bot,
 		"interaction_user_id": interaction_user_id,
+		"interaction_username": interaction_username,
 		"interaction_command_name": interaction_command_name,
+		"embed_text": _extract_discord_embed_text(payload),
 		"role_names": role_names,
 		"author_is_moderator": bool(payload.get("author_is_moderator", False)),
 	}
+
+
+def _extract_discord_embed_text(payload: Mapping[str, object]) -> str:
+	parts: list[str] = []
+	embeds = payload.get("embeds")
+	if not isinstance(embeds, (list, tuple)):
+		return ""
+	for embed in embeds:
+		if not isinstance(embed, Mapping):
+			continue
+		for key in ("title", "description"):
+			value = str(embed.get(key) or "").strip()
+			if value:
+				parts.append(value)
+		fields = embed.get("fields")
+		if isinstance(fields, (list, tuple)):
+			for field in fields:
+				if not isinstance(field, Mapping):
+					continue
+				for key in ("name", "value"):
+					value = str(field.get(key) or "").strip()
+					if value:
+						parts.append(value)
+		for container_key, value_key in (("footer", "text"), ("author", "name")):
+			container = embed.get(container_key)
+			if isinstance(container, Mapping):
+				value = str(container.get(value_key) or "").strip()
+				if value:
+					parts.append(value)
+	return "\n".join(parts)
 
 
 class DiscordConnector:
@@ -279,7 +336,11 @@ class DiscordConnector:
 
 	def ingest_message(self, payload: Mapping[str, object]) -> CollectionResult:
 		normalized = normalize_discord_message(payload)
-		if normalized.metadata.get("author_is_bot") and not self.allow_bot_messages:
+		if (
+			normalized.metadata.get("author_is_bot")
+			and not self.allow_bot_messages
+			and not is_server_boost_confirmation(normalized)
+		):
 			return CollectionResult(status="ignored", platform="discord", reason="bot_message")
 		observation = observation_from_message(normalized)
 
@@ -524,93 +585,6 @@ class DiscordConnector:
 
 		self._modlogs_channel_id_cache[guild_key] = channel_id
 		return channel_id
-
-	def _maybe_record_server_boost_request(
-		self,
-		connection,
-		normalized: NormalizedMessage,
-		result: IngestionResult,
-	) -> None:
-		command_name = self._server_boost_command_name(
-			normalized.content_raw,
-			str(normalized.metadata.get("interaction_command_name") or ""),
-		)
-		if command_name is None or result.platform_account_id is None:
-			return
-
-		record_server_boost_request(
-			connection,
-			platform="discord",
-			channel_id=normalized.channel_id,
-			requester_platform_account_id=result.platform_account_id,
-			command_name=command_name,
-		)
-
-	def _server_boost_command_name(self, content: str, interaction_command_name: str = "") -> str | None:
-		normalized = content.casefold().strip()
-		if normalized:
-			first_token = normalized.split(None, 1)[0]
-			if first_token in {"/bump", "/boop"}:
-				return first_token
-
-		interaction_name = interaction_command_name.casefold().strip().lstrip("/")
-		if interaction_name in {"bump", "boop"}:
-			return f"/{interaction_name}"
-		return None
-
-	def _detect_server_boost_success(self, content: str, interaction_command_name: str = "") -> str | None:
-		normalized = content.casefold()
-		success_signals = {
-			"/bump": ("bump done", "bumped successfully", "bump successful", "server bumped"),
-			"/boop": ("boop done", "booped successfully", "boop successful", "server booped"),
-		}
-		for command_name, phrases in success_signals.items():
-			if any(phrase in normalized for phrase in phrases):
-				return command_name
-
-		inferred_command = self._server_boost_command_name("", interaction_command_name)
-		if inferred_command is not None:
-			success_keywords = ("done", "success", "successful", "completed", "complete")
-			if any(keyword in normalized for keyword in success_keywords):
-				return inferred_command
-		return None
-
-	def _reward_server_boost_from_interaction(
-		self,
-		connection,
-		normalized: NormalizedMessage,
-		command_name: str,
-	) -> int | None:
-		interaction_user_id = str(normalized.metadata.get("interaction_user_id") or "").strip()
-		if not interaction_user_id:
-			return None
-
-		account = connection.execute(
-			"""
-			SELECT id, user_id
-			FROM platform_accounts
-			WHERE platform = 'discord' AND platform_user_id = ?
-			ORDER BY updated_at DESC, id DESC
-			LIMIT 1
-			""",
-			(interaction_user_id,),
-		).fetchone()
-		if account is None or account[1] is None:
-			return None
-
-		record_server_boost_request(
-			connection,
-			platform="discord",
-			channel_id=normalized.channel_id,
-			requester_platform_account_id=int(account[0]),
-			command_name=command_name,
-		)
-		return reward_server_boost_request(
-			connection,
-			platform="discord",
-			channel_id=normalized.channel_id,
-			command_names=(command_name,),
-		)
 
 	def _dispatch_registered_command(
 		self,

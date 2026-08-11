@@ -16,6 +16,7 @@ from ..db import enqueue_processing_job, get_observation, persist_normalized_mes
 from ..models import NormalizedMessage
 from ..intelligence.signals import refresh_user_derived_signals
 from ..intelligence.workflows import process_intelligence_observation
+from ..server_boosts import is_server_boost_confirmation, process_discord_server_boost
 
 
 MESSAGE_ANALYSIS_JOB_TYPE = "analyze.message.created"
@@ -97,11 +98,46 @@ class MessageAnalysisPipeline:
         # Message projection, command mutations, the recorded command result, and
         # the outbound action job commit together. A failure rolls all of them back.
         with connection:
+            if message.platform == "discord" and is_server_boost_confirmation(message):
+                process_discord_server_boost(connection, message)
+                actor_platform_account_id = observation["actor_platform_account_id"]
+                if actor_platform_account_id is not None:
+                    connection.execute(
+                        """
+                        DELETE FROM platform_accounts
+                        WHERE id = ?
+                          AND user_id IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1 FROM messages WHERE messages.platform_account_id = platform_accounts.id
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM moderation_actions
+                              WHERE moderation_actions.target_platform_account_id = platform_accounts.id
+                          )
+                        """,
+                        (int(actor_platform_account_id),),
+                    )
+                return
+
             _project_message(connection, message, observation_id)
+            if message.platform == "discord":
+                platform_account = connection.execute(
+                    "SELECT platform_account_id FROM messages WHERE observation_id = ?",
+                    (observation_id,),
+                ).fetchone()
+                process_discord_server_boost(
+                    connection,
+                    message,
+                    platform_account_id=(
+                        int(platform_account[0])
+                        if platform_account is not None and platform_account[0] is not None
+                        else None
+                    ),
+                )
             self._analyze_command(connection, message, observation_id)
             user_row = connection.execute(
                 """
-                SELECT platform_accounts.user_id
+                SELECT COALESCE(messages.user_id, platform_accounts.user_id)
                 FROM messages
                 INNER JOIN platform_accounts
                     ON platform_accounts.id = messages.platform_account_id

@@ -100,7 +100,7 @@ def search_users(
 				COUNT(DISTINCT messages.id) AS message_count
 			FROM users
 			LEFT JOIN platform_accounts ON platform_accounts.user_id = users.id
-			LEFT JOIN messages ON messages.platform_account_id = platform_accounts.id
+			LEFT JOIN messages ON messages.user_id = users.id
 			WHERE users.primary_display_name LIKE ?
 			GROUP BY users.id
 
@@ -114,8 +114,9 @@ def search_users(
 				1 AS account_count,
 				COUNT(DISTINCT messages.id) AS message_count
 			FROM platform_accounts
-			LEFT JOIN messages ON messages.platform_account_id = platform_accounts.id
+			LEFT JOIN messages ON messages.platform_account_id = platform_accounts.id AND messages.user_id IS NULL
 			WHERE platform_accounts.user_id IS NULL
+				AND platform_accounts.detached_from_user_id IS NULL
 				AND platform_accounts.username LIKE ?
 			GROUP BY platform_accounts.id
 		) AS results
@@ -162,7 +163,7 @@ def list_recent_user_messages(
 				discord_channels.channel_id = messages.channel_id
 				AND messages.platform = 'discord'
 			)
-			WHERE platform_accounts.user_id = ?
+			WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
 			ORDER BY messages.sent_at DESC, messages.id DESC
 			LIMIT ?
 			""",
@@ -263,6 +264,40 @@ def list_user_platform_accounts(connection: sqlite3.Connection, user_id: int) ->
 
 
 def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> UserModerationStatus:
+	if user_id >= 0:
+		open_reviews = int(
+			connection.execute(
+				"""
+				SELECT COUNT(*)
+				FROM review_queue
+				INNER JOIN messages ON messages.id = review_queue.message_id
+				INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+				WHERE review_queue.status = 'open'
+				  AND COALESCE(messages.user_id, platform_accounts.user_id) = ?
+				""",
+				(user_id,),
+			).fetchone()[0]
+		)
+		counts = connection.execute(
+			"""
+			SELECT
+				SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END),
+				SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END),
+				COUNT(*)
+			FROM moderation_actions
+			INNER JOIN platform_accounts
+				ON platform_accounts.id = moderation_actions.target_platform_account_id
+			WHERE COALESCE(moderation_actions.user_id, platform_accounts.user_id) = ?
+			""",
+			(user_id,),
+		).fetchone()
+		return UserModerationStatus(
+			open_reviews=open_reviews,
+			pending_actions=int(counts[0] or 0),
+			completed_actions=int(counts[1] or 0),
+			recent_actions=int(counts[2] or 0),
+		)
+
 	account_ids = _resolve_platform_account_ids(connection, user_id)
 	if not account_ids:
 		return UserModerationStatus(open_reviews=0, pending_actions=0, completed_actions=0, recent_actions=0)
@@ -329,6 +364,28 @@ def list_recent_user_moderation_actions(
 	*,
 	limit: int = 10,
 ) -> list[UserModerationAction]:
+	if user_id >= 0:
+		rows = connection.execute(
+			"""
+			SELECT
+				moderation_actions.id,
+				moderation_actions.platform,
+				platform_accounts.username,
+				moderation_actions.action_type,
+				moderation_actions.status,
+				moderation_actions.reason,
+				moderation_actions.created_at
+			FROM moderation_actions
+			INNER JOIN platform_accounts
+				ON platform_accounts.id = moderation_actions.target_platform_account_id
+			WHERE COALESCE(moderation_actions.user_id, platform_accounts.user_id) = ?
+			ORDER BY moderation_actions.created_at DESC, moderation_actions.id DESC
+			LIMIT ?
+			""",
+			(user_id, limit),
+		).fetchall()
+		return [_moderation_action_from_row(row) for row in rows]
+
 	account_ids = _resolve_platform_account_ids(connection, user_id)
 	if not account_ids:
 		return []
@@ -354,18 +411,19 @@ def list_recent_user_moderation_actions(
 		(*bindings, limit),
 	).fetchall()
 
-	return [
-		UserModerationAction(
-			action_id=int(row[0]),
-			platform=str(row[1]),
-			target_username=str(row[2]),
-			action_type=str(row[3]),
-			status=str(row[4]),
-			reason=str(row[5]) if row[5] is not None else None,
-			created_at=str(row[6]),
-		)
-		for row in rows
-	]
+	return [_moderation_action_from_row(row) for row in rows]
+
+
+def _moderation_action_from_row(row: sqlite3.Row | tuple[object, ...]) -> UserModerationAction:
+	return UserModerationAction(
+		action_id=int(row[0]),
+		platform=str(row[1]),
+		target_username=str(row[2]),
+		action_type=str(row[3]),
+		status=str(row[4]),
+		reason=str(row[5]) if row[5] is not None else None,
+		created_at=str(row[6]),
+	)
 
 
 def _resolve_platform_account_ids(connection: sqlite3.Connection, user_id: int) -> list[int]:

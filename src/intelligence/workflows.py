@@ -247,11 +247,12 @@ def extract_observation_relationships(connection: sqlite3.Connection, *, observa
 
     peers = connection.execute(
         """
-        SELECT DISTINCT peer.user_id
+        SELECT DISTINCT COALESCE(messages.user_id, peer.user_id)
         FROM messages
         INNER JOIN platform_accounts peer ON peer.id = messages.platform_account_id
         WHERE messages.channel_id = ? AND messages.platform = ?
-          AND peer.user_id IS NOT NULL AND peer.user_id != ?
+          AND COALESCE(messages.user_id, peer.user_id) IS NOT NULL
+          AND COALESCE(messages.user_id, peer.user_id) != ?
           AND datetime(messages.sent_at) BETWEEN datetime(?, '-10 minutes') AND datetime(?, '+10 minutes')
         """,
         (observation["container_id"], observation["platform"], actor_user_id, occurred_at, occurred_at),
@@ -265,10 +266,11 @@ def extract_observation_relationships(connection: sqlite3.Connection, *, observa
     for domain in domains:
         domain_peers = connection.execute(
             """
-            SELECT DISTINCT peer.user_id
+            SELECT DISTINCT COALESCE(messages.user_id, peer.user_id)
             FROM messages
             INNER JOIN platform_accounts peer ON peer.id = messages.platform_account_id
-            WHERE peer.user_id IS NOT NULL AND peer.user_id != ?
+            WHERE COALESCE(messages.user_id, peer.user_id) IS NOT NULL
+              AND COALESCE(messages.user_id, peer.user_id) != ?
               AND lower(messages.content_raw) LIKE ?
               AND datetime(messages.sent_at) >= datetime(?, '-1 day')
             """,
@@ -403,7 +405,7 @@ def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_a
         SELECT COUNT(DISTINCT messages.id), MIN(messages.sent_at)
         FROM platform_accounts
         INNER JOIN messages ON messages.platform_account_id = platform_accounts.id
-        WHERE platform_accounts.user_id = ? {condition}
+        WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ? {condition}
         """,
         bindings,
     ).fetchone()
@@ -416,7 +418,7 @@ def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_a
         FROM reputation_events
         INNER JOIN messages ON messages.id = reputation_events.source_id
         INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
-        WHERE platform_accounts.user_id = ?
+        WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
           AND reputation_events.source_type = 'message'
           {condition}
         """,
@@ -431,7 +433,7 @@ def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_a
         FROM rule_matches
         INNER JOIN messages ON messages.id=rule_matches.message_id
         INNER JOIN platform_accounts ON platform_accounts.id=messages.platform_account_id
-        WHERE platform_accounts.user_id=? {condition}
+        WHERE COALESCE(messages.user_id, platform_accounts.user_id)=? {condition}
         """,
         bindings,
     ).fetchone()
@@ -461,7 +463,7 @@ def _window_evidence(connection: sqlite3.Connection, user_id: int, end_at: str, 
     condition = "AND messages.sent_at >= ? AND messages.sent_at <= ?" if cutoff else "AND messages.sent_at <= ?"
     bindings: tuple[object, ...] = (user_id, cutoff, end_at) if cutoff else (user_id, end_at)
     rows = connection.execute(
-        f"""SELECT messages.observation_id, messages.id FROM messages INNER JOIN platform_accounts ON platform_accounts.id=messages.platform_account_id WHERE platform_accounts.user_id=? {condition} ORDER BY messages.sent_at DESC LIMIT 100""",
+        f"""SELECT messages.observation_id, messages.id FROM messages INNER JOIN platform_accounts ON platform_accounts.id=messages.platform_account_id WHERE COALESCE(messages.user_id, platform_accounts.user_id)=? {condition} ORDER BY messages.sent_at DESC LIMIT 100""",
         bindings,
     ).fetchall()
     return [(int(row[0]) if row[0] is not None else None, int(row[1])) for row in rows]

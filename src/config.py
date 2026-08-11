@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -8,6 +9,9 @@ from typing import Mapping
 
 class ConfigError(ValueError):
     pass
+
+
+_SYSTEMD_SERVICE_PATTERN = re.compile(r"^[A-Za-z0-9_.@:-]+\.service$")
 
 
 def _load_dotenv(dotenv_path: Path) -> None:
@@ -60,6 +64,7 @@ class AppSettings:
     dashboard_host: str
     dashboard_port: int
     dashboard_session_secret: str | None
+    systemd_service_name: str
     log_level: str
     enabled_services: tuple[str, ...]
     twitch_channels: tuple[str, ...]
@@ -132,6 +137,10 @@ class AppSettings:
                 8080,
             ),
             dashboard_session_secret=env_map.get("QBOT_DASHBOARD_SESSION_SECRET"),
+            systemd_service_name=env_map.get(
+                "QBOT_SYSTEMD_SERVICE_NAME",
+                "qbot4k.service",
+            ).strip(),
             log_level=log_level,
             enabled_services=enabled_services,
             twitch_channels=twitch_channels,
@@ -172,6 +181,10 @@ class AppSettings:
         return settings
 
     def validate(self) -> None:
+        if not _SYSTEMD_SERVICE_PATTERN.fullmatch(self.systemd_service_name):
+            raise ConfigError(
+                "QBOT_SYSTEMD_SERVICE_NAME must be a valid .service unit name"
+            )
         if self.dashboard_port <= 0 or self.dashboard_port > 65535:
             raise ConfigError("QBOT_DASHBOARD_PORT must be between 1 and 65535")
 
@@ -242,6 +255,7 @@ class AppSettings:
             "backup_dir": str(self.backup_dir),
             "dashboard_host": self.dashboard_host,
             "dashboard_port": self.dashboard_port,
+            "systemd_service_name": self.systemd_service_name,
             "log_level": self.log_level,
             "enabled_services": list(self.enabled_services),
             "twitch_channels": list(self.twitch_channels),

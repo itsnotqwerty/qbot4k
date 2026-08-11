@@ -36,6 +36,146 @@ class FoundationTests(unittest.TestCase):
         env.update(overrides)
         return env
 
+    def test_identity_attribution_migration_preserves_detached_account_history(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "legacy-identity.sqlite3"
+            connection = connect_database(database_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE users (
+                        id INTEGER PRIMARY KEY,
+                        primary_display_name TEXT NOT NULL,
+                        current_reputation_score INTEGER NOT NULL DEFAULT 500,
+                        candidate_flag INTEGER NOT NULL DEFAULT 0,
+                        score_confidence REAL NOT NULL DEFAULT 0.0,
+                        score_model_version INTEGER,
+                        score_calculated_at TEXT,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE platform_accounts (
+                        id INTEGER PRIMARY KEY,
+                        platform TEXT NOT NULL,
+                        platform_user_id TEXT NOT NULL,
+                        username TEXT NOT NULL,
+                        guild_or_channel_context TEXT,
+                        user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(platform, platform_user_id)
+                    );
+                    CREATE TABLE messages (
+                        id INTEGER PRIMARY KEY,
+                        observation_id INTEGER,
+                        platform TEXT NOT NULL,
+                        platform_message_id TEXT,
+                        platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
+                        channel_id TEXT NOT NULL,
+                        content_raw TEXT NOT NULL,
+                        content_normalized TEXT NOT NULL,
+                        sent_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(platform, platform_message_id)
+                    );
+                    CREATE TABLE moderation_actions (
+                        id INTEGER PRIMARY KEY,
+                        platform TEXT NOT NULL,
+                        message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+                        target_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
+                        action_type TEXT NOT NULL,
+                        actor_type TEXT NOT NULL,
+                        actor_id INTEGER,
+                        reason TEXT,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE reputation_events (
+                        id INTEGER PRIMARY KEY,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        source_type TEXT NOT NULL,
+                        source_id INTEGER,
+                        delta INTEGER NOT NULL,
+                        reason_code TEXT NOT NULL,
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE TABLE audit_log (
+                        id INTEGER PRIMARY KEY,
+                        actor_type TEXT NOT NULL,
+                        actor_id INTEGER,
+                        action_type TEXT NOT NULL,
+                        entity_type TEXT NOT NULL,
+                        entity_id INTEGER,
+                        payload_json TEXT NOT NULL DEFAULT '{}',
+                        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO users (id, primary_display_name) VALUES (1, 'legacy_user');
+                    INSERT INTO users (id, primary_display_name) VALUES (2, 'merge_target');
+                    INSERT INTO users (id, primary_display_name) VALUES (3, 'merge_ghost');
+                    INSERT INTO platform_accounts (
+                        id, platform, platform_user_id, username, user_id
+                    ) VALUES (10, 'discord', 'legacy-account', 'legacy_user', NULL);
+                    INSERT INTO messages (
+                        id, platform, platform_message_id, platform_account_id,
+                        channel_id, content_raw, content_normalized, sent_at
+                    ) VALUES (
+                        20, 'discord', 'legacy-message', 10,
+                        'legacy-channel', 'hello', 'hello', '2026-08-10T00:00:00+00:00'
+                    );
+                    INSERT INTO reputation_events (
+                        user_id, source_type, source_id, delta, reason_code
+                    ) VALUES (1, 'message', 20, 1, 'message_sent');
+                    INSERT INTO platform_accounts (
+                        id, platform, platform_user_id, username, user_id
+                    ) VALUES (11, 'twitch', 'merged-account', 'merged_user', 2);
+                    INSERT INTO messages (
+                        id, platform, platform_message_id, platform_account_id,
+                        channel_id, content_raw, content_normalized, sent_at
+                    ) VALUES (
+                        21, 'twitch', 'merged-message', 11,
+                        'merged-channel', 'hello', 'hello', '2026-08-10T00:01:00+00:00'
+                    );
+                    INSERT INTO reputation_events (
+                        user_id, source_type, source_id, delta, reason_code
+                    ) VALUES (3, 'message', 21, 1, 'message_sent');
+                    INSERT INTO audit_log (
+                        actor_type, action_type, entity_type, entity_id, payload_json
+                    ) VALUES (
+                        'system', 'user_account_link', 'platform_account', 10,
+                        '{"platform":"discord","platform_user_id":"legacy-account","user_id":1}'
+                    );
+                    INSERT INTO audit_log (
+                        actor_type, action_type, entity_type, entity_id, payload_json
+                    ) VALUES (
+                        'system', 'user_account_unlink', 'platform_account', 10,
+                        '{"platform":"discord","platform_user_id":"legacy-account"}'
+                    );
+                    INSERT INTO audit_log (
+                        actor_type, action_type, entity_type, entity_id, payload_json
+                    ) VALUES ('system', 'auto_user_create', 'user', 3, '{}');
+                    """
+                )
+
+                initialize_database(connection)
+                account = connection.execute(
+                    "SELECT user_id, detached_from_user_id FROM platform_accounts WHERE id = 10"
+                ).fetchone()
+                message = connection.execute("SELECT user_id FROM messages WHERE id = 20").fetchone()
+                ghost_count = int(connection.execute("SELECT COUNT(*) FROM users WHERE id = 3").fetchone()[0])
+                merged_event_owner = int(
+                    connection.execute(
+                        "SELECT user_id FROM reputation_events WHERE source_id = 21 AND source_type = 'message'"
+                    ).fetchone()[0]
+                )
+            finally:
+                connection.close()
+
+        self.assertIsNone(account[0])
+        self.assertEqual(int(account[1]), 1)
+        self.assertEqual(int(message[0]), 1)
+        self.assertEqual(ghost_count, 0)
+        self.assertEqual(merged_event_owner, 2)
+
     def test_settings_validate_with_web_defaults(self) -> None:
         with TemporaryDirectory() as tmpdir:
             settings = AppSettings.from_env(self.build_env(tmpdir))

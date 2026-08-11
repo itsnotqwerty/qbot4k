@@ -62,9 +62,9 @@ def refresh_user_derived_signals(
             COUNT(DISTINCT messages.platform),
             MIN(messages.sent_at),
             MAX(messages.sent_at)
-        FROM platform_accounts
-        LEFT JOIN messages ON messages.platform_account_id = platform_accounts.id
-        WHERE platform_accounts.user_id = ?
+        FROM messages
+        INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+        WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
         """,
         (user_id,),
     ).fetchone()
@@ -110,9 +110,9 @@ def refresh_user_derived_signals(
             """
             SELECT COUNT(*)
             FROM welcome_events
-            INNER JOIN platform_accounts
-                ON platform_accounts.id = welcome_events.sender_platform_account_id
-            WHERE platform_accounts.user_id = ?
+            INNER JOIN messages ON messages.id = welcome_events.message_id
+            INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
+            WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
             """,
             (user_id,),
         ).fetchone()[0]
@@ -125,7 +125,7 @@ def refresh_user_derived_signals(
             FROM rule_matches
             INNER JOIN messages ON messages.id = rule_matches.message_id
             INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
-            WHERE platform_accounts.user_id = ?
+            WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
             """,
             (user_id,),
         ).fetchone()

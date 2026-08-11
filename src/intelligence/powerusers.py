@@ -407,7 +407,7 @@ def enforce_score_floor_ban(
 		SELECT COUNT(*)
 		FROM messages
 		INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
-		WHERE platform_accounts.user_id = ?
+		WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
 		""",
 		(user_id,),
 	).fetchone()[0]
@@ -419,28 +419,31 @@ def enforce_score_floor_ban(
 				platform,
 				message_id,
 				target_platform_account_id,
+				user_id,
 				action_type,
 				actor_type,
 				actor_id,
 				reason,
 				status
-			) VALUES (?, NULL, ?, 'ban', 'system', NULL, ?, 'completed')
+			) VALUES (?, NULL, ?, ?, 'ban', 'system', NULL, ?, 'completed')
 			""",
 			(
 				str(account[1]),
 				int(account[0]),
+				user_id,
 				f"social_score_floor_reached:{floor_score}",
 			),
 		)
 
 	connection.execute(
 		"""
-		DELETE FROM messages
-		WHERE platform_account_id IN (
-			SELECT id FROM platform_accounts WHERE user_id = ?
-		)
+	DELETE FROM messages
+	WHERE user_id = ?
+	   OR (user_id IS NULL AND platform_account_id IN (
+		SELECT id FROM platform_accounts WHERE user_id = ?
+	   ))
 		""",
-		(user_id,),
+		(user_id, user_id),
 	)
 	connection.execute(
 		"""

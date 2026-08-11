@@ -556,6 +556,73 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(request_row[0], "fulfilled")
         self.assertEqual(request_row[1], "/bump")
 
+    def test_embed_only_boops_are_processed_from_live_gateway_payload(self) -> None:
+        connector = DiscordConnector(self.database_path)
+        gateway_payload = build_discord_message_payload(
+            {
+                "id": "discord-msg-boop-embed",
+                "timestamp": "2026-08-10T05:05:00Z",
+                "channel_id": "channel-boop",
+                "guild_id": "guild-1",
+                "content": "",
+                "author": {
+                    "id": "boop-bot",
+                    "username": "BoopBot",
+                    "bot": True,
+                },
+                "embeds": [
+                    {
+                        "title": "Server Boop",
+                        "description": "Boop completed successfully!",
+                    }
+                ],
+                "interaction_metadata": {
+                    "name": "boop",
+                    "user": {
+                        "id": "user-boop-interaction",
+                        "username": "boop_user",
+                    },
+                },
+            }
+        )
+
+        result = ingest_and_analyze(connector, gateway_payload)
+
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            user = connection.execute(
+                """
+                SELECT users.current_reputation_score
+                FROM users
+                INNER JOIN platform_accounts ON platform_accounts.user_id = users.id
+                WHERE platform_accounts.platform = 'discord'
+                  AND platform_accounts.platform_user_id = 'user-boop-interaction'
+                """
+            ).fetchone()
+            request_row = connection.execute(
+                "SELECT status, command_name FROM server_boost_requests ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            bot_account_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM platform_accounts WHERE platform_user_id = 'boop-bot'"
+                ).fetchone()[0]
+            )
+            projected_bot_message_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM messages WHERE platform_message_id = 'discord-msg-boop-embed'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+
+        self.assertEqual(result.status, "persisted")
+        self.assertIsNotNone(user)
+        self.assertEqual(int(user[0]), 502)
+        self.assertEqual(tuple(request_row), ("fulfilled", "/boop"))
+        self.assertEqual(bot_account_count, 0)
+        self.assertEqual(projected_bot_message_count, 0)
+
     def test_very_negative_messages_cause_reputation_drop_without_moderation(self) -> None:
         connector = DiscordConnector(self.database_path)
 

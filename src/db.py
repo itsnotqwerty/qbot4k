@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS platform_accounts (
     username TEXT NOT NULL,
     guild_or_channel_context TEXT,
     user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    detached_from_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(platform, platform_user_id)
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS messages (
     platform TEXT NOT NULL,
     platform_message_id TEXT,
     platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     channel_id TEXT NOT NULL,
     content_raw TEXT NOT NULL,
     content_normalized TEXT NOT NULL,
@@ -129,6 +131,7 @@ CREATE TABLE IF NOT EXISTS moderation_actions (
     platform TEXT NOT NULL,
     message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
     target_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     action_type TEXT NOT NULL,
     actor_type TEXT NOT NULL,
     actor_id INTEGER,
@@ -249,6 +252,7 @@ CREATE TABLE IF NOT EXISTS service_reliability_buckets (
 
 CREATE INDEX IF NOT EXISTS idx_platform_accounts_user_id
     ON platform_accounts(user_id);
+
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at
     ON messages(sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_platform_account
@@ -611,6 +615,167 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     if "score_calculated_at" not in user_columns:
         connection.execute("ALTER TABLE users ADD COLUMN score_calculated_at TEXT")
 
+    platform_account_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(platform_accounts)").fetchall()
+    }
+    if "detached_from_user_id" not in platform_account_columns:
+        connection.execute(
+            "ALTER TABLE platform_accounts ADD COLUMN detached_from_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"
+        )
+
+    message_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+    }
+    if "user_id" not in message_columns:
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"
+        )
+
+    moderation_action_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(moderation_actions)").fetchall()
+    }
+    if "user_id" not in moderation_action_columns:
+        connection.execute(
+            "ALTER TABLE moderation_actions ADD COLUMN user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"
+        )
+
+    connection.execute(
+        """
+        UPDATE platform_accounts AS account
+        SET detached_from_user_id = (
+            SELECT CAST(json_extract(link_event.payload_json, '$.user_id') AS INTEGER)
+            FROM audit_log AS link_event
+            WHERE link_event.entity_type = 'platform_account'
+              AND link_event.entity_id = account.id
+              AND link_event.action_type = 'user_account_link'
+            ORDER BY link_event.id DESC
+            LIMIT 1
+        )
+        WHERE account.user_id IS NULL
+          AND account.detached_from_user_id IS NULL
+          AND (
+              SELECT recent_event.action_type
+              FROM audit_log AS recent_event
+              WHERE recent_event.entity_type = 'platform_account'
+                AND recent_event.entity_id = account.id
+                AND recent_event.action_type IN ('user_account_link', 'user_account_unlink')
+              ORDER BY recent_event.id DESC
+              LIMIT 1
+          ) = 'user_account_unlink'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE messages AS message
+        SET user_id = COALESCE(
+            (
+                SELECT account.user_id
+                FROM platform_accounts AS account
+                WHERE account.id = message.platform_account_id
+            ),
+            (
+                SELECT event.user_id
+                FROM reputation_events AS event
+                WHERE event.source_id = message.id
+                  AND event.source_type IN ('message', 'moderation')
+                ORDER BY event.id DESC
+                LIMIT 1
+            ),
+            (
+                SELECT account.detached_from_user_id
+                FROM platform_accounts AS account
+                WHERE account.id = message.platform_account_id
+            )
+        )
+        WHERE message.user_id IS NULL
+        """
+    )
+    connection.execute(
+        """
+        UPDATE moderation_actions AS action
+        SET user_id = COALESCE(
+            (SELECT message.user_id FROM messages AS message WHERE message.id = action.message_id),
+            (
+                SELECT COALESCE(account.user_id, account.detached_from_user_id)
+                FROM platform_accounts AS account
+                WHERE account.id = action.target_platform_account_id
+            )
+        )
+        WHERE action.user_id IS NULL
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, sent_at)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_moderation_actions_user_id ON moderation_actions(user_id, created_at)"
+    )
+    _cleanup_legacy_merged_users(connection)
+
+
+def _cleanup_legacy_merged_users(connection: sqlite3.Connection) -> None:
+    from .intelligence.userprofiles import _merge_canonical_users
+
+    merge_candidates = connection.execute(
+        """
+        SELECT events.user_id, MIN(messages.user_id)
+        FROM reputation_events AS events
+        INNER JOIN messages ON messages.id = events.source_id
+        WHERE events.source_type IN ('message', 'moderation')
+          AND messages.user_id IS NOT NULL
+          AND messages.user_id != events.user_id
+          AND NOT EXISTS (
+              SELECT 1 FROM platform_accounts WHERE platform_accounts.user_id = events.user_id
+          )
+        GROUP BY events.user_id
+        HAVING COUNT(DISTINCT messages.user_id) = 1
+        """
+    ).fetchall()
+    for source_user_id_raw, target_user_id_raw in merge_candidates:
+        source_user_id = int(source_user_id_raw)
+        target_user_id = int(target_user_id_raw)
+        if source_user_id == target_user_id:
+            continue
+        if connection.execute("SELECT 1 FROM users WHERE id = ?", (source_user_id,)).fetchone() is None:
+            continue
+        if connection.execute("SELECT 1 FROM users WHERE id = ?", (target_user_id,)).fetchone() is None:
+            continue
+        _merge_canonical_users(
+            connection,
+            source_user_id=source_user_id,
+            target_user_id=target_user_id,
+        )
+        connection.execute(
+            "UPDATE users SET score_model_version = NULL WHERE id = ?",
+            (target_user_id,),
+        )
+
+    connection.execute(
+        """
+        DELETE FROM users
+        WHERE NOT EXISTS (SELECT 1 FROM platform_accounts WHERE platform_accounts.user_id = users.id)
+          AND NOT EXISTS (SELECT 1 FROM messages WHERE messages.user_id = users.id)
+          AND NOT EXISTS (SELECT 1 FROM user_notes WHERE user_notes.user_id = users.id)
+          AND NOT EXISTS (SELECT 1 FROM server_boost_requests WHERE server_boost_requests.requester_user_id = users.id)
+          AND NOT EXISTS (SELECT 1 FROM intelligence_alerts WHERE intelligence_alerts.user_id = users.id)
+          AND NOT EXISTS (SELECT 1 FROM case_entities WHERE case_entities.user_id = users.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM entity_relationships
+              WHERE entity_relationships.source_user_id = users.id OR entity_relationships.target_user_id = users.id
+          )
+          AND NOT EXISTS (SELECT 1 FROM intelligence_reports WHERE intelligence_reports.subject_user_id = users.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM reputation_events
+              WHERE reputation_events.user_id = users.id
+                AND reputation_events.source_type != 'initial_calibration'
+          )
+          AND EXISTS (
+              SELECT 1 FROM audit_log
+              WHERE audit_log.action_type = 'auto_user_create'
+                AND audit_log.entity_type = 'user'
+                AND audit_log.entity_id = users.id
+          )
+        """
+    )
+
 
 def _seed_builtin_moderation_rules(connection: sqlite3.Connection) -> None:
     connection.execute(
@@ -749,6 +914,40 @@ def list_tables(connection: sqlite3.Connection) -> list[str]:
         "ORDER BY name"
     ).fetchall()
     return [row[0] for row in rows]
+
+
+def reset_database(connection: sqlite3.Connection) -> dict[str, int]:
+    """Delete every application row, reset sequences, and restore seed data.
+
+    The database file and schema remain in place so live processes do not keep
+    writing to an unlinked SQLite inode. An exclusive transaction prevents
+    concurrent writers from observing a partially cleared database.
+    """
+    connection.commit()
+    tables = list_tables(connection)
+    deleted_rows = 0
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        connection.execute("BEGIN EXCLUSIVE")
+        for table_name in tables:
+            quoted_name = '"' + table_name.replace('"', '""') + '"'
+            row_count = int(connection.execute(f"SELECT COUNT(*) FROM {quoted_name}").fetchone()[0])
+            connection.execute(f"DELETE FROM {quoted_name}")
+            deleted_rows += row_count
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone() is not None:
+            connection.execute("DELETE FROM sqlite_sequence")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
+
+    initialize_database(connection)
+    return {"tables_cleared": len(tables), "rows_deleted": deleted_rows}
 
 
 def database_health(database_path: Path) -> dict[str, object]:
@@ -1056,10 +1255,14 @@ def persist_normalized_message(
                 message_id=message_id,
                 attachments=message.metadata.get("attachment_urls"),
             )
-            canonical_user_id = _ensure_canonical_user_for_platform_account(
+            canonical_user_id = ensure_canonical_user_for_platform_account(
                 connection,
                 platform_account_id=platform_account_id,
                 preferred_display_name=message.username,
+            )
+            connection.execute(
+                "UPDATE messages SET user_id = ? WHERE id = ?",
+                (canonical_user_id, message_id),
             )
 
             message_delta = score_delta_for_message(message.content_raw)
@@ -1281,7 +1484,7 @@ def _extract_welcome_target_identifier(message: NormalizedMessage) -> str | None
     return None
 
 
-def _ensure_canonical_user_for_platform_account(
+def ensure_canonical_user_for_platform_account(
     connection: sqlite3.Connection,
     *,
     platform_account_id: int,
@@ -1324,7 +1527,7 @@ def _ensure_canonical_user_for_platform_account(
     connection.execute(
         """
         UPDATE platform_accounts
-        SET user_id = ?, updated_at = CURRENT_TIMESTAMP
+        SET user_id = ?, detached_from_user_id = NULL, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
         """,
         (created_user_id, platform_account_id),
@@ -1551,6 +1754,7 @@ def record_moderation_findings(
                     platform,
                     message_id,
                     target_platform_account_id,
+                    user_id,
                     action_type,
                     actor_type,
                     actor_id,
@@ -1560,6 +1764,7 @@ def record_moderation_findings(
                     ?,
                     ?,
                     (SELECT platform_account_id FROM messages WHERE id = ?),
+                    (SELECT user_id FROM messages WHERE id = ?),
                     ?,
                     'system',
                     NULL,
@@ -1569,6 +1774,7 @@ def record_moderation_findings(
                 """,
                 (
                     platform,
+                    message_id,
                     message_id,
                     message_id,
                     finding.auto_enforce_action,
@@ -1604,6 +1810,19 @@ def record_moderation_action(
     actor_type: str = "system",
     actor_id: int | None = None,
 ) -> int:
+    attribution = connection.execute(
+        """
+        SELECT COALESCE(
+            (SELECT user_id FROM messages WHERE id = ?),
+            user_id,
+            detached_from_user_id
+        )
+        FROM platform_accounts
+        WHERE id = ?
+        """,
+        (message_id, target_platform_account_id),
+    ).fetchone()
+    attributed_user_id = attribution[0] if attribution is not None else None
     with connection:
         cursor = connection.execute(
             """
@@ -1611,17 +1830,19 @@ def record_moderation_action(
                 platform,
                 message_id,
                 target_platform_account_id,
+                user_id,
                 action_type,
                 actor_type,
                 actor_id,
                 reason,
                 status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 platform,
                 message_id,
                 target_platform_account_id,
+                attributed_user_id,
                 action_type,
                 actor_type,
                 actor_id,

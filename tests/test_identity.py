@@ -240,6 +240,19 @@ class IdentityTests(unittest.TestCase):
 				platform_user_id="discord-user-2",
 				user_id=source_user_id,
 			)
+			ensure_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-2",
+				username="viewer_two_twitch",
+				guild_or_channel_context="viewer_two",
+			)
+			link_platform_account(
+				connection,
+				platform="twitch",
+				platform_user_id="twitch-user-2",
+				user_id=source_user_id,
+			)
 
 			link_platform_account(
 				connection,
@@ -259,6 +272,15 @@ class IdentityTests(unittest.TestCase):
 			merge_event_count = int(connection.execute(
 				"SELECT COUNT(*) FROM reputation_events WHERE source_type = 'account_link_merge'"
 			).fetchone()[0])
+			source_user_count = int(
+				connection.execute("SELECT COUNT(*) FROM users WHERE id = ?", (source_user_id,)).fetchone()[0]
+			)
+			merged_account_owners = {
+				int(row[0])
+				for row in connection.execute(
+					"SELECT user_id FROM platform_accounts WHERE platform_user_id IN ('discord-user-2', 'twitch-user-2')"
+				).fetchall()
+			}
 		finally:
 			connection.close()
 
@@ -267,6 +289,8 @@ class IdentityTests(unittest.TestCase):
 		self.assertEqual(reputation_row[0], "initial_calibration")
 		self.assertEqual(reputation_row[1], "initial_score_calibration")
 		self.assertEqual(merge_event_count, 0)
+		self.assertEqual(source_user_count, 0)
+		self.assertEqual(merged_account_owners, {target_user_id})
 
 	def test_operator_notes_are_stored_and_listed(self) -> None:
 		connection = connect_database(self.database_path)

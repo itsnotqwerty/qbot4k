@@ -4,7 +4,10 @@ import logging
 import hashlib
 import hmac
 import json
+import os
 import subprocess
+import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -18,9 +21,10 @@ from ..db import (
     connect_database,
 	database_health,
 	delete_simple_command_definition,
-    initialize_database,
+	initialize_database,
 	list_service_reliability_buckets,
 	record_moderation_action,
+	reset_database,
     upsert_operator_account,
 	list_command_definitions,
 	list_simple_command_definitions,
@@ -69,8 +73,21 @@ from .users import (
 	search_users,
 )
 
-SUDO_PATH = "/usr/bin/sudo"
-RESTART_HELPER_PATH = "/usr/local/sbin/qbot4k-restart"
+
+def _restart_systemd_service(service_name: str) -> None:
+	command = ["systemctl", "restart", service_name]
+	if os.geteuid() != 0:
+		command = ["sudo", "-n", *command]
+	result = subprocess.run(
+		command,
+		check=False,
+		capture_output=True,
+		text=True,
+		timeout=30,
+	)
+	if result.returncode != 0:
+		detail = (result.stderr or result.stdout or "systemctl restart failed").strip()
+		raise RuntimeError(detail[:500])
 
 
 @dataclass(frozen=True)
@@ -111,6 +128,9 @@ class DashboardApp:
 		if handler.command == "POST" and path == "/dashboard/restart":
 			self._serve_dashboard_restart(handler)
 			return True
+		if handler.command == "POST" and path == "/dashboard/reset-database":
+			self._serve_dashboard_reset_database(handler)
+			return True
 		if handler.command == "GET" and path == "/users":
 			self._serve_users(handler, parse_qs(parsed.query))
 			return True
@@ -134,6 +154,9 @@ class DashboardApp:
 			return True
 		if handler.command == "POST" and path == "/users/link":
 			self._serve_users_link(handler)
+			return True
+		if handler.command == "POST" and path == "/users/unlink":
+			self._serve_users_unlink(handler)
 			return True
 		if handler.command == "POST" and path.startswith(
 		    "/users/") and path.endswith("/moderation"):
@@ -196,58 +219,6 @@ class DashboardApp:
 			self._serve_api_health(handler)
 			return True
 		return False
-
-	def _serve_dashboard_restart(
-		self,
-		handler: BaseHTTPRequestHandler,
-	) -> None:
-		session = self._require_session(handler, admin_only=True)
-		if session is None:
-			return
-
-		try:
-			result = subprocess.run(
-				[
-					SUDO_PATH,
-					"-n",
-					RESTART_HELPER_PATH,
-				],
-				stdin=subprocess.DEVNULL,
-				stdout=subprocess.PIPE,
-				stderr=subprocess.PIPE,
-				text=True,
-				timeout=5,
-				check=False,
-			)
-		except (OSError, subprocess.TimeoutExpired) as exc:
-			self._log_exception("service restart scheduling failed", exc)
-			self._redirect(
-				handler,
-				"/dashboard?status=Restart%20could%20not%20be%20scheduled",
-			)
-			return
-
-		if result.returncode != 0:
-			logging.getLogger("qbot4k.dashboard").error(
-				"service restart scheduling rejected user_id=%s error=%s",
-				session.user_id,
-				result.stderr.strip()[:500],
-			)
-			self._redirect(
-				handler,
-				"/dashboard?status=Restart%20was%20rejected",
-			)
-			return
-
-		logging.getLogger("qbot4k.dashboard").warning(
-			"service restart scheduled user_id=%s username=%s",
-			session.user_id,
-			session.username,
-		)
-		self._redirect(
-			handler,
-			"/dashboard?status=Restart%20scheduled",
-		)
 
 	def _read_session(
 	    self, handler: BaseHTTPRequestHandler) -> DashboardSession | None:
@@ -431,18 +402,19 @@ class DashboardApp:
     self._escape(status_message)}</p>" if status_message else ""
 		admin_actions = (
 			"<form method='post' action='/dashboard/go-live'>"
-			"<button type='submit'>Go Live</button>"
-			"</form>"
-			"<form method='post' action='/dashboard/restart' "
-			"onsubmit=\"return confirm('Restart the QBot4K service?');\">"
-			"<button class='danger' type='submit'>Restart</button>"
-			"</form>"
+			+ "<button type='submit'>Go Live</button>"
+			+ "</form>"
+			+ "<form method='post' action='/dashboard/restart' "
+			+ "onsubmit=\"return window.confirm('Restart the QBot4K service now?');\">"
+			+ "<button type='submit'>Restart Bot</button>"
+			+ "</form>"
+			+ "<form method='post' action='/dashboard/reset-database' "
+			+ "onsubmit=\"const value=window.prompt('Type RESET to permanently erase all QBot4K database data.'); if(value !== 'RESET') return false; this.elements.confirmation.value=value; return window.confirm('This cannot be undone. Reset the entire database?');\">"
+			+ "<input type='hidden' name='confirmation' value=''>"
+			+ "<button class='danger' type='submit'>Reset Database</button>"
+			+ "</form>"
 			if session.role == "admin"
 			else ""
-		)
-
-		toolbar_html = (
-			f"<div class='toolbar'>{admin_actions}{status_html}</div>"
 		)
 		toolbar_html = f"<div class='toolbar'>{admin_actions}{status_html}</div>"
 		connector_status = self._render_overview_connector_status()
@@ -582,6 +554,74 @@ class DashboardApp:
 			self._redirect(handler, "/dashboard?status=Go%20Live%20sent%200%20pings")
 			return
 		self._redirect(handler, f"/dashboard?status={quote(f'Go Live sent {announcements} pings')}")
+
+	def _serve_dashboard_restart(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		service_name = self.settings.systemd_service_name
+		logging.getLogger("qbot4k.dashboard").warning(
+			"systemd restart requested operator_user_id=%s service=%s",
+			session.user_id,
+			service_name,
+		)
+		self._redirect(
+			handler,
+			f"/dashboard?status={quote(f'Restart requested for {service_name}')}",
+		)
+		self._schedule_systemd_restart(service_name)
+
+	@staticmethod
+	def _schedule_systemd_restart(service_name: str) -> None:
+		def _delayed_restart() -> None:
+			time.sleep(0.5)
+			try:
+				_restart_systemd_service(service_name)
+			except Exception:
+				logging.getLogger("qbot4k.dashboard").exception(
+					"systemd restart failed service=%s",
+					service_name,
+				)
+
+		threading.Thread(
+			target=_delayed_restart,
+			name="dashboard-systemd-restart",
+			daemon=True,
+		).start()
+
+	def _serve_dashboard_reset_database(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+		confirmation = (form.get("confirmation") or [""])[0].strip()
+		if not hmac.compare_digest(confirmation, "RESET"):
+			self._redirect(handler, "/dashboard?status=Database%20reset%20cancelled")
+			return
+
+		connection = connect_database(self.settings.database_path)
+		try:
+			report = reset_database(connection)
+		except Exception as exc:
+			self._log_exception("database reset failed", exc)
+			self._redirect(handler, "/dashboard?status=Database%20reset%20failed")
+			return
+		finally:
+			connection.close()
+
+		logging.getLogger("qbot4k.dashboard").warning(
+			"database reset completed operator_user_id=%s tables=%s rows=%s",
+			session.user_id,
+			report["tables_cleared"],
+			report["rows_deleted"],
+		)
+		status = quote(f"Database reset complete; deleted {report['rows_deleted']} rows")
+		self._redirect(
+			handler,
+			f"/dashboard?status={status}",
+		)
 
 	def _serve_users(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
@@ -834,6 +874,59 @@ class DashboardApp:
 				status_message += ", ..."
 		self._redirect(handler, _users_url(selected=selected_user_id, status=status_message))
 
+	def _serve_users_unlink(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler, admin_only=True)
+		if session is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None:
+			return
+
+		user_id_raw = (form.get("user_id") or [""])[0].strip()
+		platform_account_id_raw = (form.get("platform_account_id") or [""])[0].strip()
+		confirmation = (form.get("confirmation") or [""])[0].strip()
+		try:
+			user_id = int(user_id_raw)
+			platform_account_id = int(platform_account_id_raw)
+		except ValueError:
+			self._redirect(handler, "/users?link_status=" + quote("Invalid unlink request"))
+			return
+
+		def _user_url(status: str) -> str:
+			return f"/users/{user_id}?account_status={quote(status)}"
+
+		if user_id < 0 or confirmation != "UNLINK":
+			self._redirect(handler, _user_url("Unlink confirmation failed"))
+			return
+
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			account = connection.execute(
+				"""
+				SELECT platform, platform_user_id, username
+				FROM platform_accounts
+				WHERE id = ? AND user_id = ?
+				""",
+				(platform_account_id, user_id),
+			).fetchone()
+			if account is None:
+				self._redirect(handler, _user_url("Platform account does not belong to this user"))
+				return
+
+			unlink_platform_account(
+				connection,
+				platform=str(account[0]),
+				platform_user_id=str(account[1]),
+				operator_id=int(session.user_id),
+			)
+			username = str(account[2])
+			platform = str(account[0])
+		finally:
+			connection.close()
+
+		self._redirect(handler, _user_url(f"Unlinked {platform} account {username}"))
+
 	def _serve_user_messages(
 		self,
 		handler: BaseHTTPRequestHandler,
@@ -844,6 +937,7 @@ class DashboardApp:
 		if session is None:
 			return
 		moderation_status_message = (query.get("mod_status") or [""])[0].strip()
+		account_status_message = (query.get("account_status") or [""])[0].strip()
 		parts = [part for part in path.split("/") if part]
 		if len(parts) != 2:
 			self._send_text(handler, HTTPStatus.NOT_FOUND, "Not found")
@@ -906,6 +1000,27 @@ class DashboardApp:
 			f"<option value='{item.platform_account_id}'>{self._escape(item.platform)} · {self._escape(item.username)} ({self._escape(item.platform_user_id)})</option>"
 			for item in platform_accounts
 		)
+		linked_account_rows = "".join(
+			"<tr>"
+			+ f"<td>{self._escape(item.platform)}</td>"
+			+ f"<td>{self._escape(item.username)}</td>"
+			+ f"<td>{self._escape(item.platform_user_id)}</td>"
+			+ (
+				"<td><form method='post' action='/users/unlink' "
+				+ "onsubmit=\"return window.confirm('Unlink this platform account? Its messages and evidence will be preserved.');\">"
+				+ f"<input type='hidden' name='user_id' value='{user_id}'>"
+				+ f"<input type='hidden' name='platform_account_id' value='{item.platform_account_id}'>"
+				+ "<input type='hidden' name='confirmation' value='UNLINK'>"
+				+ "<button class='danger' type='submit'>Unlink</button></form></td>"
+				if session.role == "admin" and user_id >= 0
+				else "<td><span class='muted'>No action</span></td>"
+			)
+			+ "</tr>"
+			for item in platform_accounts
+		)
+		account_notice = (
+			f"<p class='status-banner'>{self._escape(account_status_message)}</p>" if account_status_message else ""
+		)
 		moderation_form = ""
 		if platform_accounts:
 			moderation_form = (
@@ -934,6 +1049,12 @@ class DashboardApp:
 			+ "<section class='card'>"
 			+ "<h2>Profile summary</h2>"
 			+ f"<div class='grid'><div class='metric'><div class='label'>Intelligence score (Reputation)</div><div class='value'>{selected_user.current_reputation_score}</div></div><div class='metric'><div class='label'>Evidence confidence</div><div class='value'>{(social_score.confidence if social_score else 0.0) * 100:.0f}%</div></div><div class='metric'><div class='label'>Score band</div><div class='value'>{self._escape(social_score.band if social_score else 'unscored')}</div></div><div class='metric'><div class='label'>Power User</div><div class='value'>{'yes' if selected_user.candidate_flag else 'no'}</div></div><div class='metric'><div class='label'>Accounts</div><div class='value'>{selected_user.account_count}</div></div><div class='metric'><div class='label'>Messages</div><div class='value'>{selected_user.message_count}</div></div></div>"
+			+ "</section>"
+			+ "<section class='card'>"
+			+ "<h2>Linked accounts</h2>"
+			+ account_notice
+			+ "<p class='lede'>Unlinking detaches an identity from this profile. Historical messages, evidence, and audit records are preserved.</p>"
+			+ f"<div class='table-scroll'><table class='table'><thead><tr><th>Platform</th><th>Username</th><th>Platform user ID</th><th>Action</th></tr></thead><tbody>{linked_account_rows or '<tr><td colspan=4>No linked accounts</td></tr>'}</tbody></table></div>"
 			+ "</section>"
 			+ "<section class='card'>"
 			+ f"<h2>Score explanation</h2><p class='lede'>Model v{social_score.model_version if social_score else 'n/a'} recalculates the materialized score from versioned evidence. Contributions are bounded and auditable.</p>"
@@ -1926,13 +2047,6 @@ h1, h2 {{ margin: 0 0 10px; }}
 .metric {{ background: var(--panel); border: 1px solid var(--border); border-radius: 18px; padding: 18px; }}
 .metric .value {{ font-size: 30px; font-weight: 800; }}
 .toolbar {{ display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 16px 0 20px; }}
-button:hover {{
-	cursor: pointer;
-}}
-button.danger {{
-	background: #d95c5c;
-    color: #fff;
-}}
 .status-banner {{ margin: 0; padding: 10px 14px; border-radius: 999px; background: rgba(120,220,202,.12); color: var(--accent); border: 1px solid rgba(120,220,202,.25); }}
 .status-row {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }}
 .status-pill {{ display: inline-flex; align-items: center; gap: 6px; border-radius: 999px; padding: 4px 10px; border: 1px solid transparent; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; font-weight: 700; }}
@@ -1971,6 +2085,7 @@ input {{ flex: 1; min-width: 0; padding: 12px 14px; border-radius: 12px; border:
 textarea {{ width: 100%; min-width: 0; max-width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); resize: vertical; }}
 select {{ min-width: 0; max-width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--panel); color: var(--text); }}
 button {{ padding: 12px 16px; border: 0; border-radius: 12px; background: var(--accent); color: #041014; font-weight: 700; }}
+button.danger {{ background: #d95c5c; color: #fff; }}
 .columns {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }}
 .sticky-link-panel {{ position: sticky; top: 12px; z-index: 5; margin-bottom: 18px; }}
 .checkbox {{ display: inline-flex; align-items: center; gap: 8px; }}

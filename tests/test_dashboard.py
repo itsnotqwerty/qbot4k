@@ -88,6 +88,89 @@ class DashboardTests(unittest.TestCase):
 		self.assertEqual(query["redirect_uri"][0], "https://dashboard.example.test/oauth/discord/callback")
 		self.assertIn("qbot4k_oauth_state=", error.exception.headers["Set-Cookie"])
 
+	def test_admin_can_restart_bot_through_configured_systemd_service(self) -> None:
+		cookie = self._issue_operator_session_cookie()
+		with self.opener.open(Request(f"{self.base_url}/dashboard", headers={"Cookie": cookie})) as response:
+			body = response.read().decode("utf-8")
+		self.assertIn("Go Live", body)
+		self.assertIn("Restart Bot", body)
+		self.assertIn("/dashboard/restart", body)
+		self.assertIn("Reset Database", body)
+
+		request = Request(
+			f"{self.base_url}/dashboard/restart",
+			data=b"",
+			headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+			method="POST",
+		)
+		with mock.patch("src.dashboard.server.DashboardApp._schedule_systemd_restart") as schedule_restart:
+			with self.assertRaises(HTTPError) as restart_response:
+				self.opener.open(request)
+
+		self.assertEqual(restart_response.exception.code, 302)
+		self.assertIn("Restart%20requested%20for%20qbot4k.service", restart_response.exception.headers["Location"])
+		restart_response.exception.close()
+		schedule_restart.assert_called_once_with("qbot4k.service")
+
+	def test_admin_can_reset_entire_database_with_explicit_confirmation(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		ingest_and_analyze(
+			connector,
+			{
+				"id": "database-reset-message",
+				"timestamp": "2026-08-10T12:00:00Z",
+				"channel_id": "channel-reset",
+				"guild_id": "guild-1",
+				"content": "message to erase",
+				"author": {"id": "reset-user", "username": "reset_user", "bot": False},
+			},
+		)
+		cookie = self._issue_operator_session_cookie()
+
+		with self.opener.open(Request(f"{self.base_url}/dashboard", headers={"Cookie": cookie})) as response:
+			body = response.read().decode("utf-8")
+		self.assertIn("Reset Database", body)
+		self.assertIn("/dashboard/reset-database", body)
+
+		invalid_request = Request(
+			f"{self.base_url}/dashboard/reset-database",
+			data=b"confirmation=NO",
+			headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as invalid_response:
+			self.opener.open(invalid_request)
+		invalid_response.exception.close()
+
+		connection = connect_database(self.database_path)
+		try:
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]), 1)
+		finally:
+			connection.close()
+
+		reset_request = Request(
+			f"{self.base_url}/dashboard/reset-database",
+			data=b"confirmation=RESET",
+			headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as reset_response:
+			self.opener.open(reset_request)
+		self.assertEqual(reset_response.exception.code, 302)
+		self.assertIn("Database%20reset%20complete", reset_response.exception.headers["Location"])
+		reset_response.exception.close()
+
+		connection = connect_database(self.database_path)
+		try:
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]), 0)
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]), 0)
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM operator_accounts").fetchone()[0]), 0)
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM command_definitions").fetchone()[0]), 1)
+			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM moderation_rules").fetchone()[0]), 1)
+			self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+		finally:
+			connection.close()
+
 	def test_oauth_callback_sets_session_and_unlocks_dashboard(self) -> None:
 		with mock.patch("src.dashboard.server.exchange_discord_code_for_token", return_value="discord-access-token"):
 			with mock.patch(
@@ -956,6 +1039,110 @@ class DashboardTests(unittest.TestCase):
 		self.assertEqual(owner_rows[0][1], 1)
 		self.assertEqual(owner_rows[1][0], "user-link-2")
 		self.assertEqual(owner_rows[1][1], 1)
+
+	def test_admin_can_unlink_platform_account_without_deleting_history(self) -> None:
+		connector = DiscordConnector(self.database_path)
+		ingest_and_analyze(
+			connector,
+			{
+				"id": "discord-msg-unlink-1",
+				"timestamp": "2026-08-10T15:00:00Z",
+				"channel_id": "channel-unlink",
+				"guild_id": "guild-1",
+				"content": "preserve this message",
+				"author": {
+					"id": "user-unlink-1",
+					"username": "viewer_unlink",
+					"bot": False,
+				},
+			},
+		)
+
+		connection = connect_database(self.database_path)
+		try:
+			account = connection.execute(
+				"SELECT id, user_id FROM platform_accounts WHERE platform_user_id = 'user-unlink-1'"
+			).fetchone()
+			self.assertIsNotNone(account)
+			platform_account_id = int(account[0])
+			user_id = int(account[1])
+		finally:
+			connection.close()
+
+		cookie = self._issue_operator_session_cookie()
+		with self.opener.open(Request(f"{self.base_url}/users/{user_id}", headers={"Cookie": cookie})) as response:
+			body = response.read().decode("utf-8")
+		self.assertIn("Linked accounts", body)
+		self.assertIn("/users/unlink", body)
+		self.assertIn("viewer_unlink", body)
+
+		invalid_request = Request(
+			f"{self.base_url}/users/unlink",
+			data=f"user_id={user_id}&platform_account_id={platform_account_id}&confirmation=NO".encode(),
+			headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as invalid_response:
+			self.opener.open(invalid_request)
+		invalid_response.exception.close()
+
+		connection = connect_database(self.database_path)
+		try:
+			self.assertEqual(
+				int(connection.execute("SELECT user_id FROM platform_accounts WHERE id = ?", (platform_account_id,)).fetchone()[0]),
+				user_id,
+			)
+		finally:
+			connection.close()
+
+		unlink_request = Request(
+			f"{self.base_url}/users/unlink",
+			data=f"user_id={user_id}&platform_account_id={platform_account_id}&confirmation=UNLINK".encode(),
+			headers={"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded"},
+			method="POST",
+		)
+		with self.assertRaises(HTTPError) as unlink_response:
+			self.opener.open(unlink_request)
+		self.assertEqual(unlink_response.exception.code, 302)
+		self.assertIn("account_status=", unlink_response.exception.headers["Location"])
+		unlink_response.exception.close()
+
+		connection = connect_database(self.database_path)
+		try:
+			owner = connection.execute(
+				"SELECT user_id, detached_from_user_id FROM platform_accounts WHERE id = ?",
+				(platform_account_id,),
+			).fetchone()
+			message_owner = connection.execute(
+				"SELECT user_id FROM messages WHERE platform_account_id = ?",
+				(platform_account_id,),
+			).fetchone()
+			message_count = int(connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+			audit_count = int(
+				connection.execute(
+					"SELECT COUNT(*) FROM audit_log WHERE action_type = 'user_account_unlink' AND entity_id = ?",
+					(platform_account_id,),
+				).fetchone()[0]
+			)
+			user_count = int(connection.execute("SELECT COUNT(*) FROM users WHERE id = ?", (user_id,)).fetchone()[0])
+		finally:
+			connection.close()
+
+		self.assertIsNone(owner[0])
+		self.assertEqual(int(owner[1]), user_id)
+		self.assertEqual(int(message_owner[0]), user_id)
+		self.assertEqual(message_count, 1)
+		self.assertEqual(audit_count, 1)
+		self.assertEqual(user_count, 1)
+
+		with self.opener.open(Request(f"{self.base_url}/users/{user_id}", headers={"Cookie": cookie})) as response:
+			user_body = response.read().decode("utf-8")
+		self.assertIn("preserve this message", user_body)
+		self.assertIn("No linked accounts", user_body)
+
+		with self.opener.open(Request(f"{self.base_url}/users", headers={"Cookie": cookie})) as response:
+			users_body = response.read().decode("utf-8")
+		self.assertNotIn("viewer_unlink (unlinked)", users_body)
 
 	def test_commands_page_updates_credit_template_for_twitch_and_discord(self) -> None:
 		connection = connect_database(self.database_path)
