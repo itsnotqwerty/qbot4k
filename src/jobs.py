@@ -27,6 +27,13 @@ from .permissions import _everyone_cannot_view
 from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 from .intelligence.signals import refresh_all_derived_signals
+from .intelligence.analytics import (
+	refresh_cohort_baselines,
+	refresh_emerging_topics,
+	refresh_graph_analytics,
+	refresh_identity_suggestions,
+	run_model_evaluation,
+)
 from .pipeline.handlers import recover_expired_processing_jobs
 
 
@@ -55,11 +62,20 @@ _CHANNEL_MATCH_STOPWORDS = {
 @dataclass(frozen=True)
 class MaintenanceReport:
 	deleted_messages: int
+	deleted_observations: int
 	deleted_audit_log_rows: int
+	deleted_signal_runs: int
+	deleted_score_runs: int
+	deleted_processing_jobs: int
 	backup_path: str
 	backup_metadata_path: str
 	backup_sha256: str
 	rollup_rows: int
+	topic_count: int
+	graph_node_count: int
+	identity_suggestion_count: int
+	cohort_baseline_count: int
+	evaluation_run_id: int
 
 
 @dataclass(frozen=True)
@@ -82,8 +98,34 @@ def run_maintenance_jobs(
 		initialize_database(connection)
 		recover_expired_processing_jobs(connection)
 		deleted_messages = purge_expired_messages(connection, current_time, settings.message_retention_days)
+		deleted_observations = purge_expired_observations(
+			connection,
+			current_time,
+			settings.message_retention_days,
+		)
 		deleted_audit_rows = purge_expired_audit_log(connection, current_time, settings.audit_retention_days)
+		deleted_score_runs = purge_expired_score_runs(
+			connection,
+			current_time,
+			settings.message_retention_days,
+		)
+		deleted_signal_runs = purge_expired_signal_runs(
+			connection,
+			current_time,
+			settings.message_retention_days,
+		)
+		deleted_processing_jobs = purge_expired_processing_jobs(
+			connection,
+			current_time,
+			settings.message_retention_days,
+		)
 		refresh_all_derived_signals(connection)
+		with connection:
+			topic_count = refresh_emerging_topics(connection, now=current_time)
+			graph_node_count = refresh_graph_analytics(connection, calculated_at=current_time.isoformat())
+			identity_suggestion_count = refresh_identity_suggestions(connection)
+			cohort_baseline_count, _ = refresh_cohort_baselines(connection, calculated_at=current_time.isoformat())
+			evaluation_run_id = run_model_evaluation(connection)
 		rollup_rows = refresh_metrics_rollups(connection, current_time)
 	finally:
 		connection.close()
@@ -95,11 +137,20 @@ def run_maintenance_jobs(
 	)
 	return MaintenanceReport(
 		deleted_messages=deleted_messages,
+		deleted_observations=deleted_observations,
 		deleted_audit_log_rows=deleted_audit_rows,
+		deleted_signal_runs=deleted_signal_runs,
+		deleted_score_runs=deleted_score_runs,
+		deleted_processing_jobs=deleted_processing_jobs,
 		backup_path=str(backup_path),
 		backup_metadata_path=str(backup_metadata_path),
 		backup_sha256=backup_sha256,
 		rollup_rows=rollup_rows,
+		topic_count=topic_count,
+		graph_node_count=graph_node_count,
+		identity_suggestion_count=identity_suggestion_count,
+		cohort_baseline_count=cohort_baseline_count,
+		evaluation_run_id=evaluation_run_id,
 	)
 
 
@@ -268,7 +319,7 @@ def purge_expired_messages(
 	cutoff = _cutoff_timestamp(now, retention_days)
 	with connection:
 		cursor = connection.execute(
-			"DELETE FROM messages WHERE created_at < ?",
+			"DELETE FROM messages WHERE datetime(sent_at) < datetime(?)",
 			(cutoff,),
 		)
 	return int(cursor.rowcount or 0)
@@ -305,6 +356,63 @@ def purge_expired_audit_log(
 	with connection:
 		cursor = connection.execute(
 			"DELETE FROM audit_log WHERE created_at < ?",
+			(cutoff,),
+		)
+	return int(cursor.rowcount or 0)
+
+
+def purge_expired_signal_runs(
+	connection: sqlite3.Connection,
+	now: datetime,
+	retention_days: int,
+) -> int:
+	cutoff = _cutoff_timestamp(now, retention_days)
+	with connection:
+		cursor = connection.execute(
+			"""
+			DELETE FROM signal_calculation_runs
+			WHERE datetime(calculated_at) < datetime(?)
+			""",
+			(cutoff,),
+		)
+	return int(cursor.rowcount or 0)
+
+
+def purge_expired_score_runs(
+	connection: sqlite3.Connection,
+	now: datetime,
+	retention_days: int,
+) -> int:
+	cutoff = _cutoff_timestamp(now, retention_days)
+	with connection:
+		cursor = connection.execute(
+			"""
+			DELETE FROM social_score_runs
+			WHERE datetime(calculated_at) < datetime(?)
+			  AND id NOT IN (
+				SELECT MAX(id)
+				FROM social_score_runs
+				GROUP BY user_id
+			  )
+			""",
+			(cutoff,),
+		)
+	return int(cursor.rowcount or 0)
+
+
+def purge_expired_processing_jobs(
+	connection: sqlite3.Connection,
+	now: datetime,
+	retention_days: int,
+) -> int:
+	cutoff = _cutoff_timestamp(now, retention_days)
+	with connection:
+		cursor = connection.execute(
+			"""
+			DELETE FROM processing_jobs
+			WHERE status IN ('completed', 'failed', 'cancelled')
+			  AND datetime(COALESCE(completed_at, updated_at, created_at)) < datetime(?)
+			""",
 			(cutoff,),
 		)
 	return int(cursor.rowcount or 0)

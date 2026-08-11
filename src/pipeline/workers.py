@@ -207,6 +207,7 @@ class DiscordWorker:
                     job.id,
                     str(exc),
                 )
+                _fail_moderation_actions_for_job(connection, job)
                 self._last_status = "degraded"
                 self._logger.error(
                     "Action permanently failed "
@@ -221,6 +222,8 @@ class DiscordWorker:
                     job.id,
                     str(exc),
                 )
+                if not retrying:
+                    _fail_moderation_actions_for_job(connection, job)
                 self._last_status = "degraded"
                 self._logger.exception(
                     "Action failed "
@@ -246,3 +249,24 @@ class DiscordWorker:
             "status": self._last_status,
             "worker_id": self.worker_id,
         }
+
+
+def _fail_moderation_actions_for_job(
+    connection,
+    job: AnalysisJob,
+) -> None:
+    if not job.job_type.strip().casefold().endswith(".moderation.execute"):
+        return
+    try:
+        message_id = int(job.payload.get("message_id"))
+    except (TypeError, ValueError):
+        return
+    with connection:
+        connection.execute(
+            """
+            UPDATE moderation_actions
+            SET status = 'failed'
+            WHERE message_id = ? AND status = 'pending'
+            """,
+            (message_id,),
+        )

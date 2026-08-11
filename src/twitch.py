@@ -13,7 +13,9 @@ from .commands import CommandContext, CommandRegistry, build_default_command_reg
 from .db import (
 	connect_database,
 	initialize_database,
+	list_pending_moderation_actions_for_message,
 	list_twitch_channels,
+	mark_moderation_action_completed,
 	record_moderation_action,
 	update_twitch_channel_status,
 	upsert_twitch_channel,
@@ -22,6 +24,7 @@ from .db import (
 from .intelligence.powerusers import record_reputation_evidence, score_delta_for_moderation
 from .intelligence.scoring import calculate_social_score
 from .intelligence.signals import refresh_user_derived_signals
+from .intelligence.events import ingest_event, observation_from_twitch_irc_event
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 
@@ -190,6 +193,12 @@ class TwitchConnector:
 		finally:
 			connection.close()
 
+	def ingest_event(self, raw_line: str) -> CollectionResult | None:
+		observation = observation_from_twitch_irc_event(raw_line)
+		if observation is None:
+			return None
+		return ingest_event(self.database_path, observation)
+
 	def configured_channels(self) -> tuple[str, ...]:
 		connection = connect_database(self.database_path)
 		try:
@@ -222,7 +231,7 @@ class TwitchConnector:
 					irc_reader = irc_socket.makefile("r", encoding="utf-8", newline="\r\n")
 					self._send_irc_line(irc_socket, f"PASS oauth:{token_for_irc}")
 					self._send_irc_line(irc_socket, f"NICK {bot_login}")
-					self._send_irc_line(irc_socket, "CAP REQ :twitch.tv/tags twitch.tv/commands")
+					self._send_irc_line(irc_socket, "CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership")
 					joined_channels = set()
 					for channel_name in channels:
 						self._join_channel(irc_socket, channel_name)
@@ -252,6 +261,7 @@ class TwitchConnector:
 
 						payload = parse_twitch_irc_message(line)
 						if payload is None:
+							self.ingest_event(line)
 							continue
 
 						result = self.ingest_message(
@@ -279,16 +289,41 @@ class TwitchConnector:
 
 	def run_twitch_safely(self, initial_token: str, service_states: dict[str, str]) -> None:
 		twitch_logger = logging.getLogger("qbot4k.twitch")
-		try:
-			self.run_forever(initial_token)
-		except TwitchAuthenticationRequired:
-			service_states["twitch"] = "auth_failed"
-			twitch_logger.error(
-				"Twitch authorization is invalid; reauthorization is required"
+		retry_delay = 1.0
+		while not self._stop_event.is_set():
+			try:
+				self.run_forever(initial_token)
+			except TwitchAuthenticationRequired:
+				service_states["twitch"] = "auth_failed"
+				twitch_logger.error(
+					"Twitch authorization is invalid; reauthorization is required"
+				)
+				return
+			except KeyboardInterrupt:
+				raise
+			except Exception:
+				if self._stop_event.is_set():
+					return
+				service_states["twitch"] = "reconnecting"
+				twitch_logger.exception(
+					"Twitch connector stopped unexpectedly; reconnecting in %.1fs",
+					retry_delay,
+				)
+				if self._stop_event.wait(retry_delay):
+					return
+				retry_delay = min(60.0, retry_delay * 2.0)
+				continue
+
+			if self._stop_event.is_set():
+				return
+			service_states["twitch"] = "reconnecting"
+			twitch_logger.warning(
+				"Twitch connector returned without shutdown; reconnecting in %.1fs",
+				retry_delay,
 			)
-		except Exception:
-			service_states["twitch"] = "down"
-			twitch_logger.exception("Twitch connector stopped unexpectedly")
+			if self._stop_event.wait(retry_delay):
+				return
+			retry_delay = min(60.0, retry_delay * 2.0)
 
 	def _seed_bootstrap_channels(self, connection: object) -> None:
 		for channel_name in self.bootstrap_channels:
@@ -378,6 +413,55 @@ class TwitchConnector:
 			normalized_channel,
 			message,
 		)
+
+	def execute_pending_moderation_actions(
+		self,
+		connection,
+		message_id: int,
+	) -> None:
+		message = connection.execute(
+			"SELECT channel_id FROM messages WHERE id = ? AND platform = 'twitch'",
+			(message_id,),
+		).fetchone()
+		if message is None:
+			raise ValueError(f"Twitch message {message_id} was not found")
+
+		pending_actions = list_pending_moderation_actions_for_message(
+			connection,
+			message_id,
+		)
+		for action in pending_actions:
+			action_id = int(action[0])
+			action_type = str(action[3]).strip().casefold()
+			reason = str(action[4] or action_type).strip()
+			username = str(action[5]).strip()
+			channel_id = str(message[0]).strip()
+			if not username or not channel_id:
+				raise ValueError(
+					f"Twitch moderation action {action_id} has no target or channel"
+				)
+
+			if action_type == "timeout":
+				command = f"/timeout {username} 600 {reason}"
+			elif action_type == "ban":
+				command = f"/ban {username} {reason}"
+			elif action_type == "warn":
+				command = f"@{username} Warning: {reason}"
+			else:
+				raise ValueError(
+					f"Unsupported Twitch moderation action: {action_type}"
+				)
+
+			self.send_message(channel_id, command)
+			mark_moderation_action_completed(connection, action_id)
+			self._logger.warning(
+				"executed twitch moderation action action_id=%s type=%s "
+				"channel=%s user=%s",
+				action_id,
+				action_type,
+				channel_id,
+				username,
+			)
 
 	def _send_irc_line(
 		self,

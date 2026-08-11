@@ -72,13 +72,18 @@ def record_temporal_signal_run(
     if cursor.rowcount == 0:
         return None
     run_id = int(cursor.lastrowid)
+    run_evidence = _trigger_evidence(
+        connection,
+        user_id=user_id,
+        end_at=timestamp,
+        trigger_observation_id=trigger_observation_id,
+    )
 
     window_values: dict[str, dict[str, float]] = {}
     for window_name, duration in WINDOWS:
         values = _calculate_window_values(connection, user_id, timestamp, duration)
         window_values[window_name] = values
-        evidence = _window_evidence(connection, user_id, timestamp, duration)
-        evidence_count = len(evidence)
+        evidence_count = int(values["activity.message_count"])
         confidence = round(min(1.0, evidence_count / 20.0), 4)
         window_start = (
             (datetime.fromisoformat(timestamp).astimezone(timezone.utc) - duration).isoformat()
@@ -132,7 +137,7 @@ def record_temporal_signal_run(
                 (run_id, user_id, signal_key, window_name, SIGNAL_ANALYZER_VERSION, value, json.dumps(details, sort_keys=True), confidence, evidence_count, window_start, window_end, timestamp),
             )
             history_id = int(history_cursor.lastrowid)
-            for observation_evidence_id, message_id in evidence:
+            for observation_evidence_id, message_id in run_evidence:
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO derived_signal_evidence (
@@ -143,8 +148,8 @@ def record_temporal_signal_run(
                 )
 
     velocity = window_values["24h"]["behavior.negative_message_ratio"] - window_values["7d"]["behavior.negative_message_ratio"]
-    evidence = _window_evidence(connection, user_id, timestamp, timedelta(days=7))
-    confidence = round(min(1.0, len(evidence) / 20.0), 4)
+    evidence_count = int(window_values["7d"]["activity.message_count"])
+    confidence = round(min(1.0, evidence_count / 20.0), 4)
     details = {"current_24h": window_values["24h"]["behavior.negative_message_ratio"], "baseline_7d": window_values["7d"]["behavior.negative_message_ratio"]}
     connection.execute(
         """
@@ -158,7 +163,7 @@ def record_temporal_signal_run(
             window_start=excluded.window_start, window_end=excluded.window_end,
             calculated_at=excluded.calculated_at
         """,
-        (user_id, SIGNAL_ANALYZER_VERSION, velocity, json.dumps(details, sort_keys=True), confidence, len(evidence), (datetime.fromisoformat(timestamp) - timedelta(days=7)).isoformat(), timestamp, timestamp),
+        (user_id, SIGNAL_ANALYZER_VERSION, velocity, json.dumps(details, sort_keys=True), confidence, evidence_count, (datetime.fromisoformat(timestamp) - timedelta(days=7)).isoformat(), timestamp, timestamp),
     )
     velocity_history = connection.execute(
         """
@@ -168,10 +173,10 @@ def record_temporal_signal_run(
             window_end, calculated_at
         ) VALUES (?, ?, 'behavior.negative_velocity', '24h_vs_7d', ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (run_id, user_id, SIGNAL_ANALYZER_VERSION, velocity, json.dumps(details, sort_keys=True), confidence, len(evidence), (datetime.fromisoformat(timestamp) - timedelta(days=7)).isoformat(), timestamp, timestamp),
+        (run_id, user_id, SIGNAL_ANALYZER_VERSION, velocity, json.dumps(details, sort_keys=True), confidence, evidence_count, (datetime.fromisoformat(timestamp) - timedelta(days=7)).isoformat(), timestamp, timestamp),
     )
     velocity_history_id = int(velocity_history.lastrowid)
-    for observation_evidence_id, message_id in evidence:
+    for observation_evidence_id, message_id in run_evidence:
         connection.execute(
             """
             INSERT OR IGNORE INTO derived_signal_evidence (
@@ -339,6 +344,16 @@ def dispose_alert(connection: sqlite3.Connection, alert_id: int, disposition: st
         "INSERT INTO audit_log (actor_type, actor_id, action_type, entity_type, entity_id, payload_json) VALUES (?, ?, 'alert.disposed', 'intelligence_alert', ?, ?)",
         ("operator" if operator_id is not None else "system", operator_id, alert_id, json.dumps({"disposition": normalized}, sort_keys=True)),
     )
+    from .analytics import record_evaluation_label
+    record_evaluation_label(
+        connection,
+        alert_id=alert_id,
+        user_id=int(alert[0]) if alert is not None and alert[0] is not None else None,
+        label_key="alert.disposition",
+        label_value="positive" if normalized in {"confirmed", "escalated"} else "negative" if normalized == "benign" else "uncertain",
+        operator_id=operator_id,
+        source="alert_disposition",
+    )
     if alert is not None and alert[0] is not None:
         calculate_social_score(connection, int(alert[0]))
 
@@ -458,15 +473,49 @@ def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_a
     }
 
 
-def _window_evidence(connection: sqlite3.Connection, user_id: int, end_at: str, duration: timedelta | None) -> list[tuple[int | None, int]]:
-    cutoff = (datetime.fromisoformat(end_at).astimezone(timezone.utc) - duration).isoformat() if duration else None
-    condition = "AND messages.sent_at >= ? AND messages.sent_at <= ?" if cutoff else "AND messages.sent_at <= ?"
-    bindings: tuple[object, ...] = (user_id, cutoff, end_at) if cutoff else (user_id, end_at)
-    rows = connection.execute(
-        f"""SELECT messages.observation_id, messages.id FROM messages INNER JOIN platform_accounts ON platform_accounts.id=messages.platform_account_id WHERE COALESCE(messages.user_id, platform_accounts.user_id)=? {condition} ORDER BY messages.sent_at DESC LIMIT 100""",
-        bindings,
-    ).fetchall()
-    return [(int(row[0]) if row[0] is not None else None, int(row[1])) for row in rows]
+def _trigger_evidence(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    end_at: str,
+    trigger_observation_id: int | None,
+) -> list[tuple[int | None, int]]:
+    if trigger_observation_id is not None:
+        row = connection.execute(
+            """
+            SELECT messages.observation_id, messages.id
+            FROM messages
+            INNER JOIN platform_accounts
+                ON platform_accounts.id = messages.platform_account_id
+            WHERE messages.observation_id = ?
+              AND COALESCE(messages.user_id, platform_accounts.user_id) = ?
+            """,
+            (trigger_observation_id, user_id),
+        ).fetchone()
+        if row is not None:
+            return [(int(row[0]), int(row[1]))]
+
+    row = connection.execute(
+        """
+        SELECT messages.observation_id, messages.id
+        FROM messages
+        INNER JOIN platform_accounts
+            ON platform_accounts.id = messages.platform_account_id
+        WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
+          AND messages.sent_at <= ?
+        ORDER BY messages.sent_at DESC, messages.id DESC
+        LIMIT 1
+        """,
+        (user_id, end_at),
+    ).fetchone()
+    if row is None:
+        return []
+    return [
+        (
+            int(row[0]) if row[0] is not None else None,
+            int(row[1]),
+        )
+    ]
 
 
 def _upsert_relationship(connection: sqlite3.Connection, source: int, target: int, kind: str, context: str, occurred_at: str, evidence: Mapping[str, object]) -> None:

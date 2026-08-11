@@ -19,6 +19,7 @@ from statistics import NormalDist
 from ..config import AppSettings
 from ..db import (
     connect_database,
+	collect_observation,
 	database_health,
 	delete_simple_command_definition,
 	initialize_database,
@@ -31,6 +32,7 @@ from ..db import (
 	upsert_command_definition,
 	upsert_simple_command_definition,
 )
+from ..models import Observation, coerce_timestamp
 from ..intelligence.userprofiles import (
     add_user_note,
 	create_canonical_user,
@@ -51,6 +53,9 @@ from ..intelligence.workflows import (
 	generate_intelligence_report,
 	intelligence_summary,
 )
+from ..intelligence.search import list_saved_queries, observation_pivots, save_query, search_observations
+from ..intelligence.analytics import analytics_snapshot, review_identity_suggestion
+from ..intelligence.events import SUPPORTED_EVENT_TYPES, collect_external_feed_item
 from ..jobs import send_manual_twitch_live_announcements
 from .auth import (
     DashboardSession,
@@ -140,6 +145,15 @@ class DashboardApp:
 		if handler.command == "GET" and path == "/intelligence":
 			self._serve_intelligence(handler, parse_qs(parsed.query))
 			return True
+		if handler.command == "GET" and path == "/search":
+			self._serve_search(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "POST" and path == "/search/saved":
+			self._serve_search_save(handler)
+			return True
+		if handler.command == "GET" and path == "/analytics":
+			self._serve_analytics(handler, parse_qs(parsed.query))
+			return True
 		if handler.command == "GET" and path.startswith("/intelligence/cases/"):
 			self._serve_intelligence_case(handler, path)
 			return True
@@ -194,7 +208,28 @@ class DashboardApp:
 			self._serve_api_signals(handler, parse_qs(parsed.query))
 			return True
 		if handler.command == "GET" and path == "/api/intelligence":
-			self._serve_api_intelligence(handler)
+			self._serve_api_intelligence(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "GET" and path == "/api/search":
+			self._serve_api_search(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "POST" and path == "/api/search/saved":
+			self._serve_api_save_query(handler)
+			return True
+		if handler.command == "GET" and path.startswith("/api/observations/") and path.endswith("/pivots"):
+			self._serve_api_observation_pivots(handler, path)
+			return True
+		if handler.command == "GET" and path == "/api/analytics":
+			self._serve_api_analytics(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "POST" and path.startswith("/api/identity-suggestions/"):
+			self._serve_api_identity_review(handler, path)
+			return True
+		if handler.command == "POST" and path == "/api/external/observations":
+			self._serve_api_external_observation(handler)
+			return True
+		if handler.command == "POST" and path == "/api/events":
+			self._serve_api_event(handler)
 			return True
 		if handler.command == "GET" and path.startswith("/api/intelligence/reports/"):
 			self._serve_api_intelligence_report(handler, path)
@@ -1400,6 +1435,219 @@ class DashboardApp:
 			connection.close()
 		self._send_json(handler, HTTPStatus.OK, {"overview": overview.__dict__, "services": dict(self.service_states)})
 
+	def _serve_search(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			items = self._search_items(connection, query)
+			saved = list_saved_queries(connection)
+		finally:
+			connection.close()
+		rows = "".join(
+			f"<tr><td>{item['id']}</td><td>{self._escape(item['occurred_at'])}</td><td>{self._escape(item['platform'])}</td>"
+			f"<td>{self._escape(item['event_type'])}</td><td>{self._escape(item.get('text_raw') or '')}</td>"
+			f"<td><a href='/api/observations/{item['id']}/pivots'>Pivots</a></td></tr>" for item in items
+		) or "<tr><td colspan='6'>No matching observations.</td></tr>"
+		saved_options = "".join(f"<li><a href='/search?q={quote(str(item['query_text']))}'>{self._escape(item['name'])}</a></li>" for item in saved) or "<li>No saved queries.</li>"
+		content = (
+			"<section class='hero'><div><p class='eyebrow'>Investigation</p><h1>Observation search</h1>"
+			"<p class='lede'>Full-text search with temporal, entity, user, platform, and event filters.</p></div></section>"
+			"<section class='card'><form class='search' method='get' action='/search'>"
+			f"<input name='q' placeholder='Terms or phrases' value='{self._escape((query.get('q') or [''])[0])}'>"
+			"<input name='start_at' placeholder='Start ISO timestamp'><input name='end_at' placeholder='End ISO timestamp'>"
+			"<input name='platform' placeholder='Platform'><input name='event_type' placeholder='Event type'>"
+			"<input name='user_id' placeholder='User ID'><input name='context_id' placeholder='Context'>"
+			"<input name='entity_type' placeholder='Entity type'><input name='entity_value' placeholder='Entity value'>"
+			"<button type='submit'>Search</button></form></section>"
+			f"<section class='card'><h2>Results</h2><div class='table-scroll'><table class='table'><thead><tr><th>ID</th><th>Time</th><th>Platform</th><th>Event</th><th>Content</th><th>Investigate</th></tr></thead><tbody>{rows}</tbody></table></div></section>"
+			f"<section class='card'><h2>Saved queries</h2><form class='toolbar' method='post' action='/search/saved'><input name='name' placeholder='Query name' required><input name='q' value='{self._escape((query.get('q') or [''])[0])}' placeholder='Full-text query'><button type='submit'>Save query</button></form><ul>{saved_options}</ul></section>"
+		)
+		self._send_html(handler, HTTPStatus.OK, self._render_page("Search", session, content))
+
+	def _serve_search_save(self, handler: BaseHTTPRequestHandler) -> None:
+		if self._require_session(handler) is None:
+			return
+		form = self._read_form_body(handler)
+		if form is None: return
+		name = (form.get("name") or [""])[0]; query_text = (form.get("q") or [""])[0]
+		try:
+			connection = connect_database(self.settings.database_path); initialize_database(connection)
+			with connection: save_query(connection, name, query_text, {})
+		except ValueError as exc:
+			self._send_text(handler, HTTPStatus.BAD_REQUEST, str(exc)); return
+		finally:
+			if 'connection' in locals(): connection.close()
+		self._redirect(handler, f"/search?q={quote(query_text)}")
+
+	def _serve_analytics(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		sorts = self._normalize_analytics_sorts(query)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			snapshot = analytics_snapshot(connection, sorts=sorts)
+		finally:
+			connection.close()
+
+		def analytics_query(table_name: str, sort: str, direction: str) -> str:
+			params: dict[str, str] = {}
+			for key, (sort_by, sort_dir) in sorts.items():
+				params[f"{key}_sort"] = sort_by
+				params[f"{key}_dir"] = sort_dir
+			params[f"{table_name}_sort"] = sort
+			params[f"{table_name}_dir"] = direction
+			return urlencode(params)
+
+		def table(table_name, items, columns):
+			current_sort, current_dir = sorts[table_name]
+			head_parts = []
+			for column in columns:
+				is_current = current_sort == column
+				default_dir = "asc" if column in self._analytics_text_columns(table_name) else "desc"
+				next_dir = ("asc" if current_dir == "desc" else "desc") if is_current else default_dir
+				indicator = " ↑" if is_current and current_dir == "asc" else " ↓" if is_current else ""
+				label = column.replace("_", " ").title() + indicator
+				head_parts.append(f"<th><a href='/analytics?{analytics_query(table_name, column, next_dir)}'>{self._escape(label)}</a></th>")
+			head = "".join(head_parts)
+			body = "".join("<tr>" + "".join(f"<td>{self._escape(item.get(column, ''))}</td>" for column in columns) + "</tr>" for item in items)
+			return f"<table><thead><tr>{head}</tr></thead><tbody>{body or '<tr><td>No data yet.</td></tr>'}</tbody></table>"
+		content = "<section class='hero'><div><p class='eyebrow'>Analytical breadth</p><h1>Intelligence analytics</h1><p class='lede'>Emergence, networks, identity hypotheses, cohort deviations, and model quality.</p></div></section>"
+		content += "<section class='card'><h2>Emerging topics</h2>" + table("topics", snapshot["topics"], ["topic_kind", "label", "velocity", "community_count", "unusualness"]) + "</section>"
+		content += "<section class='card'><h2>Graph influence</h2>" + table("graph", snapshot["graph"], ["user_id", "pagerank", "betweenness", "is_bridge", "cluster_id", "influence_score"]) + "</section>"
+		content += "<section class='card'><h2>Identity suggestions</h2>" + table("identity_suggestions", snapshot["identity_suggestions"], ["id", "left_platform_account_id", "right_platform_account_id", "confidence", "status"]) + "</section>"
+		content += "<section class='card'><h2>Cohort anomalies</h2>" + table("cohort_anomalies", snapshot["cohort_anomalies"], ["user_id", "cohort_key", "signal_key", "z_score", "direction", "confidence"]) + "</section>"
+		content += "<section class='card'><h2>Model evaluation</h2>" + table("evaluation", snapshot["evaluation"], ["model_key", "model_version", "sample_size", "calculated_at"]) + "</section>"
+		self._send_html(handler, HTTPStatus.OK, self._render_page("Analytics", session, content))
+
+	def _serve_api_search(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		if self._require_session(handler) is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			items = self._search_items(connection, query)
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"items": items})
+
+	def _search_items(self, connection, query: Mapping[str, list[str]]) -> list[dict[str, object]]:
+		value = lambda key: (query.get(key) or [""])[0].strip() or None
+		user_raw = value("user_id")
+		return search_observations(
+			connection, query=value("q") or "", start_at=value("start_at"), end_at=value("end_at"),
+			platform=value("platform"), event_type=value("event_type"), user_id=int(user_raw) if user_raw and user_raw.isdigit() else None,
+			container_id=value("container_id"), context_id=value("context_id"), entity_type=value("entity_type"),
+			entity_value=value("entity_value"), limit=int(value("limit") or 100), offset=int(value("offset") or 0),
+		)
+
+	def _serve_api_save_query(self, handler: BaseHTTPRequestHandler) -> None:
+		if self._require_session(handler) is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		try:
+			connection = connect_database(self.settings.database_path); initialize_database(connection)
+			with connection:
+				query_id = save_query(connection, str(payload.get("name") or ""), str(payload.get("query") or ""), payload.get("filters") if isinstance(payload.get("filters"), dict) else {})
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"id": query_id, "status": "saved"})
+
+	def _serve_api_observation_pivots(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		if self._require_session(handler) is None:
+			return
+		try:
+			observation_id = int(path.split("/")[3])
+			connection = connect_database(self.settings.database_path); initialize_database(connection)
+			payload = observation_pivots(connection, observation_id)
+		except (ValueError, IndexError):
+			self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "observation_not_found"}); return
+		finally:
+			if 'connection' in locals(): connection.close()
+		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _serve_api_analytics(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
+		if self._require_session(handler) is None:
+			return
+		sorts = self._normalize_analytics_sorts(query)
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection); payload = analytics_snapshot(connection, sorts=sorts)
+		finally:
+			connection.close()
+		payload["sort"] = {key: {"by": value[0], "dir": value[1]} for key, value in sorts.items()}
+		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _serve_api_identity_review(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		if self._require_session(handler, admin_only=True) is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None: return
+		try:
+			suggestion_id = int(path.rstrip('/').split('/')[-1]); connection = connect_database(self.settings.database_path); initialize_database(connection)
+			with connection: review_identity_suggestion(connection, suggestion_id, str(payload.get("decision") or ""))
+		except ValueError as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)}); return
+		finally:
+			if 'connection' in locals(): connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"status": "reviewed"})
+
+	def _serve_api_external_observation(self, handler: BaseHTTPRequestHandler) -> None:
+		if self._require_session(handler, admin_only=True) is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None: return
+		try:
+			connection = connect_database(self.settings.database_path); initialize_database(connection)
+			result = collect_external_feed_item(
+				connection, source_key=str(payload.get("source_key") or ""), external_event_id=str(payload.get("external_event_id") or ""),
+				text=str(payload.get("text") or ""), occurred_at=str(payload.get("occurred_at") or "") or None,
+				display_name=str(payload.get("display_name") or "") or None, source_type=str(payload.get("source_type") or "api"),
+				actor_id=str(payload.get("actor_id") or "") or None, context_id=str(payload.get("context_id") or "") or None,
+				attributes=payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {}, trust_weight=float(payload.get("trust_weight") or 0.5),
+			)
+		except (ValueError, TypeError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)}); return
+		finally:
+			if 'connection' in locals(): connection.close()
+		self._send_json(handler, HTTPStatus.CREATED, {"status": result.status, "observation_id": result.observation_id, "analysis_job_id": result.analysis_job_id})
+
+	def _serve_api_event(self, handler: BaseHTTPRequestHandler) -> None:
+		if self._require_session(handler, admin_only=True) is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None: return
+		try:
+			event_type = str(payload.get("event_type") or "").strip().casefold()
+			if event_type not in SUPPORTED_EVENT_TYPES:
+				raise ValueError("unsupported event_type")
+			observation = Observation(
+				platform=str(payload.get("platform") or "").strip(), event_type=event_type,
+				external_event_id=str(payload.get("external_event_id") or "").strip() or None,
+				actor_platform_user_id=str(payload.get("actor_platform_user_id") or "").strip() or None,
+				actor_username=str(payload.get("actor_username") or "").strip() or None,
+				target_platform_user_id=str(payload.get("target_platform_user_id") or "").strip() or None,
+				container_id=str(payload.get("container_id") or "").strip() or None,
+				context_id=str(payload.get("context_id") or "").strip() or None,
+				text=str(payload.get("text") or "") or None, occurred_at=coerce_timestamp(str(payload.get("occurred_at") or "") or None),
+				attributes=payload.get("attributes") if isinstance(payload.get("attributes"), dict) else {},
+			)
+			if not observation.platform:
+				raise ValueError("platform is required")
+			connection = connect_database(self.settings.database_path); initialize_database(connection)
+			result = collect_observation(connection, observation)
+		except (ValueError, TypeError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)}); return
+		finally:
+			if 'connection' in locals(): connection.close()
+		self._send_json(handler, HTTPStatus.CREATED, {"status": result.status, "observation_id": result.observation_id, "analysis_job_id": result.analysis_job_id})
+
 	def _serve_api_users(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
 		if session is None:
@@ -1421,6 +1669,12 @@ class DashboardApp:
 		session = self._require_session(handler)
 		if session is None:
 			return
+		alert_sort, alert_dir = self._normalize_alert_sort(query)
+		case_sort, case_dir = self._normalize_case_sort(query)
+		relationship_sort, relationship_dir = self._normalize_relationship_sort(query)
+		alert_order = self._alert_order_clause(alert_sort, alert_dir)
+		case_order = self._case_order_clause(case_sort, case_dir)
+		relationship_order = self._relationship_order_clause(relationship_sort, relationship_dir)
 		connection = connect_database(self.settings.database_path)
 		try:
 			initialize_database(connection)
@@ -1430,8 +1684,7 @@ class DashboardApp:
 				SELECT intelligence_alerts.*, users.primary_display_name
 				FROM intelligence_alerts
 				LEFT JOIN users ON users.id = intelligence_alerts.user_id
-				ORDER BY CASE intelligence_alerts.status WHEN 'open' THEN 0 WHEN 'in_case' THEN 1 ELSE 2 END,
-				         intelligence_alerts.created_at DESC
+				ORDER BY """ + alert_order + """
 				LIMIT 100
 				"""
 			).fetchall()
@@ -1443,7 +1696,7 @@ class DashboardApp:
 				LEFT JOIN case_entities ON case_entities.case_id = investigation_cases.id
 				LEFT JOIN case_evidence ON case_evidence.case_id = investigation_cases.id
 				GROUP BY investigation_cases.id
-				ORDER BY investigation_cases.updated_at DESC LIMIT 50
+				ORDER BY """ + case_order + """ LIMIT 50
 				"""
 			).fetchall()
 			relationships = connection.execute(
@@ -1453,7 +1706,7 @@ class DashboardApp:
 				FROM entity_relationships
 				INNER JOIN users source ON source.id = entity_relationships.source_user_id
 				INNER JOIN users target ON target.id = entity_relationships.target_user_id
-				ORDER BY entity_relationships.strength DESC, entity_relationships.last_observed_at DESC
+				ORDER BY """ + relationship_order + """
 				LIMIT 100
 				"""
 			).fetchall()
@@ -1462,6 +1715,31 @@ class DashboardApp:
 			).fetchall()
 		finally:
 			connection.close()
+
+		def _intelligence_query(**overrides: object) -> str:
+			params: dict[str, str] = {
+				"alert_sort": alert_sort, "alert_dir": alert_dir,
+				"case_sort": case_sort, "case_dir": case_dir,
+				"relationship_sort": relationship_sort, "relationship_dir": relationship_dir,
+			}
+			params.update({key: str(value) for key, value in overrides.items()})
+			return urlencode(params)
+
+		def _sort_header(label: str, key: str, *, table: str, current_sort: str, current_dir: str, ascending_keys: set[str]) -> str:
+			is_current = current_sort == key
+			default_dir = "asc" if key in ascending_keys else "desc"
+			next_dir = ("asc" if current_dir == "desc" else "desc") if is_current else default_dir
+			indicator = " ↑" if is_current and current_dir == "asc" else " ↓" if is_current else ""
+			return f"<a href='/intelligence?{_intelligence_query(**{table + '_sort': key, table + '_dir': next_dir})}'>{self._escape(label + indicator)}</a>"
+
+		def _alert_header(label: str, key: str) -> str:
+			return _sort_header(label, key, table="alert", current_sort=alert_sort, current_dir=alert_dir, ascending_keys={"subject", "finding", "status"})
+
+		def _case_header(label: str, key: str) -> str:
+			return _sort_header(label, key, table="case", current_sort=case_sort, current_dir=case_dir, ascending_keys={"case", "status"})
+
+		def _relationship_header(label: str, key: str) -> str:
+			return _sort_header(label, key, table="relationship", current_sort=relationship_sort, current_dir=relationship_dir, ascending_keys={"source", "relationship", "target"})
 
 		alert_rows = "".join(
 			"<tr>"
@@ -1495,9 +1773,9 @@ class DashboardApp:
 			"<section class='hero'><p class='eyebrow'>Operations</p><h1>Intelligence workspace</h1><p class='lede'>Temporal signals, evidence-backed alerts, investigations, entity relationships, and reproducible reports.</p></section>"
 			+ status_html
 			+ f"<div class='grid'><div class='metric'><div class='label'>Active alerts</div><div class='value'>{summary.open_alerts}</div></div><div class='metric'><div class='label'>Open cases</div><div class='value'>{summary.open_cases}</div></div><div class='metric'><div class='label'>Relationships</div><div class='value'>{summary.relationships}</div></div><div class='metric'><div class='label'>Reports</div><div class='value'>{summary.reports}</div></div></div>"
-			+ f"<section class='card'><h2>Alerts</h2><div class='table-scroll'><table class='table'><thead><tr><th>Severity</th><th>Subject</th><th>Finding</th><th>Confidence</th><th>Status</th><th>Disposition</th></tr></thead><tbody>{alert_rows or '<tr><td colspan=6>No alerts</td></tr>'}</tbody></table></div></section>"
-			+ f"<section class='card'><h2>Cases</h2><div class='table-scroll'><table class='table'><thead><tr><th>Case</th><th>Priority</th><th>Status</th><th>Entities</th><th>Evidence</th><th>Updated</th></tr></thead><tbody>{case_rows or '<tr><td colspan=6>No cases</td></tr>'}</tbody></table></div></section>"
-			+ f"<section class='card'><h2>Relationships</h2><div class='table-scroll'><table class='table'><thead><tr><th>Source</th><th>Relationship</th><th>Target</th><th>Strength</th><th>Evidence</th><th>Last observed</th></tr></thead><tbody>{relationship_rows or '<tr><td colspan=6>No relationships</td></tr>'}</tbody></table></div></section>"
+			+ f"<section class='card'><h2>Alerts</h2><div class='table-scroll'><table class='table'><thead><tr><th>{_alert_header('Severity', 'severity')}</th><th>{_alert_header('Subject', 'subject')}</th><th>{_alert_header('Finding', 'finding')}</th><th>{_alert_header('Confidence', 'confidence')}</th><th>{_alert_header('Status', 'status')}</th><th>Disposition</th></tr></thead><tbody>{alert_rows or '<tr><td colspan=6>No alerts</td></tr>'}</tbody></table></div></section>"
+			+ f"<section class='card'><h2>Cases</h2><div class='table-scroll'><table class='table'><thead><tr><th>{_case_header('Case', 'case')}</th><th>{_case_header('Priority', 'priority')}</th><th>{_case_header('Status', 'status')}</th><th>{_case_header('Entities', 'entities')}</th><th>{_case_header('Evidence', 'evidence')}</th><th>{_case_header('Updated', 'updated')}</th></tr></thead><tbody>{case_rows or '<tr><td colspan=6>No cases</td></tr>'}</tbody></table></div></section>"
+			+ f"<section class='card'><h2>Relationships</h2><div class='table-scroll'><table class='table'><thead><tr><th>{_relationship_header('Source', 'source')}</th><th>{_relationship_header('Relationship', 'relationship')}</th><th>{_relationship_header('Target', 'target')}</th><th>{_relationship_header('Strength', 'strength')}</th><th>{_relationship_header('Evidence', 'evidence')}</th><th>{_relationship_header('Last observed', 'last_observed')}</th></tr></thead><tbody>{relationship_rows or '<tr><td colspan=6>No relationships</td></tr>'}</tbody></table></div></section>"
 			+ "<section class='card'><h2>Reports</h2><form class='toolbar' method='post' action='/intelligence/reports/generate'><select name='report_type'><option value='daily_summary'>Daily summary</option><option value='entity_profile'>Entity profile</option></select><input name='user_id' type='number' min='1' placeholder='User ID (entity only)'><button type='submit'>Generate report</button></form>"
 			+ f"<div class='table-scroll'><table class='table'><thead><tr><th>Type</th><th>Report</th><th>Generated</th><th>Export</th></tr></thead><tbody>{report_rows or '<tr><td colspan=4>No reports</td></tr>'}</tbody></table></div></section>",
 		)
@@ -1605,21 +1883,54 @@ class DashboardApp:
 			connection.close()
 		self._redirect(handler, f"/api/intelligence/reports/{report_id}")
 
-	def _serve_api_intelligence(self, handler: BaseHTTPRequestHandler) -> None:
+	def _serve_api_intelligence(self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]) -> None:
 		session = self._require_session(handler)
 		if session is None:
 			return
+		alert_sort, alert_dir = self._normalize_alert_sort(query)
+		case_sort, case_dir = self._normalize_case_sort(query)
+		relationship_sort, relationship_dir = self._normalize_relationship_sort(query)
+		alert_order = self._alert_order_clause(alert_sort, alert_dir)
+		case_order = self._case_order_clause(case_sort, case_dir)
+		relationship_order = self._relationship_order_clause(relationship_sort, relationship_dir)
 		connection = connect_database(self.settings.database_path)
 		try:
 			initialize_database(connection)
 			summary = intelligence_summary(connection)
-			alerts = [dict(row) for row in connection.execute("SELECT * FROM intelligence_alerts ORDER BY created_at DESC LIMIT 500").fetchall()]
-			cases = [dict(row) for row in connection.execute("SELECT * FROM investigation_cases ORDER BY updated_at DESC LIMIT 500").fetchall()]
-			relationships = [dict(row) for row in connection.execute("SELECT * FROM entity_relationships ORDER BY strength DESC LIMIT 500").fetchall()]
+			alerts = [dict(row) for row in connection.execute(
+				"""SELECT intelligence_alerts.*, users.primary_display_name
+				   FROM intelligence_alerts
+				   LEFT JOIN users ON users.id=intelligence_alerts.user_id
+				   ORDER BY """ + alert_order + " LIMIT 500"
+			).fetchall()]
+			cases = [dict(row) for row in connection.execute(
+				"""SELECT investigation_cases.*, COUNT(DISTINCT case_entities.user_id) AS entity_count,
+				          COUNT(DISTINCT case_evidence.id) AS evidence_count
+				   FROM investigation_cases
+				   LEFT JOIN case_entities ON case_entities.case_id=investigation_cases.id
+				   LEFT JOIN case_evidence ON case_evidence.case_id=investigation_cases.id
+				   GROUP BY investigation_cases.id ORDER BY """ + case_order + " LIMIT 500"
+			).fetchall()]
+			relationships = [dict(row) for row in connection.execute(
+				"""SELECT entity_relationships.*, source.primary_display_name AS source_name,
+				          target.primary_display_name AS target_name
+				   FROM entity_relationships
+				   INNER JOIN users source ON source.id=entity_relationships.source_user_id
+				   INNER JOIN users target ON target.id=entity_relationships.target_user_id
+				   ORDER BY """ + relationship_order + " LIMIT 500"
+			).fetchall()]
 			reports = [dict(row) for row in connection.execute("SELECT id, report_type, subject_user_id, title, summary, generated_at, generator_version FROM intelligence_reports ORDER BY generated_at DESC LIMIT 500").fetchall()]
 		finally:
 			connection.close()
-		self._send_json(handler, HTTPStatus.OK, {"summary": asdict(summary), "alerts": alerts, "cases": cases, "relationships": relationships, "reports": reports})
+		self._send_json(handler, HTTPStatus.OK, {
+			"summary": asdict(summary),
+			"sort": {
+				"alerts": {"by": alert_sort, "dir": alert_dir},
+				"cases": {"by": case_sort, "dir": case_dir},
+				"relationships": {"by": relationship_sort, "dir": relationship_dir},
+			},
+			"alerts": alerts, "cases": cases, "relationships": relationships, "reports": reports,
+		})
 
 	def _serve_api_intelligence_report(self, handler: BaseHTTPRequestHandler, path: str) -> None:
 		session = self._require_session(handler)
@@ -1704,6 +2015,116 @@ class DashboardApp:
 		if sort_dir not in {"asc", "desc"}:
 			sort_dir = default_dir
 		return sort_by, sort_dir
+
+	def _normalize_alert_sort(self, query: Mapping[str, list[str]]) -> tuple[str, str]:
+		sort_by = (query.get("alert_sort") or query.get("sort") or ["default"])[0].strip().casefold()
+		if sort_by not in {"default", "severity", "subject", "finding", "confidence", "status"}:
+			sort_by = "default"
+		sort_dir = (query.get("alert_dir") or query.get("dir") or [""])[0].strip().casefold()
+		default_dir = "asc" if sort_by in {"subject", "finding", "status"} else "desc"
+		if sort_dir not in {"asc", "desc"}:
+			sort_dir = default_dir
+		if sort_by == "default":
+			sort_dir = "desc"
+		return sort_by, sort_dir
+
+	def _normalize_case_sort(self, query: Mapping[str, list[str]]) -> tuple[str, str]:
+		sort_by = (query.get("case_sort") or ["default"])[0].strip().casefold()
+		if sort_by not in {"default", "case", "priority", "status", "entities", "evidence", "updated"}:
+			sort_by = "default"
+		sort_dir = (query.get("case_dir") or [""])[0].strip().casefold()
+		default_dir = "asc" if sort_by in {"case", "status"} else "desc"
+		if sort_dir not in {"asc", "desc"}:
+			sort_dir = default_dir
+		if sort_by == "default":
+			sort_dir = "desc"
+		return sort_by, sort_dir
+
+	def _normalize_relationship_sort(self, query: Mapping[str, list[str]]) -> tuple[str, str]:
+		sort_by = (query.get("relationship_sort") or ["default"])[0].strip().casefold()
+		if sort_by not in {"default", "source", "relationship", "target", "strength", "evidence", "last_observed"}:
+			sort_by = "default"
+		sort_dir = (query.get("relationship_dir") or [""])[0].strip().casefold()
+		default_dir = "asc" if sort_by in {"source", "relationship", "target"} else "desc"
+		if sort_dir not in {"asc", "desc"}:
+			sort_dir = default_dir
+		if sort_by == "default":
+			sort_dir = "desc"
+		return sort_by, sort_dir
+
+	def _alert_order_clause(self, sort_by: str, sort_dir: str) -> str:
+		direction = "ASC" if sort_dir == "asc" else "DESC"
+		severity_rank = "CASE lower(intelligence_alerts.severity) WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
+		status_rank = "CASE lower(intelligence_alerts.status) WHEN 'open' THEN 1 WHEN 'in_case' THEN 2 WHEN 'resolved' THEN 3 ELSE 4 END"
+		columns = {
+			"severity": severity_rank,
+			"subject": "COALESCE(users.primary_display_name, '') COLLATE NOCASE",
+			"finding": "intelligence_alerts.title COLLATE NOCASE",
+			"confidence": "intelligence_alerts.confidence",
+			"status": status_rank,
+		}
+		if sort_by == "default":
+			return status_rank + " ASC, intelligence_alerts.created_at DESC, intelligence_alerts.id DESC"
+		return columns[sort_by] + f" {direction}, intelligence_alerts.created_at DESC, intelligence_alerts.id DESC"
+
+	def _case_order_clause(self, sort_by: str, sort_dir: str) -> str:
+		direction = "ASC" if sort_dir == "asc" else "DESC"
+		priority_rank = "CASE lower(investigation_cases.priority) WHEN 'critical' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'low' THEN 2 WHEN 'info' THEN 1 ELSE 0 END"
+		status_rank = "CASE lower(investigation_cases.status) WHEN 'open' THEN 1 WHEN 'active' THEN 2 WHEN 'pending' THEN 3 WHEN 'closed' THEN 4 ELSE 5 END"
+		columns = {
+			"case": "investigation_cases.title COLLATE NOCASE",
+			"priority": priority_rank,
+			"status": status_rank,
+			"entities": "entity_count",
+			"evidence": "evidence_count",
+			"updated": "investigation_cases.updated_at",
+		}
+		if sort_by == "default":
+			return "investigation_cases.updated_at DESC, investigation_cases.id DESC"
+		return columns[sort_by] + f" {direction}, investigation_cases.updated_at DESC, investigation_cases.id DESC"
+
+	def _relationship_order_clause(self, sort_by: str, sort_dir: str) -> str:
+		direction = "ASC" if sort_dir == "asc" else "DESC"
+		columns = {
+			"source": "source.primary_display_name COLLATE NOCASE",
+			"relationship": "entity_relationships.relationship_type COLLATE NOCASE",
+			"target": "target.primary_display_name COLLATE NOCASE",
+			"strength": "entity_relationships.strength",
+			"evidence": "entity_relationships.evidence_count",
+			"last_observed": "entity_relationships.last_observed_at",
+		}
+		if sort_by == "default":
+			return "entity_relationships.strength DESC, entity_relationships.last_observed_at DESC, entity_relationships.id DESC"
+		return columns[sort_by] + f" {direction}, entity_relationships.last_observed_at DESC, entity_relationships.id DESC"
+
+	def _normalize_analytics_sorts(self, query: Mapping[str, list[str]]) -> dict[str, tuple[str, str]]:
+		specs = {
+			"topics": ({"topic_kind", "label", "velocity", "community_count", "unusualness"}, "unusualness"),
+			"graph": ({"user_id", "pagerank", "betweenness", "is_bridge", "cluster_id", "influence_score"}, "influence_score"),
+			"identity_suggestions": ({"id", "left_platform_account_id", "right_platform_account_id", "confidence", "status"}, "confidence"),
+			"cohort_anomalies": ({"user_id", "cohort_key", "signal_key", "z_score", "direction", "confidence"}, "z_score"),
+			"evaluation": ({"model_key", "model_version", "sample_size", "calculated_at"}, "calculated_at"),
+		}
+		result: dict[str, tuple[str, str]] = {}
+		for table_name, (allowed, default_sort) in specs.items():
+			sort_by = (query.get(f"{table_name}_sort") or [default_sort])[0].strip().casefold()
+			if sort_by not in allowed:
+				sort_by = default_sort
+			sort_dir = (query.get(f"{table_name}_dir") or [""])[0].strip().casefold()
+			default_dir = "asc" if sort_by in self._analytics_text_columns(table_name) else "desc"
+			if sort_dir not in {"asc", "desc"}:
+				sort_dir = default_dir
+			result[table_name] = (sort_by, sort_dir)
+		return result
+
+	def _analytics_text_columns(self, table_name: str) -> set[str]:
+		return {
+			"topics": {"topic_kind", "label"},
+			"graph": set(),
+			"identity_suggestions": {"status"},
+			"cohort_anomalies": {"cohort_key", "signal_key", "direction"},
+			"evaluation": {"model_key"},
+		}.get(table_name, set())
 
 	def _serve_api_user_detail(self, handler: BaseHTTPRequestHandler, path: str) -> None:
 		session = self._require_session(handler)
@@ -2187,6 +2608,8 @@ table textarea {{
 <a href='/system-health'>Health</a>
 <a href='/signals'>Signals</a>
 <a href='/intelligence'>Intelligence</a>
+<a href='/search'>Search</a>
+<a href='/analytics'>Analytics</a>
 <a href='/users'>Users</a>
 <a href='/moderation'>Moderation</a>
 		<a href='/commands'>Commands</a>

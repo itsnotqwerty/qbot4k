@@ -76,6 +76,157 @@ class DashboardTests(unittest.TestCase):
 		session_cookie = next(cookie for cookie in cookies if cookie.startswith("qbot4k_session="))
 		return session_cookie.split(";", 1)[0]
 
+	def _seed_sortable_intelligence(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			with connection:
+				user_ids = {}
+				for name in ("Alice", "Bob", "Carol"):
+					cursor = connection.execute("INSERT INTO users(primary_display_name) VALUES (?)", (name,))
+					user_ids[name] = int(cursor.lastrowid)
+				alerts = (
+					("Alice", "high", "Alpha finding", 0.90, "open", "2026-08-11T01:00:00+00:00"),
+					("Bob", "low", "Zulu finding", 0.20, "resolved", "2026-08-11T02:00:00+00:00"),
+					("Carol", "critical", "Middle finding", 0.60, "in_case", "2026-08-11T03:00:00+00:00"),
+				)
+				alert_ids = []
+				for index, (name, severity, title, confidence, status, created_at) in enumerate(alerts):
+					cursor = connection.execute(
+						"""INSERT INTO intelligence_alerts(user_id, alert_type, severity, title, summary,
+						   confidence, status, created_at, updated_at, dedupe_key)
+						   VALUES (?, 'test', ?, ?, 'summary', ?, ?, ?, ?, ?)""",
+						(user_ids[name], severity, title, confidence, status, created_at, created_at, f"sort-alert-{index}"),
+					)
+					alert_ids.append(int(cursor.lastrowid))
+				cases = (
+					("Amber case", "medium", "open", "2026-08-11T01:00:00+00:00", 3, 2),
+					("Blue case", "critical", "active", "2026-08-11T03:00:00+00:00", 1, 3),
+					("Crimson case", "low", "closed", "2026-08-11T02:00:00+00:00", 2, 1),
+				)
+				for title, priority, status, updated_at, entity_count, evidence_count in cases:
+					cursor = connection.execute(
+						"""INSERT INTO investigation_cases(title, priority, status, updated_at)
+						   VALUES (?, ?, ?, ?)""", (title, priority, status, updated_at),
+					)
+					case_id = int(cursor.lastrowid)
+					for user_id in list(user_ids.values())[:entity_count]:
+						connection.execute("INSERT INTO case_entities(case_id, user_id) VALUES (?, ?)", (case_id, user_id))
+					for alert_id in alert_ids[:evidence_count]:
+						connection.execute("INSERT INTO case_evidence(case_id, alert_id) VALUES (?, ?)", (case_id, alert_id))
+				relationships = (
+					("Alice", "Carol", "shared_domain", 2.0, 5, "2026-08-11T01:00:00+00:00", "one"),
+					("Bob", "Alice", "mention", 9.0, 2, "2026-08-11T03:00:00+00:00", "two"),
+					("Carol", "Bob", "channel_coactivity", 5.0, 8, "2026-08-11T02:00:00+00:00", "three"),
+				)
+				for source, target, relationship_type, strength, evidence_count, observed_at, context in relationships:
+					connection.execute(
+						"""INSERT INTO entity_relationships(source_user_id, target_user_id, relationship_type,
+						   context_key, strength, evidence_count, first_observed_at, last_observed_at)
+						   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+						(user_ids[source], user_ids[target], relationship_type, context, strength, evidence_count, observed_at, observed_at),
+					)
+		finally:
+			connection.close()
+
+	def test_intelligence_tables_support_independent_sorting(self) -> None:
+		self._seed_sortable_intelligence()
+		cookie = self._issue_operator_session_cookie()
+
+		def payload(query: str) -> dict[str, object]:
+			with self.opener.open(Request(f"{self.base_url}/api/intelligence?{query}", headers={"Cookie": cookie})) as response:
+				return json.loads(response.read().decode("utf-8"))
+
+		alert_expectations = {
+			"severity": ["critical", "high", "low"],
+			"subject": ["Alice", "Bob", "Carol"],
+			"finding": ["Alpha finding", "Middle finding", "Zulu finding"],
+			"confidence": [0.2, 0.6, 0.9],
+			"status": ["open", "in_case", "resolved"],
+		}
+		for key, expected in alert_expectations.items():
+			direction = "desc" if key == "severity" else "asc"
+			result = payload(f"alert_sort={key}&alert_dir={direction}")
+			field = {"subject": "primary_display_name", "finding": "title"}.get(key, key)
+			self.assertEqual([item[field] for item in result["alerts"]], expected)
+			self.assertEqual(result["sort"]["alerts"], {"by": key, "dir": direction})
+			reverse_dir = "desc" if direction == "asc" else "asc"
+			reversed_result = payload(f"alert_sort={key}&alert_dir={reverse_dir}")
+			self.assertEqual([item[field] for item in reversed_result["alerts"]], list(reversed(expected)))
+
+		case_expectations = {
+			"case": ["Amber case", "Blue case", "Crimson case"],
+			"priority": ["critical", "medium", "low"],
+			"status": ["open", "active", "closed"],
+			"entities": [3, 2, 1],
+			"evidence": [3, 2, 1],
+			"updated": ["2026-08-11T03:00:00+00:00", "2026-08-11T02:00:00+00:00", "2026-08-11T01:00:00+00:00"],
+		}
+		for key, expected in case_expectations.items():
+			direction = "asc" if key in {"case", "status"} else "desc"
+			result = payload(f"case_sort={key}&case_dir={direction}")
+			field = {"case": "title", "entities": "entity_count", "evidence": "evidence_count", "updated": "updated_at"}.get(key, key)
+			self.assertEqual([item[field] for item in result["cases"]], expected)
+			reverse_dir = "desc" if direction == "asc" else "asc"
+			reversed_result = payload(f"case_sort={key}&case_dir={reverse_dir}")
+			self.assertEqual([item[field] for item in reversed_result["cases"]], list(reversed(expected)))
+
+		relationship_expectations = {
+			"source": ["Alice", "Bob", "Carol"],
+			"relationship": ["channel_coactivity", "mention", "shared_domain"],
+			"target": ["Alice", "Bob", "Carol"],
+			"strength": [9.0, 5.0, 2.0],
+			"evidence": [8, 5, 2],
+			"last_observed": ["2026-08-11T03:00:00+00:00", "2026-08-11T02:00:00+00:00", "2026-08-11T01:00:00+00:00"],
+		}
+		for key, expected in relationship_expectations.items():
+			direction = "asc" if key in {"source", "relationship", "target"} else "desc"
+			result = payload(f"relationship_sort={key}&relationship_dir={direction}")
+			field = {"source": "source_name", "relationship": "relationship_type", "target": "target_name", "evidence": "evidence_count", "last_observed": "last_observed_at"}.get(key, key)
+			self.assertEqual([item[field] for item in result["relationships"]], expected)
+			reverse_dir = "desc" if direction == "asc" else "asc"
+			reversed_result = payload(f"relationship_sort={key}&relationship_dir={reverse_dir}")
+			self.assertEqual([item[field] for item in reversed_result["relationships"]], list(reversed(expected)))
+
+		page_query = "alert_sort=confidence&alert_dir=asc&case_sort=priority&case_dir=desc&relationship_sort=source&relationship_dir=asc"
+		with self.opener.open(Request(f"{self.base_url}/intelligence?{page_query}", headers={"Cookie": cookie})) as response:
+			body = response.read().decode("utf-8")
+		self.assertIn("Confidence ↑", body)
+		self.assertIn("Priority ↓", body)
+		self.assertIn("Source ↑", body)
+		self.assertIn("alert_sort=confidence", body)
+		self.assertIn("case_sort=priority", body)
+		self.assertIn("relationship_sort=source", body)
+
+	def test_analytics_tables_expose_independent_sort_headers_and_api_state(self) -> None:
+		cookie = self._issue_operator_session_cookie()
+		query = (
+			"topics_sort=label&topics_dir=asc&graph_sort=influence_score&graph_dir=desc&"
+			"identity_suggestions_sort=status&identity_suggestions_dir=asc&"
+			"cohort_anomalies_sort=confidence&cohort_anomalies_dir=desc&"
+			"evaluation_sort=model_key&evaluation_dir=asc"
+		)
+		with self.opener.open(Request(f"{self.base_url}/analytics?{query}", headers={"Cookie": cookie})) as response:
+			body = response.read().decode("utf-8")
+		self.assertIn("Label ↑", body)
+		self.assertIn("Influence Score ↓", body)
+		self.assertIn("Status ↑", body)
+		self.assertIn("Confidence ↓", body)
+		self.assertIn("Model Key ↑", body)
+		for parameter in (
+			"topics_sort=label", "graph_sort=influence_score", "identity_suggestions_sort=status",
+			"cohort_anomalies_sort=confidence", "evaluation_sort=model_key",
+		):
+			self.assertIn(parameter, body)
+
+		with self.opener.open(Request(f"{self.base_url}/api/analytics?{query}", headers={"Cookie": cookie})) as response:
+			payload = json.loads(response.read().decode("utf-8"))
+		self.assertEqual(payload["sort"]["topics"], {"by": "label", "dir": "asc"})
+		self.assertEqual(payload["sort"]["graph"], {"by": "influence_score", "dir": "desc"})
+		self.assertEqual(payload["sort"]["identity_suggestions"], {"by": "status", "dir": "asc"})
+		self.assertEqual(payload["sort"]["cohort_anomalies"], {"by": "confidence", "dir": "desc"})
+		self.assertEqual(payload["sort"]["evaluation"], {"by": "model_key", "dir": "asc"})
+
 	def test_login_redirects_to_discord_oauth(self) -> None:
 		with self.assertRaises(HTTPError) as error:
 			self.opener.open(Request(f"{self.base_url}/login"))

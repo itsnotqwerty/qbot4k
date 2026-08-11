@@ -25,6 +25,7 @@ if __package__ in {None, ""}:
     from src.twitch import TwitchConnector
     from src.twitch_auth import TwitchTokenManager
     from src.pipeline.analysis import AnalysisRegistry
+    from src.intelligence.events import GenericEventAnalysisPipeline, SUPPORTED_EVENT_TYPES
     from src.pipeline.message_analysis import (
         MESSAGE_ANALYSIS_JOB_TYPE,
         MessageAnalysisPipeline,
@@ -33,6 +34,7 @@ if __package__ in {None, ""}:
     from src.pipeline.actions import (
         ActionRegistry,
         DiscordMessageActionHandler,
+        ModerationActionHandler,
         TwitchMessageActionHandler,
     )
 else:
@@ -47,6 +49,7 @@ else:
     from .twitch import TwitchConnector
     from .twitch_auth import TwitchTokenManager
     from .pipeline.analysis import AnalysisRegistry
+    from .intelligence.events import GenericEventAnalysisPipeline, SUPPORTED_EVENT_TYPES
     from .pipeline.message_analysis import (
         MESSAGE_ANALYSIS_JOB_TYPE,
         MessageAnalysisPipeline,
@@ -55,6 +58,7 @@ else:
     from .pipeline.actions import (
         ActionRegistry,
         DiscordMessageActionHandler,
+        ModerationActionHandler,
         TwitchMessageActionHandler,
     )
 
@@ -199,11 +203,17 @@ def run_application(once: bool) -> int:
         message_pipeline.analyze_message_created,
     )
 
+    event_pipeline = GenericEventAnalysisPipeline(settings.database_path)
+    for event_type in SUPPORTED_EVENT_TYPES:
+        analysis_registry.register(f"analyze.{event_type}", event_pipeline.analyze_event)
+
     analysis_worker = AnalysisWorker(
         settings.database_path,
         analysis_registry,
         worker_id="analysis-1",
     )
+    action_registry = ActionRegistry()
+    action_handlers_registered = False
 
     if "discord" in settings.enabled_services:
         discord_connector = DiscordConnector(
@@ -262,6 +272,8 @@ def run_application(once: bool) -> int:
     jobs_thread: threading.Thread | None = None
     discord_thread: threading.Thread | None = None
     twitch_thread: threading.Thread | None = None
+    action_worker: DiscordWorker | None = None
+    action_worker_thread: threading.Thread | None = None
     discord_connector: DiscordConnector | None = None
     twitch_connector: TwitchConnector | None = None
     health_logger = logging.getLogger("qbot4k.health")
@@ -324,27 +336,17 @@ def run_application(once: bool) -> int:
         discord_thread.start()
         service_threads.append(discord_thread)
 
-        action_registry = ActionRegistry()
-
         action_registry.register(
             "discord.message.send",
             DiscordMessageActionHandler(
                 discord_connector,
             ),
         )
-
-        discord_worker = DiscordWorker(
-            settings.database_path,
-            action_registry,
+        action_registry.register(
+            "discord.moderation.execute",
+            ModerationActionHandler(discord_connector),
         )
-
-        discord_worker_thread = threading.Thread(
-            target=discord_worker.run_forever,
-            name="action-worker",
-        )
-
-        discord_worker_thread.start()
-        service_threads.append(discord_worker_thread)
+        action_handlers_registered = True
 
     if "twitch" in settings.enabled_services:
         twitch_token_manager = TwitchTokenManager(
@@ -380,6 +382,11 @@ def run_application(once: bool) -> int:
                 twitch_connector,
             ),
         )
+        action_registry.register(
+            "twitch.moderation.execute",
+            ModerationActionHandler(twitch_connector),
+        )
+        action_handlers_registered = True
 
         twitch_thread = threading.Thread(
             target=twitch_connector.run_twitch_safely,
@@ -392,6 +399,19 @@ def run_application(once: bool) -> int:
 
         twitch_thread.start()
         service_threads.append(twitch_thread)
+
+    if action_handlers_registered:
+        action_worker = DiscordWorker(
+            settings.database_path,
+            action_registry,
+            worker_id="action-1",
+        )
+        action_worker_thread = threading.Thread(
+            target=action_worker.run_forever,
+            name="action-worker",
+        )
+        action_worker_thread.start()
+        service_threads.append(action_worker_thread)
 
     analysis_thread = threading.Thread(
         target=analysis_worker.run_forever,
@@ -516,7 +536,8 @@ def run_application(once: bool) -> int:
             stop = getattr(service, "stop", None)
             if callable(stop):
                 stop()
-        discord_worker.stop()
+        if action_worker is not None:
+            action_worker.stop()
         if server is not None:
             server.shutdown()
             server.server_close()

@@ -564,6 +564,256 @@ CREATE INDEX IF NOT EXISTS idx_relationships_source ON entity_relationships(sour
 CREATE INDEX IF NOT EXISTS idx_reports_generated ON intelligence_reports(generated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_social_score_runs_user_time ON social_score_runs(user_id, calculated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_social_score_components_run ON social_score_components(score_run_id, ABS(contribution) DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS observation_fts USING fts5(
+    text,
+    platform UNINDEXED,
+    event_type UNINDEXED,
+    container_id UNINDEXED,
+    context_id UNINDEXED,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS observations_fts_insert
+AFTER INSERT ON observations BEGIN
+    INSERT INTO observation_fts (
+        rowid, text, platform, event_type, container_id, context_id
+    ) VALUES (
+        new.id, COALESCE(new.text_raw, ''), new.platform, new.event_type,
+        COALESCE(new.container_id, ''), COALESCE(new.context_id, '')
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS observations_fts_update
+AFTER UPDATE OF text_raw, platform, event_type, container_id, context_id ON observations BEGIN
+    DELETE FROM observation_fts WHERE rowid = old.id;
+    INSERT INTO observation_fts (
+        rowid, text, platform, event_type, container_id, context_id
+    ) VALUES (
+        new.id, COALESCE(new.text_raw, ''), new.platform, new.event_type,
+        COALESCE(new.container_id, ''), COALESCE(new.context_id, '')
+    );
+END;
+
+CREATE TRIGGER IF NOT EXISTS observations_fts_delete
+AFTER DELETE ON observations BEGIN
+    DELETE FROM observation_fts WHERE rowid = old.id;
+END;
+
+CREATE TABLE IF NOT EXISTS saved_queries (
+    id INTEGER PRIMARY KEY,
+    operator_id INTEGER,
+    name TEXT NOT NULL,
+    query_text TEXT NOT NULL DEFAULT '',
+    filters_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(operator_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS content_analysis (
+    observation_id INTEGER PRIMARY KEY REFERENCES observations(id) ON DELETE CASCADE,
+    analyzer_version INTEGER NOT NULL,
+    language_code TEXT NOT NULL,
+    language_confidence REAL NOT NULL,
+    sentiment_label TEXT NOT NULL,
+    sentiment_score REAL NOT NULL,
+    intent_label TEXT NOT NULL,
+    intent_confidence REAL NOT NULL,
+    threat_level TEXT NOT NULL,
+    threat_score REAL NOT NULL,
+    conversation_json TEXT NOT NULL DEFAULT '{}',
+    indicators_json TEXT NOT NULL DEFAULT '[]',
+    analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS content_entities (
+    id INTEGER PRIMARY KEY,
+    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    entity_type TEXT NOT NULL,
+    entity_value TEXT NOT NULL,
+    normalized_value TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    start_offset INTEGER,
+    end_offset INTEGER,
+    UNIQUE(observation_id, entity_type, normalized_value, start_offset)
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_entities_value
+    ON content_entities(entity_type, normalized_value, observation_id);
+
+CREATE TABLE IF NOT EXISTS external_feed_sources (
+    id INTEGER PRIMARY KEY,
+    source_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    source_type TEXT NOT NULL,
+    trust_weight REAL NOT NULL DEFAULT 0.5,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    configuration_json TEXT NOT NULL DEFAULT '{}',
+    last_observed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS emerging_topics (
+    id INTEGER PRIMARY KEY,
+    topic_key TEXT NOT NULL UNIQUE,
+    topic_kind TEXT NOT NULL,
+    label TEXT NOT NULL,
+    current_count INTEGER NOT NULL,
+    baseline_rate REAL NOT NULL,
+    velocity REAL NOT NULL,
+    context_count INTEGER NOT NULL,
+    community_count INTEGER NOT NULL,
+    unusualness REAL NOT NULL,
+    first_observed_at TEXT,
+    last_observed_at TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    calculated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS topic_history (
+    id INTEGER PRIMARY KEY,
+    topic_key TEXT NOT NULL,
+    topic_kind TEXT NOT NULL,
+    current_count INTEGER NOT NULL,
+    baseline_rate REAL NOT NULL,
+    velocity REAL NOT NULL,
+    context_count INTEGER NOT NULL,
+    community_count INTEGER NOT NULL,
+    unusualness REAL NOT NULL,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS topic_evidence (
+    topic_key TEXT NOT NULL,
+    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    context_key TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    PRIMARY KEY(topic_key, observation_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_topics_velocity
+    ON emerging_topics(velocity DESC, unusualness DESC);
+CREATE INDEX IF NOT EXISTS idx_topic_history_time
+    ON topic_history(topic_key, calculated_at DESC);
+
+CREATE TABLE IF NOT EXISTS graph_metrics (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    in_degree REAL NOT NULL,
+    out_degree REAL NOT NULL,
+    weighted_degree REAL NOT NULL,
+    betweenness REAL NOT NULL,
+    pagerank REAL NOT NULL,
+    cluster_id INTEGER,
+    is_bridge INTEGER NOT NULL DEFAULT 0,
+    influence_score REAL NOT NULL,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS graph_metric_history (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    in_degree REAL NOT NULL,
+    out_degree REAL NOT NULL,
+    weighted_degree REAL NOT NULL,
+    betweenness REAL NOT NULL,
+    pagerank REAL NOT NULL,
+    cluster_id INTEGER,
+    is_bridge INTEGER NOT NULL DEFAULT 0,
+    influence_score REAL NOT NULL,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS identity_link_suggestions (
+    id INTEGER PRIMARY KEY,
+    left_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    right_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    confidence REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    model_version INTEGER NOT NULL,
+    reviewed_by_operator_id INTEGER,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(left_platform_account_id, right_platform_account_id, model_version),
+    CHECK(left_platform_account_id < right_platform_account_id),
+    CHECK(status IN ('pending', 'approved', 'rejected', 'expired'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_identity_suggestions_status
+    ON identity_link_suggestions(status, confidence DESC);
+
+CREATE TABLE IF NOT EXISTS cohort_baselines (
+    id INTEGER PRIMARY KEY,
+    cohort_type TEXT NOT NULL,
+    cohort_key TEXT NOT NULL,
+    signal_key TEXT NOT NULL,
+    sample_size INTEGER NOT NULL,
+    mean_value REAL NOT NULL,
+    stddev_value REAL NOT NULL,
+    median_value REAL NOT NULL,
+    p90_value REAL NOT NULL,
+    calculated_at TEXT NOT NULL,
+    UNIQUE(cohort_type, cohort_key, signal_key)
+);
+
+CREATE TABLE IF NOT EXISTS cohort_anomalies (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    cohort_type TEXT NOT NULL,
+    cohort_key TEXT NOT NULL,
+    signal_key TEXT NOT NULL,
+    observed_value REAL NOT NULL,
+    baseline_mean REAL NOT NULL,
+    z_score REAL NOT NULL,
+    direction TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    calculated_at TEXT NOT NULL,
+    UNIQUE(user_id, cohort_type, cohort_key, signal_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cohort_anomalies_score
+    ON cohort_anomalies(ABS(z_score) DESC, confidence DESC);
+
+CREATE TABLE IF NOT EXISTS evaluation_labels (
+    id INTEGER PRIMARY KEY,
+    observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    alert_id INTEGER REFERENCES intelligence_alerts(id) ON DELETE SET NULL,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    label_key TEXT NOT NULL,
+    label_value TEXT NOT NULL,
+    operator_id INTEGER,
+    source TEXT NOT NULL DEFAULT 'operator',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS model_evaluation_runs (
+    id INTEGER PRIMARY KEY,
+    model_key TEXT NOT NULL,
+    model_version INTEGER NOT NULL,
+    sample_size INTEGER NOT NULL,
+    metrics_json TEXT NOT NULL,
+    score_distribution_json TEXT NOT NULL,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS threshold_backtests (
+    id INTEGER PRIMARY KEY,
+    evaluation_run_id INTEGER NOT NULL REFERENCES model_evaluation_runs(id) ON DELETE CASCADE,
+    threshold REAL NOT NULL,
+    true_positive INTEGER NOT NULL,
+    false_positive INTEGER NOT NULL,
+    true_negative INTEGER NOT NULL,
+    false_negative INTEGER NOT NULL,
+    precision REAL NOT NULL,
+    recall REAL NOT NULL,
+    false_positive_rate REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_runs_model_time
+    ON model_evaluation_runs(model_key, calculated_at DESC);
 """
 
 DEFAULT_COMMAND_DEFINITIONS = (
@@ -591,6 +841,16 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
 def initialize_database(connection: sqlite3.Connection) -> None:
     with connection:
         connection.executescript(SCHEMA_SQL)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO observation_fts(
+                rowid, text, platform, event_type, container_id, context_id
+            )
+            SELECT id, COALESCE(text_raw, ''), platform, event_type,
+                   COALESCE(container_id, ''), COALESCE(context_id, '')
+            FROM observations
+            """
+        )
         _migrate_schema(connection)
         _seed_default_command_definitions(connection)
         _seed_builtin_moderation_rules(connection)
@@ -924,7 +1184,10 @@ def reset_database(connection: sqlite3.Connection) -> dict[str, int]:
     concurrent writers from observing a partially cleared database.
     """
     connection.commit()
-    tables = list_tables(connection)
+    tables = [
+        name for name in list_tables(connection)
+        if not name.startswith("observation_fts_")
+    ]
     deleted_rows = 0
     foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
     connection.execute("PRAGMA foreign_keys = OFF")

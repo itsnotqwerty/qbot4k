@@ -15,14 +15,17 @@ from websocket._exceptions import WebSocketTimeoutException
 
 from .db import (
 	connect_database,
+	get_observation,
 	initialize_database,
 	list_pending_moderation_actions_for_message,
 	mark_moderation_action_completed,
+	normalized_message_from_observation,
 	collect_observation
 )
 from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 from .server_boosts import is_server_boost_confirmation
+from .intelligence.events import ingest_event, observation_from_discord_event
 
 
 class DiscordPayloadError(ValueError):
@@ -353,6 +356,65 @@ class DiscordConnector:
 		finally:
 			connection.close()
 
+	def ingest_event(self, gateway_event: str, payload: Mapping[str, object]) -> CollectionResult | None:
+		observation = observation_from_discord_event(gateway_event, payload)
+		if observation is None:
+			return None
+		result = ingest_event(self.database_path, observation)
+		self._last_status = "ready"
+		return result
+
+	def execute_pending_moderation_actions(
+		self,
+		connection,
+		message_id: int,
+	) -> None:
+		row = connection.execute(
+			"""
+			SELECT observation_id, platform_account_id
+			FROM messages
+			WHERE id = ? AND platform = 'discord'
+			""",
+			(message_id,),
+		).fetchone()
+		if row is None:
+			raise ValueError(f"Discord message {message_id} was not found")
+		if row[0] is None:
+			raise ValueError(
+				f"Discord message {message_id} has no source observation"
+			)
+
+		observation = get_observation(connection, int(row[0]))
+		if observation is None:
+			raise ValueError(
+				f"Discord observation {int(row[0])} was not found"
+			)
+		normalized = normalized_message_from_observation(observation)
+		self._execute_pending_moderation_actions(
+			connection,
+			normalized,
+			IngestionResult(
+				status="persisted",
+				platform="discord",
+				platform_account_id=int(row[1]),
+				message_id=message_id,
+			),
+		)
+
+		remaining = int(connection.execute(
+			"""
+			SELECT COUNT(*)
+			FROM moderation_actions
+			WHERE message_id = ? AND status = 'pending'
+			""",
+			(message_id,),
+		).fetchone()[0])
+		if remaining:
+			raise DiscordConnectionError(
+				f"Discord message {message_id} still has "
+				f"{remaining} pending moderation action(s)"
+			)
+
 	def _execute_pending_moderation_actions(
 		self,
 		connection,
@@ -469,6 +531,7 @@ class DiscordConnector:
 						reason=reason,
 						outcome="recorded",
 					)
+					mark_moderation_action_completed(connection, action_id)
 				else:
 					self._logger.warning(
 						"discord moderation action not executed for unsupported type=%s message=%s",
@@ -788,9 +851,6 @@ class DiscordConnector:
 						bool(self._gateway_intents() & (1 << 15)),
 					)
 					continue
-				if event_type != "MESSAGE_CREATE":
-					continue
-
 				guild_id = str(data.get("guild_id") or "").strip()
 				if self.guild_ids and guild_id not in self.guild_ids:
 					if guild_id not in self._guild_filter_warned_guilds:
@@ -801,6 +861,12 @@ class DiscordConnector:
 							str(data.get("channel_id") or "").strip(),
 							",".join(self.guild_ids),
 						)
+					continue
+
+				if event_type != "MESSAGE_CREATE":
+					result = self.ingest_event(str(event_type or ""), data)
+					if result is not None:
+						self._logger.info("ingested discord event type=%s status=%s", event_type, result.status)
 					continue
 
 				payload = build_discord_message_payload(data)

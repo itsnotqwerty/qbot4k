@@ -148,3 +148,38 @@ class TwitchMessageActionHandler:
             channel_id,
             rendered_reply,
         )
+
+
+class ModerationExecutor(Protocol):
+    def execute_pending_moderation_actions(
+        self,
+        connection: sqlite3.Connection,
+        message_id: int,
+    ) -> None:
+        ...
+
+
+class ModerationActionHandler:
+    def __init__(self, executor: ModerationExecutor) -> None:
+        self.executor = executor
+
+    def __call__(
+        self,
+        connection: sqlite3.Connection,
+        job: AnalysisJob,
+    ) -> None:
+        raw_message_id = job.payload.get("message_id")
+        try:
+            message_id = int(raw_message_id)
+        except (TypeError, ValueError) as exc:
+            raise PermanentActionError(
+                "Moderation action has no valid message_id"
+            ) from exc
+        if message_id <= 0:
+            raise PermanentActionError(
+                "Moderation action message_id must be positive"
+            )
+        self.executor.execute_pending_moderation_actions(
+            connection,
+            message_id,
+        )

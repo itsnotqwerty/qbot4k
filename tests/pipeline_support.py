@@ -5,7 +5,11 @@ from pathlib import Path
 
 from src.db import connect_database, get_observation
 from src.models import CollectionResult, IngestionResult
-from src.pipeline.actions import ActionRegistry, DiscordMessageActionHandler
+from src.pipeline.actions import (
+    ActionRegistry,
+    DiscordMessageActionHandler,
+    ModerationActionHandler,
+)
 from src.pipeline.analysis import AnalysisRegistry
 from src.pipeline.message_analysis import MESSAGE_ANALYSIS_JOB_TYPE, MessageAnalysisPipeline
 from src.pipeline.workers import AnalysisWorker
@@ -83,6 +87,10 @@ def ingest_and_analyze(
             if connector._bot_token:
                 registry = ActionRegistry()
                 registry.register("discord.message.send", DiscordMessageActionHandler(connector))
+                registry.register(
+                    "discord.moderation.execute",
+                    ModerationActionHandler(connector),
+                )
                 from src.pipeline.workers import DiscordWorker
 
                 worker = DiscordWorker(database_path, registry, poll_interval=0)

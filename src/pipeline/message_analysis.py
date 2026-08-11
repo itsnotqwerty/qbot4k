@@ -16,6 +16,7 @@ from ..db import enqueue_processing_job, get_observation, persist_normalized_mes
 from ..models import NormalizedMessage
 from ..intelligence.signals import refresh_user_derived_signals
 from ..intelligence.workflows import process_intelligence_observation
+from ..intelligence.content import analyze_observation_content
 from ..server_boosts import is_server_boost_confirmation, process_discord_server_boost
 
 
@@ -120,6 +121,12 @@ class MessageAnalysisPipeline:
                 return
 
             _project_message(connection, message, observation_id)
+            analyze_observation_content(connection, observation_id)
+            _enqueue_moderation_action(
+                connection,
+                observation_id=observation_id,
+                platform=message.platform,
+            )
             if message.platform == "discord":
                 platform_account = connection.execute(
                     "SELECT platform_account_id FROM messages WHERE observation_id = ?",
@@ -327,4 +334,39 @@ def _enqueue_command_action(
         },
         idempotency_key=f"observation:{observation_id}:command-reply:v1",
         priority=50,
+    )
+
+
+def _enqueue_moderation_action(
+    connection: sqlite3.Connection,
+    *,
+    observation_id: int,
+    platform: str,
+) -> None:
+    row = connection.execute(
+        """
+        SELECT messages.id
+        FROM messages
+        WHERE messages.observation_id = ?
+          AND EXISTS (
+              SELECT 1
+              FROM moderation_actions
+              WHERE moderation_actions.message_id = messages.id
+                AND moderation_actions.status = 'pending'
+          )
+        """,
+        (observation_id,),
+    ).fetchone()
+    if row is None:
+        return
+
+    message_id = int(row[0])
+    enqueue_processing_job(
+        connection,
+        stage="action",
+        job_type=f"{platform}.moderation.execute",
+        observation_id=observation_id,
+        payload={"message_id": message_id},
+        idempotency_key=f"message:{message_id}:moderation:v1",
+        priority=10,
     )
