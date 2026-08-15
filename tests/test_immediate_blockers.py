@@ -117,7 +117,11 @@ class ImmediateBlockerTests(unittest.TestCase):
             ModerationActionHandler(connector),
         )
         worker = DiscordWorker(self.database_path, registry, poll_interval=0)
-        with mock.patch.object(connector, "send_message") as send_message:
+        with mock.patch.object(
+            connector,
+            "_execute_helix_moderation_action",
+            return_value=("200", {"data": [{"moderation_id": "provider-1"}]}),
+        ) as helix_action:
             self.assertTrue(worker.process_next_job())
 
         connection = connect_database(self.database_path)
@@ -129,8 +133,9 @@ class ImmediateBlockerTests(unittest.TestCase):
             connection.close()
 
         self.assertEqual(status, "completed")
-        send_message.assert_called_once()
-        self.assertIn("/timeout user_one 600", send_message.call_args.args[1])
+        helix_action.assert_called_once()
+        self.assertEqual(helix_action.call_args.kwargs["target_user_id"], "user-1")
+        self.assertEqual(helix_action.call_args.kwargs["action_type"], "timeout")
 
     def test_twitch_supervisor_reconnects_after_transient_failure(self) -> None:
         connector = TwitchConnector(self.database_path)

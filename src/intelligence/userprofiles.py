@@ -305,7 +305,7 @@ def _merge_canonical_users(
 
 	relationships = connection.execute(
 		"""
-		SELECT source_user_id, target_user_id, relationship_type, context_key,
+		SELECT community_id, source_user_id, target_user_id, relationship_type, context_key,
 		       strength, evidence_count, first_observed_at, last_observed_at, evidence_json
 		FROM entity_relationships
 		WHERE source_user_id = ? OR target_user_id = ?
@@ -317,25 +317,26 @@ def _merge_canonical_users(
 		(source_user_id, source_user_id),
 	)
 	for relationship in relationships:
-		source = target_user_id if int(relationship[0]) == source_user_id else int(relationship[0])
-		target = target_user_id if int(relationship[1]) == source_user_id else int(relationship[1])
+		community_id = int(relationship[0])
+		source = target_user_id if int(relationship[1]) == source_user_id else int(relationship[1])
+		target = target_user_id if int(relationship[2]) == source_user_id else int(relationship[2])
 		if source == target:
 			continue
 		source, target = sorted((source, target))
 		connection.execute(
 			"""
 			INSERT INTO entity_relationships (
-				source_user_id, target_user_id, relationship_type, context_key,
+				community_id, source_user_id, target_user_id, relationship_type, context_key,
 				strength, evidence_count, first_observed_at, last_observed_at, evidence_json
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(source_user_id, target_user_id, relationship_type, context_key)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(community_id, source_user_id, target_user_id, relationship_type, context_key)
 			DO UPDATE SET
 				strength = MAX(entity_relationships.strength, excluded.strength),
 				evidence_count = entity_relationships.evidence_count + excluded.evidence_count,
 				first_observed_at = MIN(entity_relationships.first_observed_at, excluded.first_observed_at),
 				last_observed_at = MAX(entity_relationships.last_observed_at, excluded.last_observed_at)
 			""",
-			(source, target, *relationship[2:]),
+			(community_id, source, target, *relationship[3:]),
 		)
 
 	connection.execute(

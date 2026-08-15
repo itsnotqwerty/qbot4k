@@ -21,6 +21,7 @@ from .actions import (
     ActionRegistry,
     PermanentActionError,
 )
+from ..intelligence.recovery import record_dead_letter
 
 class AnalysisWorker:
     def __init__(
@@ -98,6 +99,7 @@ class AnalysisWorker:
                     job.id,
                     str(exc),
                 )
+                record_dead_letter(connection, job_id=job.id, error=exc, payload=job.payload)
                 self._last_status = "degraded"
                 self._logger.error(
                     "Analysis job permanently failed "
@@ -113,6 +115,8 @@ class AnalysisWorker:
                     job.id,
                     str(exc),
                 )
+                if not retry_scheduled:
+                    record_dead_letter(connection, job_id=job.id, error=exc, payload=job.payload)
                 self._last_status = "degraded"
                 self._logger.exception(
                     "Analysis job failed "
@@ -220,6 +224,7 @@ class DiscordWorker:
                     job.id,
                     str(exc),
                 )
+                record_dead_letter(connection, job_id=job.id, error=exc, payload=job.payload)
                 _fail_moderation_actions_for_job(connection, job)
                 self._last_status = "degraded"
                 self._logger.error(
@@ -237,6 +242,7 @@ class DiscordWorker:
                     str(exc),
                 )
                 if not retrying:
+                    record_dead_letter(connection, job_id=job.id, error=exc, payload=job.payload)
                     _fail_moderation_actions_for_job(connection, job)
                 self._last_status = "degraded"
                 self._logger.exception(

@@ -14,11 +14,20 @@ class TwitchAuthError(RuntimeError):
 	pass
 
 
+class TwitchReauthorizationRequired(TwitchAuthError):
+	"""The stored grant is invalid and operator authorization is required."""
+
+
+class TwitchTemporaryAuthError(TwitchAuthError):
+	"""Authorization could not be checked because Twitch is temporarily unavailable."""
+
+
 @dataclass(frozen=True)
 class TwitchTokenValidation:
 	access_token: str
 	login: str
 	client_id: str
+	user_id: str = ""
 
 
 class TwitchTokenManager:
@@ -51,7 +60,7 @@ class TwitchTokenManager:
 				validation_payload = self._validate_access_token(self._access_token)
 
 		if validation_payload is None:
-			raise TwitchAuthError("Failed to validate Twitch token")
+			raise TwitchReauthorizationRequired("Twitch authorization is invalid")
 
 		login = str(validation_payload.get("login") or "").strip()
 		if not login:
@@ -66,7 +75,12 @@ class TwitchTokenManager:
 			access_token=self._access_token,
 			login=login,
 			client_id=resolved_client_id,
+			user_id=str(validation_payload.get("user_id") or "").strip(),
 		)
+
+	@property
+	def access_token(self) -> str:
+		return self._access_token
 
 	def refresh_access_token(self) -> str:
 		with self._lock:
@@ -88,8 +102,9 @@ class TwitchTokenManager:
 			self._logger.warning("twitch token validate failed code=%s", exc.code)
 			return None
 		except URLError as exc:
-			self._logger.warning("twitch token validate failed reason=%s", exc.reason)
-			return None
+			raise TwitchTemporaryAuthError(
+				f"Twitch token validation is temporarily unavailable: {exc.reason}"
+			) from exc
 
 		if not isinstance(payload, dict):
 			return None
@@ -120,9 +135,13 @@ class TwitchTokenManager:
 			with urlopen(request, timeout=15) as response:
 				payload = json.loads(response.read().decode("utf-8"))
 		except HTTPError as exc:
-			raise TwitchAuthError(f"Failed to refresh Twitch token: HTTP {exc.code}") from exc
+			if exc.code in {400, 401}:
+				raise TwitchReauthorizationRequired(
+					f"Twitch refresh authorization was rejected: HTTP {exc.code}"
+				) from exc
+			raise TwitchTemporaryAuthError(f"Failed to refresh Twitch token: HTTP {exc.code}") from exc
 		except URLError as exc:
-			raise TwitchAuthError(f"Failed to refresh Twitch token: {exc.reason}") from exc
+			raise TwitchTemporaryAuthError(f"Failed to refresh Twitch token: {exc.reason}") from exc
 
 		if not isinstance(payload, dict):
 			raise TwitchAuthError("Failed to refresh Twitch token: invalid response payload")

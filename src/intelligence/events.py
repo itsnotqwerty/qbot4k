@@ -10,6 +10,11 @@ from typing import Mapping
 from ..db import collect_observation, connect_database, get_observation, initialize_database
 from ..models import CollectionResult, Observation, coerce_timestamp, normalize_message_content
 from .content import analyze_observation_content, emit_content_alert
+from .professional_ops import (
+    confirm_moderation_from_event,
+    project_stream_session,
+    record_audience_event,
+)
 
 
 SUPPORTED_EVENT_TYPES = (
@@ -17,6 +22,10 @@ SUPPORTED_EVENT_TYPES = (
     "reaction.added", "reaction.removed", "member.roles_changed",
     "moderation.action", "moderation.ban_added", "moderation.ban_removed",
     "stream.started", "stream.ended", "stream.updated", "account.updated", "channel.notice", "external.item",
+    "channel.followed", "channel.subscribed", "channel.subscription_gifted",
+    "channel.cheered", "channel.raided", "channel.reward_redeemed",
+    "channel.warning", "channel.suspicious_user", "channel.shield_mode",
+    "channel.shared_chat", "channel.ad_break", "channel.charity_donation",
 )
 
 _DISCORD_EVENTS = {
@@ -136,6 +145,9 @@ class GenericEventAnalysisPipeline:
             emit_content_alert(connection, int(job.observation_id), content)
             _project_event_state(connection, observation)
             _upsert_event_relationship(connection, observation)
+            project_stream_session(connection, observation)
+            record_audience_event(connection, observation)
+            confirm_moderation_from_event(connection, observation)
 
 
 def ingest_event(database_path: Path, observation: Observation) -> CollectionResult:
@@ -185,19 +197,19 @@ def _upsert_event_relationship(connection: sqlite3.Connection, observation: sqli
     context = str(observation["context_id"] or observation["container_id"] or "")
     occurred = str(observation["occurred_at"])
     connection.execute(
-        """INSERT INTO entity_relationships(source_user_id, target_user_id, relationship_type, context_key,
+        """INSERT INTO entity_relationships(community_id, source_user_id, target_user_id, relationship_type, context_key,
              strength, evidence_count, first_observed_at, last_observed_at, evidence_json)
-           VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)
-           ON CONFLICT(source_user_id, target_user_id, relationship_type, context_key) DO UPDATE SET
+           VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+           ON CONFLICT(community_id, source_user_id, target_user_id, relationship_type, context_key) DO UPDATE SET
              strength=entity_relationships.strength+1, evidence_count=entity_relationships.evidence_count+1,
              last_observed_at=excluded.last_observed_at, evidence_json=excluded.evidence_json""",
-        (int(users[0]), int(users[1]), relationship, context, occurred, occurred,
+        (int(observation["community_id"] or 1), int(users[0]), int(users[1]), relationship, context, occurred, occurred,
          json.dumps({"latest_observation_id": int(observation["id"])})),
     )
     relationship_row = connection.execute(
-        """SELECT id FROM entity_relationships WHERE source_user_id=? AND target_user_id=?
+        """SELECT id FROM entity_relationships WHERE community_id=? AND source_user_id=? AND target_user_id=?
            AND relationship_type=? AND context_key=?""",
-        (int(users[0]), int(users[1]), relationship, context),
+        (int(observation["community_id"] or 1), int(users[0]), int(users[1]), relationship, context),
     ).fetchone()
     if relationship_row is not None:
         connection.execute(

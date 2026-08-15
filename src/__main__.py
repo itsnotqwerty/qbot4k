@@ -21,7 +21,7 @@ if __package__ in {None, ""}:
     from src.jobs import run_maintenance_jobs
     from src.jobs import run_twitch_live_announcement_job
     from src.logging_utils import configure_logging
-    from src.token_store import persist_refreshed_twitch_tokens
+    from src.token_store import configure_token_store, persist_refreshed_twitch_tokens
     from src.twitch import TwitchConnector
     from src.twitch_auth import TwitchTokenManager
     from src.pipeline.analysis import AnalysisRegistry
@@ -31,6 +31,7 @@ if __package__ in {None, ""}:
         MessageAnalysisPipeline,
     )
     from src.pipeline.workers import AnalysisWorker, DiscordWorker
+    from src.platform_audit import run_platform_audit
     from src.pipeline.actions import (
         ActionRegistry,
         DiscordMessageActionHandler,
@@ -45,7 +46,7 @@ else:
     from .jobs import run_maintenance_jobs
     from .jobs import run_twitch_live_announcement_job
     from .logging_utils import configure_logging
-    from .token_store import persist_refreshed_twitch_tokens
+    from .token_store import configure_token_store, persist_refreshed_twitch_tokens
     from .twitch import TwitchConnector
     from .twitch_auth import TwitchTokenManager
     from .pipeline.analysis import AnalysisRegistry
@@ -55,6 +56,7 @@ else:
         MessageAnalysisPipeline,
     )
     from .pipeline.workers import AnalysisWorker, DiscordWorker
+    from .platform_audit import run_platform_audit
     from .pipeline.actions import (
         ActionRegistry,
         DiscordMessageActionHandler,
@@ -111,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
         "check-config",
         help="Validate environment configuration")
     subparsers.add_parser("init-db", help="Initialize the SQLite schema")
+    subparsers.add_parser("platform-audit", help="Audit professional-platform readiness")
 
     run_parser = subparsers.add_parser(
         "run",
@@ -142,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def load_settings(env_file: Path | None = None) -> AppSettings:
+    configure_token_store(env_file)
     settings = AppSettings.from_env(env_file=env_file)
     configure_logging(settings.log_level)
     return settings
@@ -166,6 +170,18 @@ def run_init_db(env_file: Path | None = None) -> int:
         return 0
     finally:
         connection.close()
+
+
+def run_readiness_audit(env_file: Path | None = None) -> int:
+    settings = load_settings(env_file)
+    connection = connect_database(settings.database_path)
+    try:
+        initialize_database(connection)
+        result = run_platform_audit(connection, settings)
+    finally:
+        connection.close()
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 1 if result["status"] == "fail" else 0
 
 
 def run_application(once: bool, env_file: Path | None = None) -> int:
@@ -741,6 +757,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_check_config(args.env_file)
         if args.command == "init-db":
             return run_init_db(args.env_file)
+        if args.command == "platform-audit":
+            return run_readiness_audit(args.env_file)
         if args.command == "run":
             return run_application(args.once, args.env_file)
         if args.command == "watch":

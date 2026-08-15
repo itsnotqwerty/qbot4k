@@ -19,6 +19,8 @@ UNIT_NAME="qbot4k.service"
 UNIT_FILE="/etc/systemd/system/${UNIT_NAME}"
 UNIT_DROPIN_DIR="/etc/systemd/system/${UNIT_NAME}.d"
 UNIT_DROPIN_FILE="${UNIT_DROPIN_DIR}/zz-qbot4k-installer.conf"
+POLKIT_RULE_DIR="/etc/polkit-1/rules.d"
+POLKIT_RULE_FILE="${POLKIT_RULE_DIR}/49-qbot4k.rules"
 START_SERVICE=1
 SOURCE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RELEASE_DIR=""
@@ -153,6 +155,8 @@ if [ ! -e "$CONFIG_FILE" ]; then
 # Managed by the operator. install.sh preserves this file during upgrades.
 QBOT_DATABASE_PATH=${STATE_DIR}/qbot4k.sqlite3
 QBOT_BACKUP_DIR=${BACKUP_DIR}
+QBOT_RAW_ARCHIVE_DIR=${STATE_DIR}/raw-events
+QBOT_DEFAULT_COMMUNITY_SLUG=default
 
 # Safe initial profile. Add web after configuring Discord OAuth below.
 QBOT_ENABLED_SERVICES=jobs,analysis
@@ -177,6 +181,8 @@ QBOT_TWITCH_REFRESH_TOKEN=
 QBOT_TWITCH_CLIENT_ID=
 QBOT_TWITCH_CLIENT_SECRET=
 QBOT_TWITCH_CHANNELS=its_not_qwerty
+QBOT_TWITCH_EVENTSUB_SECRET=
+QBOT_TWITCH_EVENTSUB_CALLBACK_URL=
 
 # Safety and scheduling.
 QBOT_MODERATION_SHADOW_MODE=true
@@ -224,6 +230,9 @@ install -m 0644 "$RELEASE_DIR/deploy/qbot4k.service" "$UNIT_FILE"
 install -d -m 0755 -o root -g root "$UNIT_DROPIN_DIR"
 install -m 0644 \
     "$RELEASE_DIR/deploy/zz-qbot4k-installer.conf" "$UNIT_DROPIN_FILE"
+if [ -d "$POLKIT_RULE_DIR" ]; then
+    install -m 0644 "$RELEASE_DIR/deploy/49-qbot4k.rules" "$POLKIT_RULE_FILE"
+fi
 systemctl daemon-reload
 systemctl enable "$UNIT_NAME" >/dev/null
 

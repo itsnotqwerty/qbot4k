@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import logging
+import json
 import socket
 import ssl
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
 from .db import (
@@ -22,7 +26,12 @@ from .db import (
 from .intelligence.events import ingest_event, observation_from_twitch_irc_event
 from .moderation import contains_streamboo_viewer_spam
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
-from .twitch_auth import TwitchAuthError, TwitchTokenManager
+from .twitch_auth import (
+	TwitchAuthError,
+	TwitchReauthorizationRequired,
+	TwitchTemporaryAuthError as TokenTemporaryAuthError,
+	TwitchTokenManager,
+)
 
 
 class TwitchPayloadError(ValueError):
@@ -161,6 +170,7 @@ class TwitchConnector:
 		self._stop_event = threading.Event()
 		self._active_socket: ssl.SSLSocket | None = None
 		self._send_lock = threading.Lock()
+		self._broadcaster_id_cache: dict[str, str] = {}
 
 	def stop(self) -> None:
 		self._stop_event.set()
@@ -369,6 +379,10 @@ class TwitchConnector:
 
 		try:
 			validation = self._token_manager.validate_token()
+		except TwitchReauthorizationRequired as exc:
+			raise TwitchAuthenticationRequired(str(exc)) from exc
+		except TokenTemporaryAuthError as exc:
+			raise TwitchTemporaryAuthError(str(exc)) from exc
 		except TwitchAuthError as exc:
 			raise TwitchConnectionError(str(exc)) from exc
 
@@ -431,25 +445,26 @@ class TwitchConnector:
 			reason = str(action[4] or action_type).strip()
 			username = str(action[5]).strip()
 			duration_seconds = int(action[6]) if len(action) > 6 else 600
+			target_user_id = str(action[7]).strip() if len(action) > 7 else ""
 			channel_id = str(message[0]).strip()
-			if not username or not channel_id:
+			if not username or not channel_id or not target_user_id:
 				raise ValueError(
 					f"Twitch moderation action {action_id} has no target or channel"
 				)
 
-			if action_type == "timeout":
-				command = f"/timeout {username} {duration_seconds} {reason}"
-			elif action_type == "ban":
-				command = f"/ban {username} {reason}"
-			elif action_type == "warn":
-				command = f"@{username} Warning: {reason}"
-			else:
-				raise ValueError(
-					f"Unsupported Twitch moderation action: {action_type}"
-				)
-
-			self.send_message(channel_id, command)
-			mark_moderation_action_completed(connection, action_id)
+			provider_status, response_payload = self._execute_helix_moderation_action(
+				channel_id=channel_id,
+				target_user_id=target_user_id,
+				action_type=action_type,
+				reason=reason,
+				duration_seconds=duration_seconds,
+			)
+			mark_moderation_action_completed(
+				connection,
+				action_id,
+				provider_status=provider_status,
+				provider_response=response_payload,
+			)
 			self._logger.warning(
 				"executed twitch moderation action action_id=%s type=%s "
 				"channel=%s user=%s",
@@ -458,6 +473,106 @@ class TwitchConnector:
 				channel_id,
 				username,
 			)
+
+	def _execute_helix_moderation_action(
+		self,
+		*,
+		channel_id: str,
+		target_user_id: str,
+		action_type: str,
+		reason: str,
+		duration_seconds: int,
+	) -> tuple[str, Mapping[str, object]]:
+		if self._token_manager is None:
+			raise TwitchAuthenticationRequired(
+				"Twitch moderation requires an authenticated Helix token manager"
+			)
+		validation = self._token_manager.validate_token()
+		if not validation.user_id:
+			raise TwitchConnectionError("Twitch token validation omitted moderator user_id")
+		broadcaster_id = self._resolve_broadcaster_id(
+			channel_id, validation.access_token, validation.client_id
+		)
+		query = urlencode({
+			"broadcaster_id": broadcaster_id,
+			"moderator_id": validation.user_id,
+		})
+		if action_type in {"timeout", "ban"}:
+			endpoint = f"https://api.twitch.tv/helix/moderation/bans?{query}"
+			data: dict[str, object] = {"user_id": target_user_id, "reason": reason[:500]}
+			if action_type == "timeout":
+				data["duration"] = max(1, min(int(duration_seconds), 1_209_600))
+		elif action_type == "warn":
+			endpoint = f"https://api.twitch.tv/helix/moderation/warnings?{query}"
+			data = {"user_id": target_user_id, "reason": reason[:500]}
+		else:
+			raise ValueError(f"Unsupported Twitch moderation action: {action_type}")
+		return self._helix_request(
+			endpoint,
+			method="POST",
+			access_token=validation.access_token,
+			client_id=validation.client_id,
+			payload={"data": data},
+		)
+
+	def _resolve_broadcaster_id(self, channel: str, access_token: str, client_id: str) -> str:
+		normalized = channel.strip().removeprefix("#").casefold()
+		if normalized.isdigit():
+			return normalized
+		if normalized in self._broadcaster_id_cache:
+			return self._broadcaster_id_cache[normalized]
+		_, response = self._helix_request(
+			"https://api.twitch.tv/helix/users?" + urlencode({"login": normalized}),
+			method="GET", access_token=access_token, client_id=client_id,
+		)
+		rows = response.get("data")
+		if not isinstance(rows, list) or not rows or not isinstance(rows[0], Mapping):
+			raise TwitchConnectionError(f"Twitch broadcaster {normalized!r} was not found")
+		broadcaster_id = str(rows[0].get("id") or "").strip()
+		if not broadcaster_id:
+			raise TwitchConnectionError("Twitch users response omitted broadcaster id")
+		self._broadcaster_id_cache[normalized] = broadcaster_id
+		return broadcaster_id
+
+	def _helix_request(
+		self,
+		url: str,
+		*,
+		method: str,
+		access_token: str,
+		client_id: str,
+		payload: Mapping[str, object] | None = None,
+	) -> tuple[str, Mapping[str, object]]:
+		body = json.dumps(payload).encode("utf-8") if payload is not None else None
+		request = Request(
+			url,
+			data=body,
+			method=method,
+			headers={
+				"Authorization": f"Bearer {access_token}",
+				"Client-Id": client_id,
+				"Accept": "application/json",
+				"Content-Type": "application/json",
+			},
+		)
+		try:
+			with urlopen(request, timeout=15) as response:
+				raw = response.read().decode("utf-8")
+				parsed = json.loads(raw) if raw.strip() else {}
+				if not isinstance(parsed, dict):
+					parsed = {"data": parsed}
+				return str(response.status), parsed
+		except HTTPError as exc:
+			detail = exc.read().decode("utf-8", errors="replace")[:1000]
+			if exc.code in {401, 403}:
+				raise TwitchAuthenticationRequired(
+					f"Twitch Helix authorization rejected moderation action: HTTP {exc.code} {detail}"
+				) from exc
+			raise TwitchConnectionError(
+				f"Twitch Helix moderation failed: HTTP {exc.code} {detail}"
+			) from exc
+		except URLError as exc:
+			raise TwitchConnectionError(f"Twitch Helix moderation unavailable: {exc.reason}") from exc
 
 	def _send_irc_line(
 		self,

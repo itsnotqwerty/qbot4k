@@ -27,6 +27,7 @@ from .permissions import _everyone_cannot_view
 from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 from .intelligence.signals import refresh_all_derived_signals
+from .intelligence.scoring import SOCIAL_SCORE_MODEL_VERSION, calculate_social_score
 from .models import Observation
 from .db import collect_observation
 from .intelligence.analytics import (
@@ -38,6 +39,11 @@ from .intelligence.analytics import (
 	emit_analytics_alerts,
 )
 from .pipeline.handlers import recover_expired_processing_jobs
+from .intelligence.recovery import flush_raw_event_archive
+from .intelligence.professional_ops import (
+    dispatch_pending_notifications,
+    refresh_stream_cohorts,
+)
 
 
 JobConnectionFactory = Callable[[Path], sqlite3.Connection]
@@ -79,6 +85,7 @@ class MaintenanceReport:
 	identity_suggestion_count: int
 	cohort_baseline_count: int
 	evaluation_run_id: int
+	raw_events_archived: int = 0
 
 
 @dataclass(frozen=True)
@@ -107,8 +114,10 @@ def run_maintenance_jobs(
 		rollup_rows = 0
 		topic_count = graph_node_count = identity_suggestion_count = 0
 		cohort_baseline_count = evaluation_run_id = 0
+		raw_events_archived = 0
 		if perform_maintenance:
 			recover_expired_processing_jobs(connection)
+			raw_events_archived = flush_raw_event_archive(connection, settings.raw_archive_dir)
 			deleted_messages = purge_expired_messages(connection, current_time, settings.message_retention_days)
 			deleted_observations = purge_expired_observations(connection, current_time, settings.message_retention_days)
 			deleted_audit_rows = purge_expired_audit_log(connection, current_time, settings.audit_retention_days)
@@ -118,13 +127,23 @@ def run_maintenance_jobs(
 			rollup_rows = refresh_metrics_rollups(connection, current_time)
 		if perform_analytics:
 			refresh_all_derived_signals(connection)
+			for user_row in connection.execute(
+				"SELECT id FROM users WHERE score_model_version IS NULL OR score_model_version<>? ORDER BY id",
+				(SOCIAL_SCORE_MODEL_VERSION,),
+			).fetchall():
+				calculate_social_score(connection, int(user_row[0]), calculated_at=current_time.isoformat())
 			with connection:
+				for active_session in connection.execute(
+					"SELECT id FROM stream_sessions WHERE status='live'"
+				).fetchall():
+					refresh_stream_cohorts(connection, int(active_session[0]))
 				topic_count = refresh_emerging_topics(connection, now=current_time)
 				graph_node_count = refresh_graph_analytics(connection, calculated_at=current_time.isoformat())
 				identity_suggestion_count = refresh_identity_suggestions(connection)
 				cohort_baseline_count, _ = refresh_cohort_baselines(connection, calculated_at=current_time.isoformat())
 				evaluation_run_id = run_model_evaluation(connection)
 				emit_analytics_alerts(connection, calculated_at=current_time.isoformat())
+			dispatch_pending_notifications(connection)
 			record_operational_metric(connection, "analytics.refresh.success", 1.0, observed_at=current_time.isoformat())
 		if perform_maintenance:
 			record_operational_metric(connection, "maintenance.success", 1.0, observed_at=current_time.isoformat())
@@ -162,6 +181,7 @@ def run_maintenance_jobs(
 		identity_suggestion_count=identity_suggestion_count,
 		cohort_baseline_count=cohort_baseline_count,
 		evaluation_run_id=evaluation_run_id,
+		raw_events_archived=raw_events_archived,
 	)
 
 
@@ -180,12 +200,27 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 		return 0
 
 	twitch_token_manager = _build_twitch_token_manager(settings)
-	stream = _fetch_twitch_live_stream("its_not_qwerty", twitch_token_manager)
-	_record_twitch_stream_lifecycle(settings.database_path, "its_not_qwerty", stream)
-	if stream is None:
-		JOBS_LOGGER.info("no active twitch stream detected for channel=%s", "its_not_qwerty")
-		return 0
+	announcements_sent = 0
+	for twitch_channel_name in settings.twitch_channels:
+		stream = _fetch_twitch_live_stream(twitch_channel_name, twitch_token_manager)
+		_record_twitch_stream_lifecycle(settings.database_path, twitch_channel_name, stream)
+		if stream is None:
+			JOBS_LOGGER.info("no active twitch stream detected for channel=%s", twitch_channel_name)
+			continue
+		announcements_sent += _announce_stream_to_guilds(
+			settings, guild_ids, twitch_channel_name, stream, deduplicate=True
+		)
+	return announcements_sent
 
+
+def _announce_stream_to_guilds(
+	settings: AppSettings,
+	guild_ids: tuple[str, ...],
+	twitch_channel_name: str,
+	stream: TwitchLiveStream,
+	*,
+	deduplicate: bool,
+) -> int:
 	announcements_sent = 0
 	for guild_id in guild_ids:
 		guild_channels = _fetch_discord_guild_channels(guild_id, settings.discord_bot_token)
@@ -204,9 +239,9 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 					channel_type=int(channel.get("type") or 0),
 				)
 
-			if has_twitch_live_announcement(
+			if deduplicate and has_twitch_live_announcement(
 				connection,
-				twitch_channel_name="its_not_qwerty",
+				twitch_channel_name=twitch_channel_name,
 				twitch_stream_id=stream.stream_id,
 				discord_guild_id=guild_id,
 			):
@@ -222,20 +257,22 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 			bot_token=settings.discord_bot_token,
 			channel_id=target_channel_id,
 			stream=stream,
+			twitch_channel_name=twitch_channel_name,
 		)
 
-		connection = connect_database(settings.database_path)
-		try:
-			initialize_database(connection)
-			record_twitch_live_announcement(
-				connection,
-				twitch_channel_name="its_not_qwerty",
-				twitch_stream_id=stream.stream_id,
-				discord_guild_id=guild_id,
-				discord_channel_id=target_channel_id,
-			)
-		finally:
-			connection.close()
+		if deduplicate:
+			connection = connect_database(settings.database_path)
+			try:
+				initialize_database(connection)
+				record_twitch_live_announcement(
+					connection,
+					twitch_channel_name=twitch_channel_name,
+					twitch_stream_id=stream.stream_id,
+					discord_guild_id=guild_id,
+					discord_channel_id=target_channel_id,
+				)
+			finally:
+				connection.close()
 		announcements_sent += 1
 
 	return announcements_sent
@@ -301,27 +338,15 @@ def send_manual_twitch_live_announcements(settings: AppSettings) -> int:
 		return 0
 
 	twitch_token_manager = _build_twitch_token_manager(settings)
-	stream = _fetch_twitch_live_stream("its_not_qwerty", twitch_token_manager)
-	if stream is None:
-		JOBS_LOGGER.info("manual go-live skipped: no active twitch stream for channel=%s", "its_not_qwerty")
-		return 0
-
 	announcements_sent = 0
-	for guild_id in guild_ids:
-		guild_channels = _fetch_discord_guild_channels(guild_id, settings.discord_bot_token)
-		if not guild_channels:
+	for twitch_channel_name in settings.twitch_channels:
+		stream = _fetch_twitch_live_stream(twitch_channel_name, twitch_token_manager)
+		if stream is None:
+			JOBS_LOGGER.info("manual go-live skipped: no active twitch stream for channel=%s", twitch_channel_name)
 			continue
-
-		target_channel_id = _pick_best_discord_channel_for_stream(guild_channels, stream.title, stream.game_name, guild_id=guild_id)
-		if not target_channel_id:
-			continue
-
-		_send_discord_here_announcement(
-			bot_token=settings.discord_bot_token,
-			channel_id=target_channel_id,
-			stream=stream,
+		announcements_sent += _announce_stream_to_guilds(
+			settings, guild_ids, twitch_channel_name, stream, deduplicate=False
 		)
-		announcements_sent += 1
 
 	return announcements_sent
 
@@ -376,7 +401,12 @@ def purge_expired_messages(
 	cutoff = _cutoff_timestamp(now, retention_days)
 	with connection:
 		cursor = connection.execute(
-			"DELETE FROM messages WHERE datetime(sent_at) < datetime(?)",
+			"""DELETE FROM messages WHERE datetime(sent_at) < datetime(?)
+			   AND NOT EXISTS (
+			       SELECT 1 FROM legal_holds
+			       WHERE legal_holds.community_id=messages.community_id
+			         AND legal_holds.status='active'
+			   )""",
 			(cutoff,),
 		)
 	return int(cursor.rowcount or 0)
@@ -392,6 +422,11 @@ def purge_expired_observations(
 		cursor = connection.execute(
 			"""
 			DELETE FROM observations WHERE occurred_at < ?
+				AND NOT EXISTS (
+					SELECT 1 FROM legal_holds
+					WHERE legal_holds.community_id=observations.community_id
+					  AND legal_holds.status='active'
+				)
 				AND id NOT IN (
 					SELECT observation_id
 					FROM messages
@@ -717,12 +752,14 @@ def _tokenize(text: str) -> set[str]:
 	return tokens
 
 
-def _send_discord_here_announcement(*, bot_token: str, channel_id: str, stream: TwitchLiveStream) -> None:
+def _send_discord_here_announcement(
+	*, bot_token: str, channel_id: str, stream: TwitchLiveStream, twitch_channel_name: str
+) -> None:
 	token = bot_token.removeprefix("Bot ").strip()
 	title_suffix = f" - {stream.title}" if stream.title else ""
 	payload = {
 		"allowed_mentions": {"parse": ["everyone"]},
-		"content": f"@here its_not_qwerty is live: {stream.url}{title_suffix}",
+		"content": f"@here {twitch_channel_name} is live: {stream.url}{title_suffix}",
 	}
 	request = Request(
 		f"https://discord.com/api/v10/channels/{channel_id}/messages",

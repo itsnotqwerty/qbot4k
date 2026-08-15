@@ -17,6 +17,8 @@ from ..models import NormalizedMessage
 from ..intelligence.signals import refresh_user_derived_signals
 from ..intelligence.workflows import process_intelligence_observation
 from ..intelligence.content import analyze_observation_content, emit_content_alert
+from ..intelligence.campaigns import analyze_coordination_campaign
+from ..intelligence.profiles import refresh_community_profile
 from ..server_boosts import is_server_boost_confirmation, process_discord_server_boost
 
 
@@ -168,6 +170,12 @@ class MessageAnalysisPipeline:
                     user_id=user_id,
                     observation_id=observation_id,
                 )
+                refresh_community_profile(
+                    connection,
+                    community_id=int(observation["community_id"] or 1),
+                    user_id=user_id,
+                )
+            analyze_coordination_campaign(connection, observation_id)
 
     def _analyze_command(
         self,

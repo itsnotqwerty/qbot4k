@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import sqlite3
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Mapping
@@ -28,6 +30,53 @@ _WELCOME_TARGET_HANDLE_PATTERN = re.compile(r"@([a-zA-Z0-9_]{2,64})")
 
 
 SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS organizations (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id INTEGER PRIMARY KEY,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(organization_id, slug)
+);
+
+CREATE TABLE IF NOT EXISTS communities (
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    retention_days INTEGER NOT NULL DEFAULT 90,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(workspace_id, slug)
+);
+
+CREATE TABLE IF NOT EXISTS community_installations (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    external_community_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    token_reference TEXT,
+    last_verified_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(platform, external_community_id)
+);
+
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
     primary_display_name TEXT NOT NULL,
@@ -62,6 +111,14 @@ CREATE TABLE IF NOT EXISTS operator_accounts (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS operator_community_roles (
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(operator_id, community_id)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
@@ -69,6 +126,7 @@ CREATE TABLE IF NOT EXISTS messages (
     platform_message_id TEXT,
     platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
     user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
     channel_id TEXT NOT NULL,
     content_raw TEXT NOT NULL,
     content_normalized TEXT NOT NULL,
@@ -109,6 +167,7 @@ CREATE TABLE IF NOT EXISTS twitch_channels (
 CREATE TABLE IF NOT EXISTS moderation_rules (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
+    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
     rule_type TEXT NOT NULL,
     pattern TEXT NOT NULL,
     severity TEXT NOT NULL,
@@ -146,6 +205,8 @@ CREATE TABLE IF NOT EXISTS moderation_actions (
     error_message TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT
+    ,provider_status TEXT
+    ,provider_response_json TEXT NOT NULL DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS reputation_events (
@@ -274,8 +335,6 @@ CREATE INDEX IF NOT EXISTS idx_welcome_events_sender_target_created_at
     ON welcome_events(sender_platform_account_id, target_identifier, created_at);
 CREATE INDEX IF NOT EXISTS idx_twitch_channels_status
     ON twitch_channels(status, channel_name);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_rules_name
-    ON moderation_rules(name);
 CREATE INDEX IF NOT EXISTS idx_moderation_actions_created_at
     ON moderation_actions(created_at);
 CREATE INDEX IF NOT EXISTS idx_reputation_events_user_id
@@ -302,6 +361,7 @@ CREATE INDEX IF NOT EXISTS idx_service_reliability_buckets_lookup
 CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY,
     platform TEXT NOT NULL,
+    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
     event_type TEXT NOT NULL,
     external_event_id TEXT,
     actor_platform_account_id INTEGER
@@ -312,6 +372,7 @@ CREATE TABLE IF NOT EXISTS observations (
     context_id TEXT,
     text_raw TEXT,
     attributes_json TEXT NOT NULL DEFAULT '{}',
+    raw_payload_json TEXT NOT NULL DEFAULT '{}',
     occurred_at TEXT NOT NULL,
     ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     schema_version INTEGER NOT NULL DEFAULT 1,
@@ -464,6 +525,7 @@ CREATE TABLE IF NOT EXISTS derived_signal_evidence (
 
 CREATE TABLE IF NOT EXISTS intelligence_alerts (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     signal_history_id INTEGER REFERENCES derived_signal_history(id) ON DELETE SET NULL,
     observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
@@ -485,6 +547,7 @@ CREATE TABLE IF NOT EXISTS intelligence_alerts (
 
 CREATE TABLE IF NOT EXISTS investigation_cases (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
     title TEXT NOT NULL,
     summary TEXT NOT NULL DEFAULT '',
     priority TEXT NOT NULL DEFAULT 'medium',
@@ -526,6 +589,7 @@ CREATE TABLE IF NOT EXISTS case_activity (
 
 CREATE TABLE IF NOT EXISTS entity_relationships (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
     source_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     target_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     relationship_type TEXT NOT NULL,
@@ -535,7 +599,7 @@ CREATE TABLE IF NOT EXISTS entity_relationships (
     first_observed_at TEXT NOT NULL,
     last_observed_at TEXT NOT NULL,
     evidence_json TEXT NOT NULL DEFAULT '{}',
-    UNIQUE(source_user_id, target_user_id, relationship_type, context_key)
+    UNIQUE(community_id, source_user_id, target_user_id, relationship_type, context_key)
 );
 
 CREATE TABLE IF NOT EXISTS relationship_evidence (
@@ -881,6 +945,371 @@ CREATE TABLE IF NOT EXISTS operational_metrics (
     PRIMARY KEY(metric_name, dimension_key, observed_at)
 );
 
+CREATE TABLE IF NOT EXISTS community_memberships (
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member',
+    joined_at TEXT,
+    left_at TEXT,
+    attributes_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY(community_id, platform_account_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_policy_settings (
+    community_id INTEGER PRIMARY KEY REFERENCES communities(id) ON DELETE CASCADE,
+    moderation_shadow_mode INTEGER NOT NULL DEFAULT 1,
+    automatic_enforcement_enabled INTEGER NOT NULL DEFAULT 0,
+    model_thresholds_json TEXT NOT NULL DEFAULT '{}',
+    sharing_policy TEXT NOT NULL DEFAULT 'isolated',
+    updated_by_operator_id INTEGER,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS intelligence_sharing_agreements (
+    id INTEGER PRIMARY KEY,
+    source_community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    target_community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    allowed_finding_types_json TEXT NOT NULL DEFAULT '[]',
+    expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(source_community_id, target_community_id)
+);
+
+CREATE TABLE IF NOT EXISTS legal_holds (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    case_id INTEGER REFERENCES investigation_cases(id) ON DELETE SET NULL,
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_by_operator_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    released_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raw_event_archive (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    platform TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    external_event_id TEXT,
+    payload_sha256 TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    archive_path TEXT,
+    received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(community_id, platform, event_type, external_event_id, payload_sha256)
+);
+
+CREATE TABLE IF NOT EXISTS dead_letter_events (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    processing_job_id INTEGER REFERENCES processing_jobs(id) ON DELETE SET NULL,
+    stage TEXT NOT NULL,
+    error_class TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    replayed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS replay_requests (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    requested_by_operator_id INTEGER,
+    event_type TEXT,
+    start_at TEXT,
+    end_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    replayed_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS model_registry (
+    model_key TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'shadow',
+    description TEXT NOT NULL,
+    minimum_precision REAL,
+    approved_by_operator_id INTEGER,
+    approved_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(model_key, version)
+);
+
+CREATE TABLE IF NOT EXISTS community_intelligence_profiles (
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    profile_version INTEGER NOT NULL,
+    trust_score REAL NOT NULL,
+    risk_score REAL NOT NULL,
+    engagement_score REAL NOT NULL,
+    identity_confidence REAL NOT NULL,
+    maturity_score REAL NOT NULL,
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    explanation_json TEXT NOT NULL DEFAULT '{}',
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY(community_id, user_id, profile_version)
+);
+
+CREATE TABLE IF NOT EXISTS coordination_campaigns (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    campaign_key TEXT NOT NULL,
+    campaign_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    message_count INTEGER NOT NULL DEFAULT 0,
+    actor_count INTEGER NOT NULL DEFAULT 0,
+    confidence REAL NOT NULL DEFAULT 0.0,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(community_id, campaign_key)
+);
+
+CREATE TABLE IF NOT EXISTS coordination_campaign_members (
+    campaign_id INTEGER NOT NULL REFERENCES coordination_campaigns(id) ON DELETE CASCADE,
+    observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
+    user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    similarity REAL NOT NULL,
+    added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(campaign_id, observation_id)
+);
+
+CREATE TABLE IF NOT EXISTS data_subject_requests (
+    id INTEGER PRIMARY KEY,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    request_type TEXT NOT NULL,
+    platform TEXT,
+    platform_user_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    result_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS twitch_eventsub_subscriptions (
+    subscription_id TEXT PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    subscription_type TEXT NOT NULL,
+    subscription_version TEXT NOT NULL,
+    condition_json TEXT NOT NULL,
+    transport_method TEXT NOT NULL,
+    status TEXT NOT NULL,
+    callback_url TEXT,
+    cost INTEGER NOT NULL DEFAULT 0,
+    last_event_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS api_clients (
+    id INTEGER PRIMARY KEY,
+    organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',
+    rate_limit_per_minute INTEGER NOT NULL DEFAULT 120,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    revoked_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS api_request_usage (
+    api_client_id INTEGER NOT NULL REFERENCES api_clients(id) ON DELETE CASCADE,
+    minute_bucket TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(api_client_id, minute_bucket)
+);
+
+CREATE TABLE IF NOT EXISTS stream_sessions (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    stream_key TEXT NOT NULL,
+    external_stream_id TEXT,
+    title TEXT,
+    category TEXT,
+    status TEXT NOT NULL DEFAULT 'live',
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    opening_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    closing_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    metrics_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(community_id, platform, stream_key, started_at)
+);
+
+CREATE TABLE IF NOT EXISTS operations_incidents (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    stream_session_id INTEGER REFERENCES stream_sessions(id) ON DELETE SET NULL,
+    campaign_id INTEGER REFERENCES coordination_campaigns(id) ON DELETE SET NULL,
+    incident_type TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    assigned_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    escalation_level INTEGER NOT NULL DEFAULT 0,
+    playbook_key TEXT,
+    opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    closed_at TEXT,
+    UNIQUE(community_id, campaign_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_alerts (
+    incident_id INTEGER NOT NULL REFERENCES operations_incidents(id) ON DELETE CASCADE,
+    alert_id INTEGER NOT NULL UNIQUE REFERENCES intelligence_alerts(id) ON DELETE CASCADE,
+    grouped_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(incident_id, alert_id)
+);
+
+CREATE TABLE IF NOT EXISTS incident_activity (
+    id INTEGER PRIMARY KEY,
+    incident_id INTEGER NOT NULL REFERENCES operations_incidents(id) ON DELETE CASCADE,
+    operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    activity_type TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS moderation_shifts (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    lead_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    incoming_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    ended_at TEXT,
+    handoff_note TEXT NOT NULL DEFAULT '',
+    handoff_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS raid_playbooks (
+    playbook_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'high',
+    steps_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS raid_playbook_runs (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    incident_id INTEGER REFERENCES operations_incidents(id) ON DELETE SET NULL,
+    playbook_key TEXT NOT NULL REFERENCES raid_playbooks(playbook_key),
+    activated_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    current_step INTEGER NOT NULL DEFAULT 0,
+    state_json TEXT NOT NULL DEFAULT '{}',
+    activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS twitch_control_actions (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    broadcaster_id TEXT NOT NULL,
+    control_type TEXT NOT NULL,
+    requested_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    provider_status TEXT,
+    provider_response_json TEXT NOT NULL DEFAULT '{}',
+    requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    confirmed_at TEXT,
+    error_message TEXT
+);
+
+CREATE TABLE IF NOT EXISTS notification_destinations (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    destination_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    target TEXT NOT NULL,
+    minimum_severity TEXT NOT NULL DEFAULT 'high',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    secret_reference TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS notification_deliveries (
+    id INTEGER PRIMARY KEY,
+    destination_id INTEGER NOT NULL REFERENCES notification_destinations(id) ON DELETE CASCADE,
+    incident_id INTEGER REFERENCES operations_incidents(id) ON DELETE CASCADE,
+    alert_id INTEGER REFERENCES intelligence_alerts(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payload_json TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS post_stream_briefings (
+    id INTEGER PRIMARY KEY,
+    stream_session_id INTEGER NOT NULL UNIQUE REFERENCES stream_sessions(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'draft',
+    title TEXT NOT NULL,
+    executive_summary TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    incidents_json TEXT NOT NULL DEFAULT '[]',
+    cohorts_json TEXT NOT NULL DEFAULT '{}',
+    recommendations_json TEXT NOT NULL DEFAULT '[]',
+    generated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS stream_cohort_snapshots (
+    stream_session_id INTEGER NOT NULL REFERENCES stream_sessions(id) ON DELETE CASCADE,
+    cohort_key TEXT NOT NULL,
+    member_count INTEGER NOT NULL,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    calculated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(stream_session_id, cohort_key)
+);
+
+CREATE TABLE IF NOT EXISTS audience_edges (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    source_key TEXT NOT NULL,
+    target_key TEXT NOT NULL,
+    edge_type TEXT NOT NULL,
+    weight REAL NOT NULL DEFAULT 1.0,
+    event_count INTEGER NOT NULL DEFAULT 1,
+    first_observed_at TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE(community_id, source_key, target_key, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stream_sessions_active
+    ON stream_sessions(community_id, status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operations_incidents_queue
+    ON operations_incidents(community_id, status, severity, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incident_activity_time
+    ON incident_activity(incident_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_notification_delivery_queue
+    ON notification_deliveries(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_audience_edges_community
+    ON audience_edges(community_id, edge_type, weight DESC);
+
+CREATE INDEX IF NOT EXISTS idx_campaigns_community_time
+    ON coordination_campaigns(community_id, last_observed_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_operational_metrics_time
     ON operational_metrics(metric_name, observed_at DESC);
 """
@@ -896,6 +1325,10 @@ DEFAULT_COMMAND_DEFINITIONS = (
 )
 
 
+_SCHEMA_INIT_LOCK = threading.Lock()
+_INITIALIZED_DATABASES: set[str] = set()
+
+
 def connect_database(database_path: Path) -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
@@ -907,24 +1340,106 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def initialize_database(connection: sqlite3.Connection) -> None:
-    with connection:
-        connection.executescript(SCHEMA_SQL)
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO observation_fts(
-                rowid, text, platform, event_type, container_id, context_id
+def initialize_database(connection: sqlite3.Connection, *, force: bool = False) -> None:
+    database_row = connection.execute("PRAGMA database_list").fetchone()
+    database_key = str(database_row[2] if database_row is not None else "")
+    cacheable = bool(database_key and database_key != ":memory:")
+    with _SCHEMA_INIT_LOCK:
+        if cacheable and not force and database_key in _INITIALIZED_DATABASES:
+            return
+        with connection:
+            connection.executescript(SCHEMA_SQL)
+            _seed_default_tenant(connection)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO observation_fts(
+                    rowid, text, platform, event_type, container_id, context_id
+                )
+                SELECT id, COALESCE(text_raw, ''), platform, event_type,
+                       COALESCE(container_id, ''), COALESCE(context_id, '')
+                FROM observations
+                """
             )
-            SELECT id, COALESCE(text_raw, ''), platform, event_type,
-                   COALESCE(container_id, ''), COALESCE(context_id, '')
-            FROM observations
-            """
-        )
-        _migrate_schema(connection)
-        _seed_default_command_definitions(connection)
-        _seed_builtin_moderation_rules(connection)
-        _backfill_social_scores(connection)
+            _migrate_schema(connection)
+            _seed_default_command_definitions(connection)
+            _seed_builtin_moderation_rules(connection)
+            _seed_model_registry(connection)
+            _seed_raid_playbooks(connection)
+            _backfill_social_scores(connection)
+        if cacheable:
+            _INITIALIZED_DATABASES.add(database_key)
 
+
+def _seed_default_tenant(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT OR IGNORE INTO organizations(id,name,slug) VALUES (1,'Default Organization','default')"
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO workspaces(id,organization_id,name,slug) VALUES (1,1,'Default Workspace','default')"
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO communities(id,workspace_id,name,slug) VALUES (1,1,'Default Community','default')"
+    )
+    connection.execute(
+        "INSERT OR IGNORE INTO community_policy_settings(community_id) VALUES (1)"
+    )
+
+
+def _seed_model_registry(connection: sqlite3.Connection) -> None:
+    connection.executemany(
+        """INSERT OR IGNORE INTO model_registry(model_key,version,status,description,minimum_precision)
+           VALUES (?,?,?,?,?)""",
+        (
+            ("content-understanding", 3, "shadow", "Deterministic content understanding fallback", 0.95),
+            ("community-profile", 1, "shadow", "Community-scoped multi-axis profile", 0.90),
+            ("coordination-campaign", 1, "shadow", "Near-duplicate campaign clustering", 0.90),
+        ),
+    )
+
+
+def _seed_raid_playbooks(connection: sqlite3.Connection) -> None:
+    playbooks = (
+        (
+            "raid-lockdown",
+            "Raid Lockdown",
+            "Immediate containment for coordinated harassment or bot raids.",
+            "critical",
+            [
+                {"key": "shield", "label": "Enable Twitch Shield Mode", "control": "shield_mode", "value": True},
+                {"key": "followers", "label": "Require ten-minute follows", "control": "chat_settings", "settings": {"follower_mode": True, "follower_mode_duration": 10}},
+                {"key": "slow", "label": "Enable ten-second slow mode", "control": "chat_settings", "settings": {"slow_mode": True, "slow_mode_wait_time": 10}},
+                {"key": "notify", "label": "Escalate to all critical destinations", "control": "notify"},
+            ],
+        ),
+        (
+            "spam-containment",
+            "Spam Containment",
+            "Reduce coordinated link and repeated-message campaigns while preserving chat.",
+            "high",
+            [
+                {"key": "links", "label": "Disable non-moderator links", "control": "policy", "value": "links_restricted"},
+                {"key": "slow", "label": "Enable five-second slow mode", "control": "chat_settings", "settings": {"slow_mode": True, "slow_mode_wait_time": 5}},
+                {"key": "assign", "label": "Assign incident commander", "control": "assign"},
+            ],
+        ),
+        (
+            "recovery",
+            "Recovery",
+            "Return chat settings to normal after containment and preserve the incident record.",
+            "medium",
+            [
+                {"key": "shield", "label": "Disable Twitch Shield Mode", "control": "shield_mode", "value": False},
+                {"key": "slow", "label": "Disable slow mode", "control": "chat_settings", "settings": {"slow_mode": False}},
+                {"key": "brief", "label": "Generate incident briefing", "control": "briefing"},
+            ],
+        ),
+    )
+    connection.executemany(
+        """INSERT INTO raid_playbooks(playbook_key,name,description,severity,steps_json)
+           VALUES (?,?,?,?,?) ON CONFLICT(playbook_key) DO NOTHING""",
+        ((key, name, description, severity, json.dumps(steps, sort_keys=True))
+         for key, name, description, severity, steps in playbooks),
+    )
 
 def _migrate_schema(connection: sqlite3.Connection) -> None:
     processing_columns = {
@@ -985,6 +1500,19 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         ("review_queue", "resolution", "TEXT"),
         ("review_queue", "resolution_note", "TEXT NOT NULL DEFAULT ''"),
         ("review_queue", "resolved_by_operator_id", "INTEGER"),
+        ("messages", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("moderation_rules", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("observations", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("observations", "raw_payload_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("intelligence_alerts", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("investigation_cases", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("entity_relationships", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("moderation_actions", "provider_status", "TEXT"),
+        ("moderation_actions", "provider_response_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("moderation_actions", "assigned_operator_id", "INTEGER"),
+        ("moderation_actions", "escalated_at", "TEXT"),
+        ("moderation_actions", "provider_confirmed_at", "TEXT"),
+        ("moderation_actions", "provider_event_id", "TEXT"),
     )
     for table_name, column_name, definition in migration_columns:
         columns = {
@@ -996,10 +1524,23 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
                 f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
             )
 
+    connection.execute("DROP INDEX IF EXISTS idx_moderation_rules_name")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_moderation_rules_community_name "
+        "ON moderation_rules(community_id, name)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_relationships_community_key "
+        "ON entity_relationships(community_id, source_user_id, target_user_id, "
+        "relationship_type, context_key)"
+    )
+
     migrations = (
         (1, "processing job leases"),
         (2, "canonical identity attribution"),
         (3, "intelligence platform P0-P3"),
+        (4, "community tenancy and professional operations"),
+        (5, "real-time stream operations and incident command"),
     )
     connection.executemany(
         "INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)",
@@ -1075,6 +1616,15 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_moderation_actions_user_id ON moderation_actions(user_id, created_at)"
     )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_community_time ON observations(community_id, occurred_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_alerts_community_status ON intelligence_alerts(community_id, status, severity, created_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_cases_community_status ON investigation_cases(community_id, status, updated_at DESC)"
+    )
     _cleanup_legacy_merged_users(connection)
 
 
@@ -1147,17 +1697,17 @@ def _cleanup_legacy_merged_users(connection: sqlite3.Connection) -> None:
 def _seed_builtin_moderation_rules(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
-        INSERT INTO moderation_rules (name, rule_type, pattern, severity, auto_enforce_action, enabled)
-        VALUES (?, 'egregious_term', '*', 'high', 'timeout', 1)
-        ON CONFLICT(name) DO NOTHING
+        INSERT INTO moderation_rules (community_id, name, rule_type, pattern, severity, auto_enforce_action, enabled)
+        VALUES (1, ?, 'egregious_term', '*', 'high', 'timeout', 1)
+        ON CONFLICT(community_id, name) DO NOTHING
         """,
         (BUILTIN_EGREGIOUS_RULE_NAME,),
     )
     connection.execute(
         """
-        INSERT INTO moderation_rules (name, rule_type, pattern, severity, auto_enforce_action, enabled)
-        VALUES (?, 'streamboo_viewer_spam', 'streamboo + solicitation', 'high', 'timeout', 1)
-        ON CONFLICT(name) DO NOTHING
+        INSERT INTO moderation_rules (community_id, name, rule_type, pattern, severity, auto_enforce_action, enabled)
+        VALUES (1, ?, 'streamboo_viewer_spam', 'streamboo + solicitation', 'high', 'timeout', 1)
+        ON CONFLICT(community_id, name) DO NOTHING
         """,
         (BUILTIN_STREAMBOO_RULE_NAME,),
     )
@@ -1324,7 +1874,7 @@ def reset_database(connection: sqlite3.Connection) -> dict[str, int]:
     finally:
         connection.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys_enabled else 'OFF'}")
 
-    initialize_database(connection)
+    initialize_database(connection, force=True)
     return {"tables_cleared": len(tables), "rows_deleted": deleted_rows}
 
 
@@ -1525,7 +2075,6 @@ def ensure_platform_account(
             """,
             (platform, platform_user_id),
         ).fetchone()
-
     if row is None:
         raise sqlite3.IntegrityError("Failed to resolve platform account after upsert")
 
@@ -1563,6 +2112,14 @@ def upsert_operator_account(
             """,
             (discord_user_id,),
         ).fetchone()
+        if row is not None:
+            scoped_role = "owner" if role.strip().casefold() == "admin" else role.strip().casefold()
+            connection.execute(
+                """INSERT INTO operator_community_roles(operator_id, community_id, role)
+                   VALUES (?, 1, ?)
+                   ON CONFLICT(operator_id, community_id) DO UPDATE SET role=excluded.role""",
+                (int(row[0]), scoped_role),
+            )
 
     if row is None:
         raise sqlite3.IntegrityError("Failed to resolve operator account after upsert")
@@ -1678,6 +2235,7 @@ def persist_normalized_message(
                 """
                 INSERT INTO messages (
                     platform,
+                    community_id,
                     platform_message_id,
                     platform_account_id,
                     channel_id,
@@ -1685,10 +2243,11 @@ def persist_normalized_message(
                     content_normalized,
                     sent_at,
                     observation_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.platform,
+                    int(message.metadata.get("community_id") or 1),
                     message.platform_message_id,
                     platform_account_id,
                     message.channel_id,
@@ -1747,7 +2306,8 @@ def persist_normalized_message(
                     source_id=message_id,
                 )
 
-            moderation_rules = load_enabled_moderation_rules(connection)
+            community_id = int(message.metadata.get("community_id") or 1)
+            moderation_rules = load_enabled_moderation_rules(connection, community_id=community_id)
             builtin_egregious_rule = next(
                 (r for r in moderation_rules if r.name == BUILTIN_EGREGIOUS_RULE_NAME),
                 None,
@@ -2105,6 +2665,7 @@ def upsert_moderation_rule(
     enabled: bool = True,
     enforcement_mode: str = "enforce",
     action_duration_seconds: int = 600,
+    community_id: int = 1,
 ) -> int:
     cleaned_name = name.strip()
     cleaned_type = rule_type.strip().casefold()
@@ -2126,6 +2687,7 @@ def upsert_moderation_rule(
         connection.execute(
             """
             INSERT INTO moderation_rules (
+                community_id,
                 name,
                 rule_type,
                 pattern,
@@ -2134,8 +2696,8 @@ def upsert_moderation_rule(
                 enabled,
                 enforcement_mode,
                 action_duration_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(name)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(community_id, name)
             DO UPDATE SET
                 rule_type = excluded.rule_type,
                 pattern = excluded.pattern,
@@ -2147,6 +2709,7 @@ def upsert_moderation_rule(
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
+                int(community_id),
                 cleaned_name,
                 cleaned_type,
                 pattern,
@@ -2158,8 +2721,8 @@ def upsert_moderation_rule(
             ),
         )
         row = connection.execute(
-            "SELECT id FROM moderation_rules WHERE name = ?",
-            (cleaned_name,),
+            "SELECT id FROM moderation_rules WHERE community_id = ? AND name = ?",
+            (int(community_id), cleaned_name),
         ).fetchone()
 
     if row is None:
@@ -2168,15 +2731,19 @@ def upsert_moderation_rule(
     return int(row[0])
 
 
-def load_enabled_moderation_rules(connection: sqlite3.Connection) -> list[ModerationRule]:
+def load_enabled_moderation_rules(
+    connection: sqlite3.Connection, *, community_id: int = 1
+) -> list[ModerationRule]:
     rows = connection.execute(
         """
         SELECT id, name, rule_type, pattern, severity, auto_enforce_action, enabled,
                enforcement_mode, action_duration_seconds
         FROM moderation_rules
-        WHERE enabled = 1
+        WHERE enabled = 1 AND community_id = ?
         ORDER BY id
         """
+        ,
+        (int(community_id),),
     ).fetchall()
     return [
         ModerationRule(
@@ -2391,7 +2958,8 @@ def list_pending_moderation_actions_for_message(
             moderation_actions.action_type,
             moderation_actions.reason,
             platform_accounts.username,
-            moderation_actions.duration_seconds
+            moderation_actions.duration_seconds,
+            platform_accounts.platform_user_id
         FROM moderation_actions
         INNER JOIN platform_accounts ON platform_accounts.id = moderation_actions.target_platform_account_id
         WHERE moderation_actions.message_id = ?
@@ -2406,16 +2974,25 @@ def list_pending_moderation_actions_for_message(
 def mark_moderation_action_completed(
     connection: sqlite3.Connection,
     action_id: int,
+    *,
+    provider_status: str | None = None,
+    provider_response: Mapping[str, object] | None = None,
 ) -> None:
     with connection:
         connection.execute(
             """
             UPDATE moderation_actions
             SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
-                error_message = NULL
+                error_message = NULL, provider_status = ?, provider_response_json = ?,
+                provider_confirmed_at = CASE WHEN platform='twitch' THEN CURRENT_TIMESTAMP
+                                             ELSE provider_confirmed_at END
             WHERE id = ?
             """,
-            (action_id,),
+            (
+                provider_status,
+                json.dumps(dict(provider_response or {}), sort_keys=True),
+                action_id,
+            ),
         )
 
 
@@ -2706,6 +3283,7 @@ def persist_observation(
                 """
                 INSERT INTO observations (
                     platform,
+                    community_id,
                     event_type,
                     external_event_id,
                     actor_platform_account_id,
@@ -2714,12 +3292,14 @@ def persist_observation(
                     context_id,
                     text_raw,
                     attributes_json,
+                    raw_payload_json,
                     occurred_at,
                     schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     observation.platform,
+                    max(1, int(observation.community_id)),
                     observation.event_type,
                     observation.external_event_id,
                     actor_account_id,
@@ -2731,6 +3311,12 @@ def persist_observation(
                         observation.attributes,
                         sort_keys=True,
                         separators=(",", ":"),
+                    ),
+                    json.dumps(
+                        observation.raw_payload or observation.attributes,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                        default=str,
                     ),
                     observation.occurred_at,
                     observation.schema_version,
@@ -2933,6 +3519,27 @@ def collect_observation(
             idempotency_key=(
                 f"observation:{observation_id}:"
                 f"{observation.event_type}:v1"
+            ),
+        )
+        payload_json = json.dumps(
+            observation.raw_payload or observation.attributes,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        connection.execute(
+            """INSERT OR IGNORE INTO raw_event_archive(
+                   community_id,observation_id,platform,event_type,external_event_id,
+                   payload_sha256,payload_json
+               ) VALUES (?,?,?,?,?,?,?)""",
+            (
+                max(1, int(observation.community_id)),
+                observation_id,
+                observation.platform,
+                observation.event_type,
+                observation.external_event_id,
+                hashlib.sha256(payload_json.encode("utf-8")).hexdigest(),
+                payload_json,
             ),
         )
 

@@ -115,6 +115,10 @@ class AppSettings:
     analytics_interval_seconds: int
     backup_interval_seconds: int
     backup_retention_count: int
+    raw_archive_dir: Path
+    default_community_slug: str
+    twitch_eventsub_secret: str | None
+    twitch_eventsub_callback_url: str | None
 
     @classmethod
     def from_env(
@@ -172,8 +176,9 @@ class AppSettings:
         if not twitch_channels:
             twitch_channels = ("its_not_qwerty",)
 
+        database_path = Path(database_raw).expanduser().resolve()
         settings = cls(
-            database_path=Path(database_raw).expanduser().resolve(),
+            database_path=database_path,
             backup_dir=Path(
                 env_map.get("QBOT_BACKUP_DIR", "./var/backups")
             ).expanduser().resolve(),
@@ -248,6 +253,14 @@ class AppSettings:
                 env_map.get("QBOT_BACKUP_RETENTION_COUNT"),
                 48,
             ),
+            raw_archive_dir=Path(
+                env_map.get("QBOT_RAW_ARCHIVE_DIR", str(database_path.parent / "raw-events"))
+            ).expanduser().resolve(),
+            default_community_slug=env_map.get(
+                "QBOT_DEFAULT_COMMUNITY_SLUG", "default"
+            ).strip().casefold(),
+            twitch_eventsub_secret=env_map.get("QBOT_TWITCH_EVENTSUB_SECRET"),
+            twitch_eventsub_callback_url=env_map.get("QBOT_TWITCH_EVENTSUB_CALLBACK_URL"),
         )
         settings.validate()
         return settings
@@ -265,6 +278,12 @@ class AppSettings:
 
         if self.audit_retention_days <= 0:
             raise ConfigError("QBOT_AUDIT_RETENTION_DAYS must be greater than zero")
+
+        if not self.default_community_slug:
+            raise ConfigError("QBOT_DEFAULT_COMMUNITY_SLUG must not be empty")
+
+        if self.twitch_eventsub_secret and len(self.twitch_eventsub_secret) < 16:
+            raise ConfigError("QBOT_TWITCH_EVENTSUB_SECRET must be at least 16 characters")
 
         for name, value in (
             ("QBOT_MAINTENANCE_INTERVAL_SECONDS", self.maintenance_interval_seconds),
@@ -364,4 +383,9 @@ class AppSettings:
             "analytics_interval_seconds": self.analytics_interval_seconds,
             "backup_interval_seconds": self.backup_interval_seconds,
             "backup_retention_count": self.backup_retention_count,
+            "raw_archive_dir": str(self.raw_archive_dir),
+            "default_community_slug": self.default_community_slug,
+            "twitch_eventsub_configured": bool(
+                self.twitch_eventsub_secret and self.twitch_eventsub_callback_url
+            ),
         }

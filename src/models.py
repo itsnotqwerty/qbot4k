@@ -42,6 +42,8 @@ def observation_from_message(message: NormalizedMessage) -> Observation:
             "role_names": list(message.role_names),
             "is_moderator": message.is_moderator,
         },
+        community_id=int(message.metadata.get("community_id") or 1),
+        raw_payload=dict(message.metadata),
     )
 
 @dataclass(frozen=True)
@@ -77,6 +79,8 @@ class Observation:
     text: str | None = None
 
     attributes: Mapping[str, object] = field(default_factory=dict)
+    raw_payload: Mapping[str, object] = field(default_factory=dict)
+    community_id: int = 1
     schema_version: int = 1
 
 @dataclass(frozen=True)

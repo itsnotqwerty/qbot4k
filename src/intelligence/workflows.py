@@ -650,23 +650,31 @@ def _trigger_evidence(
 
 
 def _upsert_relationship(connection: sqlite3.Connection, source: int, target: int, kind: str, context: str, occurred_at: str, evidence: Mapping[str, object]) -> None:
+    community_id = int(evidence.get("community_id") or 1)
+    if evidence.get("observation_id") is not None:
+        scope = connection.execute(
+            "SELECT community_id FROM observations WHERE id=?",
+            (int(evidence["observation_id"]),),
+        ).fetchone()
+        if scope is not None:
+            community_id = int(scope[0] or 1)
     connection.execute(
         """
         INSERT INTO entity_relationships (
-            source_user_id, target_user_id, relationship_type, context_key,
+            community_id, source_user_id, target_user_id, relationship_type, context_key,
             strength, evidence_count, first_observed_at, last_observed_at, evidence_json
-        ) VALUES (?, ?, ?, ?, 1.0, 1, ?, ?, ?)
-        ON CONFLICT(source_user_id, target_user_id, relationship_type, context_key) DO UPDATE SET
+        ) VALUES (?, ?, ?, ?, ?, 1.0, 1, ?, ?, ?)
+        ON CONFLICT(community_id, source_user_id, target_user_id, relationship_type, context_key) DO UPDATE SET
             strength = min(100.0, entity_relationships.strength + 1.0),
             evidence_count = entity_relationships.evidence_count + 1,
             last_observed_at = excluded.last_observed_at,
             evidence_json = excluded.evidence_json
         """,
-        (source, target, kind, context, occurred_at, occurred_at, json.dumps(dict(evidence), sort_keys=True)),
+        (community_id, source, target, kind, context, occurred_at, occurred_at, json.dumps(dict(evidence), sort_keys=True)),
     )
     relationship = connection.execute(
-        "SELECT id, evidence_count FROM entity_relationships WHERE source_user_id=? AND target_user_id=? AND relationship_type=? AND context_key=?",
-        (source, target, kind, context),
+        "SELECT id, evidence_count FROM entity_relationships WHERE community_id=? AND source_user_id=? AND target_user_id=? AND relationship_type=? AND context_key=?",
+        (community_id, source, target, kind, context),
     ).fetchone()
     relationship_id, evidence_count = int(relationship[0]), int(relationship[1])
     observation_id = evidence.get("observation_id")
@@ -682,8 +690,8 @@ def _upsert_relationship(connection: sqlite3.Connection, source: int, target: in
         connection.execute(
             """
             INSERT INTO intelligence_alerts (
-                user_id, alert_type, severity, title, summary, confidence, dedupe_key
-            ) VALUES (?, 'coordination_pattern', ?, 'Coordination Pattern', ?, ?, ?)
+                community_id, user_id, alert_type, severity, title, summary, confidence, dedupe_key
+            ) VALUES (?, ?, 'coordination_pattern', ?, 'Coordination Pattern', ?, ?, ?)
             ON CONFLICT(dedupe_key) DO UPDATE SET
                 severity=excluded.severity,
                 summary=excluded.summary,
@@ -700,6 +708,7 @@ def _upsert_relationship(connection: sqlite3.Connection, source: int, target: in
                 updated_at=CURRENT_TIMESTAMP
             """,
             (
+                community_id,
                 source,
                 "medium" if evidence_count >= COORDINATION_ALERT_MEDIUM_EVIDENCE else "low",
                 f"{kind.replace('_', ' ').title()} with entity {target} has {evidence_count} supporting observations.",

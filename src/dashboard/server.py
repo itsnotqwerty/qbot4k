@@ -22,6 +22,7 @@ from ..config import AppSettings
 from ..db import (
     connect_database,
 	collect_observation,
+	enqueue_processing_job,
 	database_health,
 	operational_readiness_snapshot,
 	delete_simple_command_definition,
@@ -64,6 +65,27 @@ from ..intelligence.workflows import (
 from ..intelligence.search import list_saved_queries, observation_pivots, save_query, search_observations
 from ..intelligence.analytics import analytics_snapshot, review_identity_suggestion
 from ..intelligence.events import SUPPORTED_EVENT_TYPES, collect_external_feed_item
+from ..intelligence.community import resolve_community_id
+from ..intelligence.liveops import live_operations_snapshot
+from ..intelligence.professional_ops import (
+    activate_playbook,
+    assign_incident,
+    conversation_context,
+    create_notification_destination,
+    escalate_incident,
+    generate_post_stream_briefing,
+    handoff_shift,
+    queue_incident_notifications,
+)
+from ..twitch_control import TwitchControlPlane
+from ..twitch_auth import TwitchTokenManager
+from ..token_store import persist_refreshed_twitch_tokens
+from ..twitch_eventsub import (
+    mark_subscription_event,
+    observation_from_eventsub,
+    record_subscription,
+    verify_eventsub_signature,
+)
 from ..jobs import send_manual_twitch_live_announcements
 from .auth import (
     DashboardSession,
@@ -95,8 +117,6 @@ from .users import (
 
 def _restart_systemd_service(service_name: str) -> None:
 	command = ["systemctl", "restart", service_name]
-	if os.geteuid() != 0:
-		command = ["sudo", "-n", *command]
 	result = subprocess.run(
 		command,
 		check=False,
@@ -142,6 +162,9 @@ class DashboardApp:
 	def dispatch(self, handler: BaseHTTPRequestHandler) -> bool:
 		parsed = urlparse(handler.path)
 		path = parsed.path
+		if handler.command == "POST" and path == "/webhooks/twitch/eventsub":
+			self._serve_twitch_eventsub(handler)
+			return True
 		if handler.command in {"POST", "PUT", "PATCH", "DELETE"} and not self._valid_request_origin(handler):
 			self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "origin_mismatch"})
 			return True
@@ -151,6 +174,9 @@ class DashboardApp:
 			return True
 		if handler.command == "GET" and path == "/system-health":
 			self._serve_system_health(handler)
+			return True
+		if handler.command == "GET" and path == "/live-ops":
+			self._serve_live_ops(handler)
 			return True
 		if handler.command == "POST" and path == "/dashboard/go-live":
 			self._serve_dashboard_go_live(handler)
@@ -244,6 +270,36 @@ class DashboardApp:
 		if handler.command == "GET" and path == "/api/overview":
 			self._serve_api_overview(handler)
 			return True
+		if handler.command == "GET" and path == "/api/live-ops":
+			self._serve_api_live_ops(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "GET" and path == "/api/live-ops/stream":
+			self._serve_live_ops_stream(handler, parse_qs(parsed.query))
+			return True
+		if handler.command == "GET" and path.startswith("/api/observations/") and path.endswith("/context"):
+			self._serve_api_conversation_context(handler, path)
+			return True
+		if handler.command == "POST" and path == "/api/live-ops/moderate":
+			self._serve_live_ops_moderate(handler)
+			return True
+		if handler.command == "POST" and path.startswith("/api/live-ops/incidents/"):
+			self._serve_live_ops_incident_action(handler, path)
+			return True
+		if handler.command == "POST" and path.startswith("/api/live-ops/playbooks/") and path.endswith("/activate"):
+			self._serve_live_ops_playbook(handler, path)
+			return True
+		if handler.command == "POST" and path == "/api/live-ops/shifts/handoff":
+			self._serve_live_ops_handoff(handler)
+			return True
+		if handler.command == "POST" and path == "/api/live-ops/twitch/shield-mode":
+			self._serve_live_ops_shield_mode(handler)
+			return True
+		if handler.command == "POST" and path == "/api/live-ops/twitch/chat-settings":
+			self._serve_live_ops_chat_settings(handler)
+			return True
+		if handler.command == "POST" and path == "/api/live-ops/notifications":
+			self._serve_live_ops_notification_destination(handler)
+			return True
 		if handler.command == "GET" and path == "/api/users":
 			self._serve_api_users(handler, parse_qs(parsed.query))
 			return True
@@ -318,6 +374,480 @@ class DashboardApp:
 			self._serve_api_audit(handler, parse_qs(parsed.query))
 			return True
 		return False
+
+	def _serve_api_live_ops(
+		self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]
+	) -> None:
+		if self._require_session(handler) is None:
+			return
+		try:
+			community_id = int((query.get("community_id") or ["1"])[0])
+		except ValueError:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_community_id"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			payload = live_operations_snapshot(connection, community_id=community_id)
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _serve_live_ops_stream(
+		self, handler: BaseHTTPRequestHandler, query: Mapping[str, list[str]]
+	) -> None:
+		if self._require_session(handler) is None:
+			return
+		try:
+			community_id = int((query.get("community_id") or ["1"])[0])
+		except ValueError:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_community_id"})
+			return
+		handler.send_response(HTTPStatus.OK)
+		handler.send_header("Content-Type", "text/event-stream; charset=utf-8")
+		handler.send_header("Cache-Control", "no-cache, no-transform")
+		handler.send_header("Connection", "keep-alive")
+		handler.send_header("X-Accel-Buffering", "no")
+		self._send_security_headers(handler)
+		handler.end_headers()
+		last_watermark = ""
+		try:
+			for tick in range(30):
+				connection = connect_database(self.settings.database_path)
+				try:
+					initialize_database(connection)
+					payload = live_operations_snapshot(connection, community_id=community_id)
+				finally:
+					connection.close()
+				watermark = str(payload.get("watermark") or "")
+				if tick == 0 or watermark != last_watermark:
+					wire = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+					handler.wfile.write(f"event: snapshot\nid: {watermark}\ndata: {wire}\n\n".encode("utf-8"))
+					last_watermark = watermark
+				else:
+					handler.wfile.write(b": heartbeat\n\n")
+				handler.wfile.flush()
+				time.sleep(1)
+		except (BrokenPipeError, ConnectionResetError, OSError):
+			return
+
+	def _serve_api_conversation_context(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		if self._require_session(handler) is None:
+			return
+		parts = [part for part in path.split("/") if part]
+		try:
+			observation_id = int(parts[2])
+		except (IndexError, ValueError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_observation_id"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				payload = conversation_context(connection, observation_id)
+			except ValueError as exc:
+				self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": str(exc)})
+				return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, payload)
+
+	def _serve_live_ops_moderate(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		try:
+			message_id = int(payload.get("message_id") or 0)
+			community_id = int(payload.get("community_id") or 1)
+			duration_seconds = max(1, min(int(payload.get("duration_seconds") or 600), 2_419_200))
+		except (TypeError, ValueError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_action_parameters"})
+			return
+		action_type = str(payload.get("action_type") or "").strip().casefold()
+		if action_type not in {"warn", "timeout", "ban"}:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_action_type"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			row = connection.execute(
+				"""SELECT id,platform,observation_id,platform_account_id FROM messages
+				   WHERE id=? AND community_id=?""", (message_id, community_id),
+			).fetchone()
+			if row is None:
+				self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "message_not_found"})
+				return
+			action_id = record_moderation_action(
+				connection, platform=str(row[1]), message_id=int(row[0]),
+				target_platform_account_id=int(row[3]), action_type=action_type,
+				reason=str(payload.get("reason") or "Live operations keyboard action")[:500],
+				status="pending", actor_type="operator", actor_id=int(session.user_id),
+			)
+			connection.execute(
+				"UPDATE moderation_actions SET duration_seconds=?,assigned_operator_id=? WHERE id=?",
+				(duration_seconds, int(session.user_id), action_id),
+			)
+			enqueue_processing_job(
+				connection, stage="action", job_type=f"{row[1]}.moderation.execute",
+				observation_id=int(row[2]) if row[2] is not None else None,
+				payload={"message_id": int(row[0])},
+				idempotency_key=f"liveops:{action_id}:execute", priority=5,
+			)
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.ACCEPTED, {
+			"action_id": action_id, "status": "pending_provider_confirmation",
+		})
+
+	def _serve_live_ops_incident_action(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		parts = [part for part in path.split("/") if part]
+		try:
+			incident_id = int(parts[3])
+			action = parts[4]
+		except (IndexError, ValueError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_incident_action"})
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			if action == "assign":
+				operator_id = int(payload.get("operator_id") or session.user_id)
+				assign_incident(connection, incident_id=incident_id, operator_id=operator_id,
+				                assigned_by=int(session.user_id))
+				result: dict[str, object] = {"incident_id": incident_id, "assigned_operator_id": operator_id}
+			elif action == "escalate":
+				level = escalate_incident(connection, incident_id=incident_id,
+				                          operator_id=int(session.user_id), note=str(payload.get("note") or ""))
+				result = {"incident_id": incident_id, "escalation_level": level}
+			else:
+				self._send_json(handler, HTTPStatus.NOT_FOUND, {"error": "unsupported_incident_action"})
+				return
+		except (TypeError, ValueError) as exc:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+			return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, result)
+
+	def _serve_live_ops_handoff(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		try:
+			incoming = int(payload.get("incoming_operator_id") or 0)
+			community_id = int(payload.get("community_id") or 1)
+		except (TypeError, ValueError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_handoff"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				shift_id = handoff_shift(connection, community_id=community_id,
+					outgoing_operator_id=int(session.user_id), incoming_operator_id=incoming,
+					note=str(payload.get("note") or ""))
+			except ValueError as exc:
+				self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+				return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, {"shift_id": shift_id, "status": "handed_off"})
+
+	def _twitch_control_plane(self) -> TwitchControlPlane:
+		if not self.settings.twitch_bot_token:
+			raise ValueError("Twitch authorization is not configured")
+		return TwitchControlPlane(TwitchTokenManager(
+			initial_access_token=self.settings.twitch_bot_token,
+			refresh_token=self.settings.twitch_refresh_token,
+			client_id=self.settings.twitch_client_id,
+			client_secret=self.settings.twitch_client_secret,
+			on_token_refresh=persist_refreshed_twitch_tokens,
+		))
+
+	def _live_ops_broadcaster(self, payload: Mapping[str, object]) -> str:
+		return str(payload.get("broadcaster") or self.settings.twitch_channels[0]).strip()
+
+	def _serve_live_ops_shield_mode(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				result = self._twitch_control_plane().set_shield_mode(
+					connection, community_id=int(payload.get("community_id") or 1),
+					broadcaster=self._live_ops_broadcaster(payload), active=bool(payload.get("active")),
+					operator_id=int(session.user_id),
+				)
+			except (RuntimeError, ValueError) as exc:
+				self._send_json(handler, HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+				return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, result)
+
+	def _serve_live_ops_chat_settings(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		settings = payload.get("settings")
+		if not isinstance(settings, Mapping):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "settings_object_required"})
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				result = self._twitch_control_plane().update_chat_settings(
+					connection, community_id=int(payload.get("community_id") or 1),
+					broadcaster=self._live_ops_broadcaster(payload), settings=settings,
+					operator_id=int(session.user_id),
+				)
+			except (RuntimeError, ValueError) as exc:
+				self._send_json(handler, HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+				return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, result)
+
+	def _serve_live_ops_playbook(self, handler: BaseHTTPRequestHandler, path: str) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		parts = [part for part in path.split("/") if part]
+		playbook_key = parts[3] if len(parts) > 4 else ""
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		community_id = int(payload.get("community_id") or 1)
+		incident_id = _optional_int(payload.get("incident_id"))
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				run = activate_playbook(connection, community_id=community_id,
+					playbook_key=playbook_key, operator_id=int(session.user_id), incident_id=incident_id)
+				completed: list[dict[str, object]] = []
+				for step in run["steps"]:
+					control = str(step.get("control") or "")
+					result: object = "recorded"
+					if control == "shield_mode":
+						result = self._twitch_control_plane().set_shield_mode(
+							connection, community_id=community_id,
+							broadcaster=self._live_ops_broadcaster(payload), active=bool(step.get("value")),
+							operator_id=int(session.user_id))
+					elif control == "chat_settings":
+						result = self._twitch_control_plane().update_chat_settings(
+							connection, community_id=community_id,
+							broadcaster=self._live_ops_broadcaster(payload), settings=step.get("settings") or {},
+							operator_id=int(session.user_id))
+					elif control == "notify" and incident_id is not None:
+						result = {"queued": queue_incident_notifications(connection, incident_id, force=True)}
+					elif control == "assign" and incident_id is not None:
+						assign_incident(connection, incident_id=incident_id, operator_id=int(session.user_id),
+						                assigned_by=int(session.user_id))
+					elif control == "briefing":
+						session_row = connection.execute(
+							"SELECT id FROM stream_sessions WHERE community_id=? ORDER BY started_at DESC LIMIT 1",
+							(community_id,),).fetchone()
+						if session_row is not None:
+							result = {"briefing_id": generate_post_stream_briefing(connection, int(session_row[0]))}
+					completed.append({"key": step.get("key"), "result": result})
+				connection.execute(
+					"""UPDATE raid_playbook_runs SET status='completed',current_step=?,state_json=?,
+					   completed_at=CURRENT_TIMESTAMP WHERE id=?""",
+					(len(completed), json.dumps({"completed": completed}, sort_keys=True), int(run["run_id"])),
+				)
+			except (RuntimeError, ValueError, TypeError) as exc:
+				self._send_json(handler, HTTPStatus.BAD_GATEWAY, {"error": str(exc)})
+				return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.OK, {**run, "completed": completed})
+
+	def _serve_live_ops_notification_destination(self, handler: BaseHTTPRequestHandler) -> None:
+		if self._require_session(handler, admin_only=True) is None:
+			return
+		payload = self._read_json_body(handler)
+		if payload is None:
+			return
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				destination_id = create_notification_destination(
+					connection, community_id=int(payload.get("community_id") or 1),
+					destination_type=str(payload.get("destination_type") or ""),
+					name=str(payload.get("name") or ""), target=str(payload.get("target") or ""),
+					minimum_severity=str(payload.get("minimum_severity") or "high"),
+				)
+			except (TypeError, ValueError) as exc:
+				self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+				return
+		finally:
+			connection.close()
+		self._send_json(handler, HTTPStatus.CREATED, {"destination_id": destination_id})
+
+	def _serve_live_ops(self, handler: BaseHTTPRequestHandler) -> None:
+		session = self._require_session(handler)
+		if session is None:
+			return
+		admin_destination = "" if session.role != "admin" else """
+<section class='card'><h2>Escalation destinations</h2>
+<form id='destinationForm' class='compact-form'><input name='name' required placeholder='On-call channel'>
+<select name='destination_type'><option value='discord_webhook'>Discord webhook</option><option value='slack_webhook'>Slack webhook</option><option value='generic_webhook'>Generic webhook</option></select>
+<input name='target' type='url' required placeholder='https://…'><select name='minimum_severity'><option>high</option><option>critical</option><option>medium</option></select><button>Add destination</button></form>
+<div id='destinations' class='tag-row'></div></section>"""
+		body = self._render_page(
+			"Live Ops", session,
+			"""<style>
+.connection-dot{display:inline-block;width:.65rem;height:.65rem;border-radius:50%;background:#d97706;margin-right:.4rem}.connection-dot.live{background:#16a34a}
+.emergency-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:.6rem}.emergency{min-height:3.2rem;font-weight:700}.danger{background:#b91c1c;color:#fff}.safe{background:#166534;color:#fff}
+.selected-row{outline:2px solid #7c3aed;outline-offset:-2px;background:rgba(124,58,237,.12)}.context-list{max-height:28rem;overflow:auto}.context-item{padding:.6rem;border-left:3px solid transparent}.context-item.finding{border-color:#ef4444;background:rgba(239,68,68,.1)}
+.two-col{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(280px,.75fr);gap:1rem}.spark{width:100%;height:130px}.graph{width:100%;height:260px}.tag-row{display:flex;flex-wrap:wrap;gap:.45rem}.tag{padding:.3rem .55rem;border-radius:999px;background:rgba(124,58,237,.14)}
+.compact-form{display:flex;flex-wrap:wrap;gap:.5rem}.compact-form input,.compact-form select{min-width:150px;flex:1}.status-banner{position:sticky;bottom:1rem;padding:.65rem;border-radius:.5rem;background:#111827;color:white;display:none;z-index:4}
+@media(max-width:780px){.two-col{grid-template-columns:1fr}.emergency-grid{grid-template-columns:1fr 1fr}.main{padding:.75rem}table{font-size:.82rem}.hide-mobile{display:none}.emergency{min-height:3.8rem}}
+</style>
+<section class='hero'><p class='eyebrow'>Live operations</p><h1>Community command center</h1><p class='lede'><span id='connectionDot' class='connection-dot'></span><span id='connectionState'>Connecting to live stream…</span> Select a finding with J/K; W warns, T times out, B bans, and C opens conversation context.</p></section>
+<section class='card'><h2>Emergency controls</h2><div class='emergency-grid'>
+<button class='emergency danger' data-shield='true'>Shield Mode on</button><button class='emergency safe' data-shield='false'>Shield Mode off</button>
+<button class='emergency' data-chat='followers'>Followers 10m</button><button class='emergency' data-chat='slow'>Slow mode 10s</button><button class='emergency' data-chat='normal'>Restore chat</button>
+</div><h3>Attack playbooks</h3><div id='playbookButtons' class='emergency-grid'></div><p class='muted'>Twitch control results appear only after Twitch confirms the request.</p></section>
+<div class='grid'><div class='metric'><div class='label'>Current velocity</div><div id='metricVelocity' class='value'>—</div></div><div class='metric'><div class='label'>Unique chatters</div><div id='metricChatters' class='value'>—</div></div><div class='metric'><div class='label'>Priority findings</div><div id='metricAlerts' class='value'>—</div></div><div class='metric'><div class='label'>Grouped incidents</div><div id='metricIncidents' class='value'>—</div></div><div class='metric'><div class='label'>Pending actions</div><div id='metricPending' class='value'>—</div></div><div class='metric'><div class='label'>Twitch confirmed</div><div id='metricConfirmed' class='value'>—</div></div></div>
+<section class='card'><h2>Chat velocity</h2><svg id='velocityGraph' class='spark' viewBox='0 0 800 130' role='img' aria-label='Thirty-minute chat velocity'></svg></section>
+<div class='two-col'><section class='card'><h2>Priority findings</h2><table><thead><tr><th>Severity</th><th>Subject</th><th>Finding</th><th class='hide-mobile'>Time</th></tr></thead><tbody id='alertRows'></tbody></table></section>
+<section class='card'><h2>Conversation context</h2><div id='contextPanel' class='context-list muted'>Press C on a selected finding.</div></section></div>
+<section class='card'><h2>Grouped incidents</h2><table><thead><tr><th>ID</th><th>Severity</th><th>Incident</th><th>Findings</th><th>Assignee</th><th>Escalation</th><th>Actions</th></tr></thead><tbody id='incidentRows'></tbody></table></section>
+<div class='two-col'><section class='card'><h2>Stream timeline</h2><div id='timeline'></div></section><section class='card'><h2>Audience cohorts</h2><div id='cohorts' class='grid'></div></section></div>
+<div class='two-col'><section class='card'><h2>Raid &amp; shared-audience graph</h2><svg id='audienceGraph' class='graph' viewBox='0 0 600 260' role='img' aria-label='Raid and shared audience graph'></svg></section><section class='card'><h2>Moderator workload &amp; consistency</h2><div id='workload'></div></section></div>
+<div class='two-col'><section class='card'><h2>Twitch-confirmed controls</h2><div id='controls'></div></section><section class='card'><h2>Post-stream briefings</h2><div id='briefings'></div></section></div>
+""" + admin_destination + """
+<div id='statusBanner' class='status-banner'></div>
+<script>
+(() => {
+  let snapshot = null, selected = 0;
+  const $ = id => document.getElementById(id);
+  const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const post = async (url, body) => { const response = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); const data=await response.json(); if(!response.ok) throw new Error(data.error||'Request failed'); return data; };
+  const notice = (message, error=false) => { const node=$('statusBanner'); node.textContent=message; node.style.background=error?'#991b1b':'#111827'; node.style.display='block'; window.setTimeout(()=>node.style.display='none',4500); };
+  const drawVelocity = rows => { const svg=$('velocityGraph'), values=rows.map(r=>Number(r.messages||0)), max=Math.max(1,...values); const points=values.map((v,i)=>`${i*800/Math.max(1,values.length-1)},${118-v*105/max}`).join(' '); svg.innerHTML=`<line x1='0' y1='118' x2='800' y2='118' stroke='currentColor' opacity='.25'/><polyline points='${points}' fill='none' stroke='#7c3aed' stroke-width='4'/><text x='8' y='18' fill='currentColor'>Peak ${max} msg/min</text>`; };
+  const drawAudience = edges => { const svg=$('audienceGraph'); if(!edges.length){svg.innerHTML='<text x="20" y="40" fill="currentColor">No raid or shared-audience events yet.</text>';return;} const names=[...new Set(edges.flatMap(e=>[e.source_key,e.target_key]))].slice(0,12), cx=300,cy=130,r=95, points=new Map(names.map((n,i)=>[n,[cx+Math.cos(i*2*Math.PI/names.length)*r,cy+Math.sin(i*2*Math.PI/names.length)*r]])); let html=''; edges.slice(0,20).forEach(e=>{if(!points.has(e.source_key)||!points.has(e.target_key))return;const a=points.get(e.source_key),b=points.get(e.target_key);html+=`<line x1='${a[0]}' y1='${a[1]}' x2='${b[0]}' y2='${b[1]}' stroke='${e.edge_type==='raid'?'#ef4444':'#7c3aed'}' stroke-width='${Math.min(8,1+Number(e.weight||1)/10)}' opacity='.55'/>`;}); points.forEach((p,n)=>{html+=`<circle cx='${p[0]}' cy='${p[1]}' r='8' fill='#111827'/><text x='${p[0]+10}' y='${p[1]+4}' fill='currentColor' font-size='12'>${esc(n)}</text>`;});svg.innerHTML=html; };
+  const render = s => { snapshot=s; const m=s.last_5_minutes,o=s.operations; $('metricVelocity').textContent=m.current_velocity+' / min'; $('metricChatters').textContent=m.unique_chatters; $('metricAlerts').textContent=s.open_alerts.length; $('metricIncidents').textContent=s.active_incidents.length; $('metricPending').textContent=o.pending_actions; $('metricConfirmed').textContent=o.provider_confirmed_actions; drawVelocity(s.velocity||[]); drawAudience(s.audience_graph||[]);
+    $('alertRows').innerHTML=s.open_alerts.map((a,i)=>`<tr tabindex='0' data-index='${i}' class='${i===selected?'selected-row':''}'><td>${esc(a.severity)}</td><td>${esc(a.subject)}</td><td>${esc(a.title)}</td><td class='hide-mobile'>${esc(a.created_at)}</td></tr>`).join('')||'<tr><td colspan="4">No priority findings.</td></tr>';
+    document.querySelectorAll('#alertRows tr[data-index]').forEach(row=>row.onclick=()=>{selected=Number(row.dataset.index);render(snapshot);});
+    $('incidentRows').innerHTML=s.active_incidents.map(i=>`<tr><td>${i.id}</td><td>${esc(i.severity)}</td><td>${esc(i.title)}</td><td>${i.finding_count}</td><td>${esc(i.assignee||'Unassigned')}</td><td>${i.escalation_level}</td><td><button data-assign='${i.id}'>Assign me</button> <button data-escalate='${i.id}'>Escalate</button></td></tr>`).join('')||'<tr><td colspan="7">No active incidents.</td></tr>';
+    document.querySelectorAll('[data-assign]').forEach(b=>b.onclick=()=>post(`/api/live-ops/incidents/${b.dataset.assign}/assign`,{}).then(()=>notice('Incident assigned')).catch(e=>notice(e.message,true))); document.querySelectorAll('[data-escalate]').forEach(b=>b.onclick=()=>post(`/api/live-ops/incidents/${b.dataset.escalate}/escalate`,{note:'Escalated from live command center'}).then(()=>notice('Incident escalated')).catch(e=>notice(e.message,true)));
+    $('playbookButtons').innerHTML=s.playbooks.map(p=>`<button class='emergency' data-playbook='${esc(p.playbook_key)}'>${esc(p.name)}</button>`).join(''); document.querySelectorAll('[data-playbook]').forEach(b=>b.onclick=()=>post(`/api/live-ops/playbooks/${b.dataset.playbook}/activate`,{incident_id:s.active_incidents[0]?.id}).then(()=>notice('Playbook completed and controls confirmed')).catch(e=>notice(e.message,true)));
+    $('timeline').innerHTML=(s.timeline||[]).slice(-20).reverse().map(t=>`<p><strong>${esc(t.event_type)}</strong> ${esc(t.text||'')}<br><small>${esc(t.occurred_at)}</small></p>`).join('')||'<p class="muted">Timeline begins when the stream starts.</p>';
+    $('cohorts').innerHTML=Object.entries(s.cohorts||{}).map(([k,v])=>`<div class='metric'><div class='label'>${esc(k)}</div><div class='value'>${v.members}</div><small>${v.messages} messages</small></div>`).join('')||'<p class="muted">Cohorts calculate during an active stream.</p>';
+    const w=s.moderator_workload||{}; $('workload').innerHTML=`<p><strong>Workload balance:</strong> ${Math.round(Number(w.workload_balance_score||0)*100)}%<br><strong>Enforcement consistency:</strong> ${Math.round(Number(w.enforcement_consistency_score||0)*100)}%</p>`+(w.operators||[]).map(x=>`<p>${esc(x.discord_username)} — ${x.actions} actions, ${x.reviews} reviews, ${x.incidents} incidents</p>`).join('');
+    $('controls').innerHTML=(s.controls||[]).map(c=>`<p><strong>${esc(c.control_type)}</strong> <span class='tag'>${esc(c.status)}</span> ${esc(c.provider_status||'awaiting Twitch')}<br><small>${esc(c.confirmed_at||c.requested_at)}</small></p>`).join('')||'<p class="muted">No control actions yet.</p>';
+    $('briefings').innerHTML=(s.briefings||[]).map(b=>`<article><h3>${esc(b.title)}</h3><p>${esc(b.executive_summary)}</p></article>`).join('')||'<p class="muted">The briefing is generated when a stream ends.</p>';
+    if($('destinations')) $('destinations').innerHTML=(s.notification_destinations||[]).map(d=>`<span class='tag'>${esc(d.name)} · ${esc(d.minimum_severity)}+</span>`).join('');
+  };
+  const context = async () => { const a=snapshot?.open_alerts[selected]; if(!a?.observation_id)return notice('Selected finding has no conversation context',true); try{const r=await fetch(`/api/observations/${a.observation_id}/context`),d=await r.json();$('contextPanel').innerHTML=d.items.map(x=>`<div class='context-item ${x.is_finding?'finding':''}'><strong>${esc(x.username)}</strong> ${esc(x.text||x.event_type)}<br><small>${esc(x.occurred_at)}</small></div>`).join('');}catch(e){notice(e.message,true);} };
+  const moderate = action => { const a=snapshot?.open_alerts[selected]; if(!a?.message_id)return notice('Select a message-backed finding',true); post('/api/live-ops/moderate',{message_id:a.message_id,action_type:action,duration_seconds:600}).then(d=>notice(`${action} queued; action ${d.action_id} awaits Twitch confirmation`)).catch(e=>notice(e.message,true)); };
+  document.addEventListener('keydown',e=>{if(['INPUT','SELECT','TEXTAREA'].includes(document.activeElement.tagName))return; if(!snapshot)return; if(e.key.toLowerCase()==='j')selected=Math.min(snapshot.open_alerts.length-1,selected+1);else if(e.key.toLowerCase()==='k')selected=Math.max(0,selected-1);else if(e.key.toLowerCase()==='w')moderate('warn');else if(e.key.toLowerCase()==='t')moderate('timeout');else if(e.key.toLowerCase()==='b')moderate('ban');else if(e.key.toLowerCase()==='c')context();else return;e.preventDefault();render(snapshot);});
+  document.querySelectorAll('[data-shield]').forEach(b=>b.onclick=()=>post('/api/live-ops/twitch/shield-mode',{active:b.dataset.shield==='true'}).then(()=>notice('Shield Mode confirmed by Twitch')).catch(e=>notice(e.message,true))); document.querySelectorAll('[data-chat]').forEach(b=>b.onclick=()=>{const presets={followers:{follower_mode:true,follower_mode_duration:10},slow:{slow_mode:true,slow_mode_wait_time:10},normal:{follower_mode:false,slow_mode:false,subscriber_mode:false,unique_chat_mode:false}};post('/api/live-ops/twitch/chat-settings',{settings:presets[b.dataset.chat]}).then(()=>notice('Chat settings confirmed by Twitch')).catch(e=>notice(e.message,true));});
+  if($('destinationForm')) $('destinationForm').onsubmit=e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.target));post('/api/live-ops/notifications',body).then(()=>{notice('Destination added');e.target.reset();}).catch(x=>notice(x.message,true));};
+  const source=new EventSource('/api/live-ops/stream?community_id=1'); source.addEventListener('snapshot',e=>{render(JSON.parse(e.data));$('connectionDot').classList.add('live');$('connectionState').textContent='Live · '+new Date().toLocaleTimeString();}); source.onerror=()=>{$('connectionDot').classList.remove('live');$('connectionState').textContent='Reconnecting to live stream…';};
+})();
+</script>""",
+		)
+		self._send_html(handler, HTTPStatus.OK, body)
+
+	def _serve_twitch_eventsub(self, handler: BaseHTTPRequestHandler) -> None:
+		secret = self.settings.twitch_eventsub_secret
+		if not secret:
+			self._send_json(handler, HTTPStatus.SERVICE_UNAVAILABLE, {"error": "eventsub_not_configured"})
+			return
+		try:
+			length = int(handler.headers.get("Content-Length", "0") or 0)
+		except (TypeError, ValueError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_content_length"})
+			return
+		if length <= 0 or length > 1_048_576:
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_body_length"})
+			return
+		body = handler.rfile.read(length)
+		message_id = (handler.headers.get("Twitch-Eventsub-Message-Id") or "").strip()
+		timestamp = (handler.headers.get("Twitch-Eventsub-Message-Timestamp") or "").strip()
+		signature = (handler.headers.get("Twitch-Eventsub-Message-Signature") or "").strip()
+		if not verify_eventsub_signature(
+			secret, message_id=message_id, timestamp=timestamp, body=body, signature=signature
+		):
+			self._send_json(handler, HTTPStatus.FORBIDDEN, {"error": "invalid_eventsub_signature"})
+			return
+		try:
+			payload = json.loads(body.decode("utf-8"))
+		except (UnicodeDecodeError, json.JSONDecodeError):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_json"})
+			return
+		if not isinstance(payload, dict):
+			self._send_json(handler, HTTPStatus.BAD_REQUEST, {"error": "invalid_payload"})
+			return
+		subscription = payload.get("subscription")
+		event = payload.get("event")
+		subscription_map = subscription if isinstance(subscription, Mapping) else {}
+		event_map = event if isinstance(event, Mapping) else {}
+		condition = subscription_map.get("condition")
+		condition_map = condition if isinstance(condition, Mapping) else {}
+		broadcaster_id = str(
+			event_map.get("broadcaster_user_id") or condition_map.get("broadcaster_user_id")
+			or event_map.get("to_broadcaster_user_id") or ""
+		).strip()
+		connection = connect_database(self.settings.database_path)
+		try:
+			initialize_database(connection)
+			community_id = resolve_community_id(
+				connection, platform="twitch", external_community_id=broadcaster_id
+			) if broadcaster_id else 1
+			if subscription_map:
+				record_subscription(connection, community_id=community_id, subscription=subscription_map)
+			message_type = (handler.headers.get("Twitch-Eventsub-Message-Type") or "notification").strip()
+			if message_type == "webhook_callback_verification":
+				challenge = str(payload.get("challenge") or "")
+				self._send_text(handler, HTTPStatus.OK, challenge)
+				return
+			if message_type == "revocation":
+				mark_subscription_event(
+					connection, str(subscription_map.get("id") or ""),
+					str(subscription_map.get("status") or "revoked"),
+				)
+				self._send_json(handler, HTTPStatus.NO_CONTENT, {})
+				return
+			observation = observation_from_eventsub(
+				payload, message_id=message_id, community_id=community_id
+			)
+			if observation is None:
+				self._send_json(handler, HTTPStatus.ACCEPTED, {"status": "unsupported_event"})
+				return
+			result = collect_observation(connection, observation)
+			mark_subscription_event(connection, str(subscription_map.get("id") or ""))
+			self._send_json(handler, HTTPStatus.ACCEPTED, {
+				"status": result.status, "observation_id": result.observation_id,
+			})
+		finally:
+			connection.close()
 
 	def _read_session(
 	    self, handler: BaseHTTPRequestHandler) -> DashboardSession | None:
@@ -708,11 +1238,11 @@ class DashboardApp:
 			session.user_id,
 			service_name,
 		)
+		self._schedule_systemd_restart(service_name)
 		self._redirect(
 			handler,
 			f"/dashboard?status={quote(f'Restart requested for {service_name}')}",
 		)
-		self._schedule_systemd_restart(service_name)
 
 	@staticmethod
 	def _schedule_systemd_restart(service_name: str) -> None:
@@ -3223,6 +3753,7 @@ table textarea {{
 <nav>
 <a href='/dashboard'>Overview</a>
 <a href='/system-health'>Health</a>
+<a href='/live-ops'>Live Ops</a>
 <a href='/signals'>Signals</a>
 <a href='/intelligence'>Intelligence</a>
 <a href='/search'>Search</a>
