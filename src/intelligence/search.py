@@ -6,14 +6,14 @@ from typing import Mapping
 
 
 def search_observations(
-    connection: sqlite3.Connection, *, query: str = "", start_at: str | None = None,
+    connection: sqlite3.Connection, *, community_id: int, query: str = "", start_at: str | None = None,
     end_at: str | None = None, platform: str | None = None, event_type: str | None = None,
     user_id: int | None = None, container_id: str | None = None, context_id: str | None = None,
     entity_type: str | None = None, entity_value: str | None = None,
     limit: int = 100, offset: int = 0,
 ) -> list[dict[str, object]]:
-    where: list[str] = []
-    params: list[object] = []
+    where: list[str] = ["o.community_id = ?"]
+    params: list[object] = [community_id]
     use_fts = bool(query.strip())
     source = "observation_fts JOIN observations AS o ON o.id=observation_fts.rowid" if use_fts else "observations AS o"
     if use_fts:
@@ -82,13 +82,15 @@ def list_saved_queries(connection: sqlite3.Connection, *, operator_id: int | Non
     return result
 
 
-def observation_pivots(connection: sqlite3.Connection, observation_id: int) -> dict[str, object]:
+def observation_pivots(
+    connection: sqlite3.Connection, observation_id: int, *, community_id: int
+) -> dict[str, object]:
     row = connection.execute(
         """SELECT o.*, actor.user_id actor_user_id, target.user_id target_user_id
            FROM observations o
            LEFT JOIN platform_accounts actor ON actor.id=o.actor_platform_account_id
            LEFT JOIN platform_accounts target ON target.id=o.target_platform_account_id
-           WHERE o.id=?""", (observation_id,),
+           WHERE o.id=? AND o.community_id=?""", (observation_id, community_id),
     ).fetchone()
     if row is None:
         raise ValueError("observation not found")
@@ -104,8 +106,9 @@ def observation_pivots(connection: sqlite3.Connection, observation_id: int) -> d
         """SELECT COUNT(DISTINCT o2.id) FROM observations o2
            LEFT JOIN platform_accounts a2 ON a2.id=o2.actor_platform_account_id
            LEFT JOIN platform_accounts t2 ON t2.id=o2.target_platform_account_id
-           WHERE o2.id<>? AND (a2.user_id IN (?, ?) OR t2.user_id IN (?, ?) OR o2.context_id=?)""",
-        (observation_id, row["actor_user_id"], row["target_user_id"], row["actor_user_id"], row["target_user_id"], row["context_id"]),
+              WHERE o2.id<>? AND o2.community_id=?
+                 AND (a2.user_id IN (?, ?) OR t2.user_id IN (?, ?) OR o2.context_id=?)""",
+          (observation_id, community_id, row["actor_user_id"], row["target_user_id"], row["actor_user_id"], row["target_user_id"], row["context_id"]),
     ).fetchone()[0])
     filters: dict[str, object] = {}
     for key in ("platform", "event_type", "container_id", "context_id"):

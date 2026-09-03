@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+
+from ..contexts import TenantContext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -33,6 +35,7 @@ class PermanentAnalysisError(Exception):
 @dataclass(frozen=True)
 class AnalysisJob:
     id: int
+    community_id: int
     stage: str
     job_type: str
     observation_id: int | None
@@ -48,6 +51,7 @@ class AnalysisJob:
 
         return cls(
             id=int(row["id"]),
+            community_id=TenantContext.require(row["community_id"]).community_id,
             stage=str(row["stage"]),
             job_type=str(row["job_type"]),
             observation_id=(
@@ -69,11 +73,9 @@ class MessageAnalysisPipeline:
         database_path: Path,
         *,
         command_registry: CommandRegistry | None = None,
-        moderation_shadow_mode: bool = False,
     ) -> None:
         self.database_path = Path(database_path)
         self.command_registry = command_registry or build_default_command_registry()
-        self.moderation_shadow_mode = moderation_shadow_mode
 
     def analyze_message_created(
         self,
@@ -81,7 +83,9 @@ class MessageAnalysisPipeline:
         job: AnalysisJob,
     ) -> None:
         observation_id = _validate_message_job(job)
-        observation = get_observation(connection, observation_id)
+        observation = get_observation(
+            connection, observation_id, tenant=TenantContext(job.community_id)
+        )
         if observation is None:
             raise PermanentAnalysisError(
                 f"Observation {observation_id} does not exist"
@@ -91,6 +95,15 @@ class MessageAnalysisPipeline:
         if event_type != "message.created":
             raise PermanentAnalysisError(
                 f"Expected message.created, received {event_type!r}"
+            )
+        policy = connection.execute(
+            """SELECT moderation_shadow_mode FROM community_policy_settings
+               WHERE community_id=?""",
+            (int(observation["community_id"]),),
+        ).fetchone()
+        if policy is None:
+            raise PermanentAnalysisError(
+                f"Community {int(observation['community_id'])} has no policy settings"
             )
 
         try:
@@ -128,9 +141,12 @@ class MessageAnalysisPipeline:
                 connection,
                 message,
                 observation_id,
-                moderation_shadow_mode=self.moderation_shadow_mode,
+                moderation_shadow_mode=bool(policy[0]),
             )
-            content = analyze_observation_content(connection, observation_id)
+            tenant = TenantContext(job.community_id)
+            content = analyze_observation_content(
+                connection, observation_id, tenant=tenant
+            )
             emit_content_alert(connection, observation_id, content)
             _enqueue_moderation_action(
                 connection,
@@ -167,12 +183,15 @@ class MessageAnalysisPipeline:
                 refresh_user_derived_signals(connection, user_id)
                 process_intelligence_observation(
                     connection,
+                    tenant=tenant,
                     user_id=user_id,
                     observation_id=observation_id,
                 )
                 refresh_community_profile(
                     connection,
-                    community_id=int(observation["community_id"] or 1),
+                    community_id=TenantContext.require(
+                        observation["community_id"]
+                    ).community_id,
                     user_id=user_id,
                 )
             analyze_coordination_campaign(connection, observation_id)
@@ -218,6 +237,10 @@ class MessageAnalysisPipeline:
             ),
             message_id=message.platform_message_id,
             content=message.content_raw,
+            community_id=(
+                int(message.metadata["community_id"])
+                if message.metadata.get("community_id") is not None else None
+            ),
         )
         parsed_command = self.command_registry.parse_command(message.content_raw)
         command_name = parsed_command[0] if parsed_command is not None else ""

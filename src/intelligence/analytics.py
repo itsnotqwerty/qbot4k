@@ -26,13 +26,17 @@ _TOKENS = re.compile(r"[\w'-]{3,}", re.UNICODE)
 _URL = re.compile(r"https?://[^\s<>]+", re.I)
 _STOP = {"the", "and", "that", "this", "with", "from", "have", "your", "you", "for", "are", "was", "not", "but", "they", "our", "will", "just", "into", "about", "http", "https", "www"}
 
-def refresh_emerging_topics(connection: sqlite3.Connection, *, now: datetime | None = None) -> int:
+def refresh_emerging_topics(
+    connection: sqlite3.Connection, *, community_id: int, now: datetime | None = None
+) -> int:
     current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     current_start = (current - timedelta(hours=24)).isoformat()
     baseline_start = (current - timedelta(days=8)).isoformat()
     rows = connection.execute(
-        """SELECT id, text_raw, context_id, container_id, occurred_at FROM observations
-           WHERE occurred_at>=? AND text_raw IS NOT NULL AND trim(text_raw)<>''""", (baseline_start,)
+          """SELECT id, text_raw, context_id, container_id, occurred_at FROM observations
+              WHERE community_id=? AND occurred_at>=?
+                 AND text_raw IS NOT NULL AND trim(text_raw)<>''""",
+          (community_id, baseline_start),
     ).fetchall()
     occurrences: dict[str, list[tuple[int, str, str, str, str]]] = defaultdict(list)
     for row in rows:
@@ -55,8 +59,8 @@ def refresh_emerging_topics(connection: sqlite3.Connection, *, now: datetime | N
             occurrences[key].append((int(row[0]), context, str(row[4]), kind, label))
 
     calculated = current.isoformat()
-    connection.execute("DELETE FROM emerging_topics")
-    connection.execute("DELETE FROM topic_evidence")
+    connection.execute("DELETE FROM emerging_topics WHERE community_id=?", (community_id,))
+    connection.execute("DELETE FROM topic_evidence WHERE community_id=?", (community_id,))
     inserted = 0
     for key, items in occurrences.items():
         recent = [item for item in items if item[2] >= current_start]
@@ -77,36 +81,54 @@ def refresh_emerging_topics(connection: sqlite3.Connection, *, now: datetime | N
             if item.startswith("phrase:")
             and set(label.split()) & set(item.split(":", 1)[1].split())
         })[:12] if kind == "phrase" else []
+        stored_key = key if community_id == 1 else f"{community_id}:{key}"
         connection.execute(
-            """INSERT INTO emerging_topics(topic_key, topic_kind, label, current_count, baseline_rate,
+            """INSERT INTO emerging_topics(community_id, topic_key, topic_kind, label, current_count, baseline_rate,
                velocity, context_count, community_count, unusualness, first_observed_at, last_observed_at,
-               details_json, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (key, kind, label, len(recent), baseline_rate, velocity, len(contexts), len(contexts), unusualness,
-             min(item[2] for item in items), max(item[2] for item in items),
-             json.dumps({"cluster_terms": cluster_terms, "cross_community_diffusion": len(contexts) > 1}), calculated),
+               details_json, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (community_id, stored_key, kind, label, len(recent), baseline_rate, velocity,
+             len(contexts), len(contexts), unusualness, min(item[2] for item in items),
+             max(item[2] for item in items), json.dumps({
+                 "cluster_terms": cluster_terms,
+                 "cross_community_diffusion": len(contexts) > 1,
+             }), calculated),
         )
         connection.execute(
-            """INSERT INTO topic_history(topic_key, topic_kind, current_count, baseline_rate, velocity,
-               context_count, community_count, unusualness, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (key, kind, len(recent), baseline_rate, velocity, len(contexts), len(contexts), unusualness, calculated),
+            """INSERT INTO topic_history(community_id, topic_key, topic_kind, current_count, baseline_rate, velocity,
+               context_count, community_count, unusualness, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (community_id, stored_key, kind, len(recent), baseline_rate, velocity,
+             len(contexts), len(contexts), unusualness, calculated),
         )
         connection.executemany(
-            "INSERT OR IGNORE INTO topic_evidence(topic_key, observation_id, context_key, occurred_at) VALUES (?, ?, ?, ?)",
-            ((key, item[0], item[1], item[2]) for item in recent[:25]),
+            """INSERT OR IGNORE INTO topic_evidence(
+                   community_id, topic_key, observation_id, context_key, occurred_at
+               ) VALUES (?, ?, ?, ?, ?)""",
+            ((community_id, stored_key, item[0], item[1], item[2]) for item in recent[:25]),
         )
         inserted += 1
     return inserted
 
 
-def refresh_graph_analytics(connection: sqlite3.Connection, *, calculated_at: str | None = None) -> int:
+def refresh_graph_analytics(
+    connection: sqlite3.Connection, *, calculated_at: str | None = None,
+    community_id: int | None = None,
+) -> int:
     timestamp = calculated_at or datetime.now(timezone.utc).isoformat()
     reference_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+    relationship_scope = "" if community_id is None else " WHERE community_id=?"
+    relationship_params: tuple[object, ...] = () if community_id is None else (community_id,)
     rows = connection.execute(
-        "SELECT source_user_id, target_user_id, strength, last_observed_at FROM entity_relationships"
+        "SELECT source_user_id, target_user_id, strength, last_observed_at "
+        "FROM entity_relationships" + relationship_scope,
+        relationship_params,
     ).fetchall()
+    metrics_table = "graph_metrics" if community_id is None else "community_graph_metrics"
+    history_table = "graph_metric_history" if community_id is None else "community_graph_metric_history"
+    delete_params: tuple[object, ...] = () if community_id is None else (community_id,)
+    delete_scope = "" if community_id is None else " WHERE community_id=?"
     nodes = {int(value) for row in rows for value in row[:2]}
     if not nodes:
-        connection.execute("DELETE FROM graph_metrics")
+        connection.execute(f"DELETE FROM {metrics_table}{delete_scope}", delete_params)
         return 0
     outgoing: dict[int, dict[int, float]] = defaultdict(dict)
     incoming: dict[int, dict[int, float]] = defaultdict(dict)
@@ -140,15 +162,26 @@ def refresh_graph_analytics(connection: sqlite3.Connection, *, calculated_at: st
     bridges = _articulation_points(nodes, undirected)
     clusters = _label_propagation(nodes, weighted_neighbors)
     max_weight = max(sum(outgoing[n].values()) + sum(incoming[n].values()) for n in nodes) or 1.0
-    connection.execute("DELETE FROM graph_metrics")
+    connection.execute(f"DELETE FROM {metrics_table}{delete_scope}", delete_params)
     for node in nodes:
         in_degree = sum(incoming[node].values()); out_degree = sum(outgoing[node].values())
         weighted = in_degree + out_degree
         influence = 0.65 * pagerank[node] + 0.35 * weighted / max_weight
         values = (node, in_degree, out_degree, weighted, betweenness[node], pagerank[node], clusters[node], int(node in bridges), influence, timestamp)
-        connection.execute("INSERT INTO graph_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
-        connection.execute("""INSERT INTO graph_metric_history(user_id, in_degree, out_degree, weighted_degree,
-            betweenness, pagerank, cluster_id, is_bridge, influence_score, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
+        if community_id is None:
+            connection.execute("INSERT INTO graph_metrics VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+            connection.execute("""INSERT INTO graph_metric_history(user_id, in_degree, out_degree, weighted_degree,
+                betweenness, pagerank, cluster_id, is_bridge, influence_score, calculated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", values)
+        else:
+            scoped_values = (community_id, *values)
+            connection.execute("""INSERT INTO community_graph_metrics(
+                community_id,user_id,in_degree,out_degree,weighted_degree,betweenness,pagerank,
+                cluster_id,is_bridge,influence_score,calculated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", scoped_values)
+            connection.execute("""INSERT INTO community_graph_metric_history(
+                community_id,user_id,in_degree,out_degree,weighted_degree,betweenness,pagerank,
+                cluster_id,is_bridge,influence_score,calculated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", scoped_values)
     return len(nodes)
 
 
@@ -185,9 +218,21 @@ def propagation_path(connection: sqlite3.Connection, source_user_id: int, target
     return []
 
 
-def refresh_identity_suggestions(connection: sqlite3.Connection, *, minimum_confidence: float = 0.55) -> int:
+def refresh_identity_suggestions(
+    connection: sqlite3.Connection, *, minimum_confidence: float = 0.55,
+    community_id: int | None = None,
+) -> int:
+    account_scope = "" if community_id is None else """
+        WHERE EXISTS (
+            SELECT 1 FROM messages
+            WHERE messages.platform_account_id=platform_accounts.id
+              AND messages.community_id=?
+        )
+    """
     accounts = connection.execute(
-        "SELECT id, platform, platform_user_id, username, user_id, guild_or_channel_context FROM platform_accounts ORDER BY id"
+        "SELECT id, platform, platform_user_id, username, user_id, guild_or_channel_context "
+        "FROM platform_accounts" + account_scope + " ORDER BY id",
+        () if community_id is None else (community_id,),
     ).fetchall()
     inserted = 0
     for index, left in enumerate(accounts):
@@ -211,30 +256,49 @@ def refresh_identity_suggestions(connection: sqlite3.Connection, *, minimum_conf
                 continue
             evidence = {"username_similarity": round(name_score, 4), "identifier_similarity": round(id_score, 4),
                         "shared_context": context_match, "manual_approval_required": True}
-            cursor = connection.execute(
-                """INSERT INTO identity_link_suggestions(left_platform_account_id, right_platform_account_id,
-                   confidence, evidence_json, model_version) VALUES (?, ?, ?, ?, 1)
-                   ON CONFLICT(left_platform_account_id, right_platform_account_id, model_version) DO UPDATE SET
-                   confidence=excluded.confidence, evidence_json=excluded.evidence_json, updated_at=CURRENT_TIMESTAMP
-                   WHERE identity_link_suggestions.status='pending'""",
-                (int(left[0]), int(right[0]), confidence, json.dumps(evidence, sort_keys=True)),
-            )
+            if community_id is None:
+                cursor = connection.execute(
+                    """INSERT INTO identity_link_suggestions(left_platform_account_id, right_platform_account_id,
+                       confidence, evidence_json, model_version) VALUES (?, ?, ?, ?, 1)
+                       ON CONFLICT(left_platform_account_id, right_platform_account_id, model_version) DO UPDATE SET
+                       confidence=excluded.confidence, evidence_json=excluded.evidence_json, updated_at=CURRENT_TIMESTAMP
+                       WHERE identity_link_suggestions.status='pending'""",
+                    (int(left[0]), int(right[0]), confidence, json.dumps(evidence, sort_keys=True)),
+                )
+            else:
+                cursor = connection.execute(
+                    """INSERT INTO community_identity_link_suggestions(
+                           community_id,left_platform_account_id,right_platform_account_id,
+                           confidence,evidence_json,model_version
+                       ) VALUES (?, ?, ?, ?, ?, 1)
+                       ON CONFLICT(community_id,left_platform_account_id,right_platform_account_id,model_version)
+                       DO UPDATE SET confidence=excluded.confidence,
+                           evidence_json=excluded.evidence_json,updated_at=CURRENT_TIMESTAMP
+                       WHERE community_identity_link_suggestions.status='pending'""",
+                    (community_id, int(left[0]), int(right[0]), confidence,
+                     json.dumps(evidence, sort_keys=True)),
+                )
             inserted += int(cursor.rowcount > 0)
     return inserted
 
 
-def emit_analytics_alerts(connection: sqlite3.Connection, *, calculated_at: str | None = None) -> int:
+def emit_analytics_alerts(
+    connection: sqlite3.Connection, *, community_id: int, calculated_at: str | None = None
+) -> int:
     """Promote material findings into bounded, stable, self-expiring triage work."""
     timestamp = calculated_at or datetime.now(timezone.utc).isoformat()
     created = 0
 
-    topic_rows = _qualifying_topic_alerts(connection) if _topic_baseline_ready(connection, timestamp) else []
+    topic_rows = _qualifying_topic_alerts(
+        connection, community_id
+    ) if _topic_baseline_ready(connection, community_id, timestamp) else []
     topic_keys = {f"topic:{row['topic_key']}" for row in topic_rows}
-    _auto_expire_alerts(connection, "emerging_topic", topic_keys, timestamp)
+    _auto_expire_alerts(connection, community_id, "emerging_topic", topic_keys, timestamp)
     for row in topic_rows:
         unusualness = float(row["unusualness"])
         created += _upsert_stable_analytics_alert(
             connection,
+            community_id=community_id,
             dedupe_key=f"topic:{row['topic_key']}",
             alert_type="emerging_topic",
             severity="high" if unusualness >= 18 else "medium",
@@ -259,10 +323,11 @@ def emit_analytics_alerts(connection: sqlite3.Connection, *, calculated_at: str 
         f"cohort:{row['user_id']}:{row['cohort_type']}:{row['cohort_key']}:{row['signal_key']}"
         for row in cohort_rows
     }
-    _auto_expire_alerts(connection, "cohort_anomaly", cohort_keys, timestamp)
+    _auto_expire_alerts(connection, community_id, "cohort_anomaly", cohort_keys, timestamp)
     for row in cohort_rows:
         created += _upsert_stable_analytics_alert(
             connection,
+            community_id=community_id,
             dedupe_key=(f"cohort:{row['user_id']}:{row['cohort_type']}:"
                         f"{row['cohort_key']}:{row['signal_key']}"),
             alert_type="cohort_anomaly",
@@ -281,10 +346,11 @@ def emit_analytics_alerts(connection: sqlite3.Connection, *, calculated_at: str 
            ORDER BY influence_score DESC"""
     ).fetchall()
     graph_keys = {f"graph-bridge:{row['user_id']}" for row in graph_rows}
-    _auto_expire_alerts(connection, "graph_bridge", graph_keys, timestamp)
+    _auto_expire_alerts(connection, community_id, "graph_bridge", graph_keys, timestamp)
     for row in graph_rows:
         created += _upsert_stable_analytics_alert(
             connection,
+            community_id=community_id,
             dedupe_key=f"graph-bridge:{row['user_id']}",
             alert_type="graph_bridge",
             severity="medium",
@@ -297,11 +363,12 @@ def emit_analytics_alerts(connection: sqlite3.Connection, *, calculated_at: str 
 
     coordination_rows = connection.execute(
         """SELECT id FROM entity_relationships
-           WHERE evidence_count>=? ORDER BY evidence_count DESC,id""",
-        (COORDINATION_ALERT_MIN_EVIDENCE,),
+              WHERE community_id=? AND evidence_count>=? ORDER BY evidence_count DESC,id""",
+          (int(community_id), COORDINATION_ALERT_MIN_EVIDENCE),
     ).fetchall()
     _auto_expire_alerts(
         connection,
+        community_id,
         "coordination_pattern",
         {f"relationship:{row['id']}:coordination" for row in coordination_rows},
         timestamp,
@@ -309,20 +376,25 @@ def emit_analytics_alerts(connection: sqlite3.Connection, *, calculated_at: str 
     return created
 
 
-def _topic_baseline_ready(connection: sqlite3.Connection, timestamp: str) -> bool:
+def _topic_baseline_ready(
+    connection: sqlite3.Connection, community_id: int, timestamp: str
+) -> bool:
     current = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
     baseline_start = (current - timedelta(days=8)).isoformat()
     current_start = (current - timedelta(hours=24)).isoformat()
     active_days = int(connection.execute(
         """SELECT COUNT(DISTINCT date(occurred_at)) FROM observations
            WHERE occurred_at>=? AND occurred_at<?
+           AND community_id=?
              AND text_raw IS NOT NULL AND trim(text_raw)<>''""",
-        (baseline_start, current_start),
+       (baseline_start, current_start, int(community_id)),
     ).fetchone()[0])
     return active_days >= TOPIC_BASELINE_MIN_ACTIVE_DAYS
 
 
-def _qualifying_topic_alerts(connection: sqlite3.Connection) -> list[sqlite3.Row]:
+def _qualifying_topic_alerts(
+    connection: sqlite3.Connection, community_id: int
+) -> list[sqlite3.Row]:
     clauses: list[str] = []
     parameters: list[object] = []
     for kind, (minimum_count, minimum_contexts, minimum_unusualness) in TOPIC_ALERT_POLICIES.items():
@@ -331,21 +403,23 @@ def _qualifying_topic_alerts(connection: sqlite3.Connection) -> list[sqlite3.Row
     return list(connection.execute(
         f"""SELECT t.topic_key,t.topic_kind,t.label,t.unusualness,t.current_count,t.context_count,
                    (SELECT e.observation_id FROM topic_evidence e WHERE e.topic_key=t.topic_key
+                    AND e.community_id=t.community_id
                     ORDER BY e.occurred_at DESC,e.observation_id DESC LIMIT 1) observation_id
-            FROM emerging_topics t WHERE {' OR '.join(clauses)}
+                FROM emerging_topics t WHERE t.community_id=? AND ({' OR '.join(clauses)})
             ORDER BY t.unusualness DESC,t.current_count DESC,t.topic_key
             LIMIT ?""",
-        (*parameters, TOPIC_ALERT_LIMIT),
+        (int(community_id), *parameters, TOPIC_ALERT_LIMIT),
     ).fetchall())
 
 
 def _auto_expire_alerts(
     connection: sqlite3.Connection,
+    community_id: int,
     alert_type: str,
     active_dedupe_keys: set[str],
     timestamp: str,
 ) -> int:
-    parameters: list[object] = [AUTO_EXPIRED_DISPOSITION, timestamp, timestamp, alert_type]
+    parameters: list[object] = [AUTO_EXPIRED_DISPOSITION, timestamp, timestamp, int(community_id), alert_type]
     exclusion = ""
     if active_dedupe_keys:
         exclusion = f" AND dedupe_key NOT IN ({','.join('?' for _ in active_dedupe_keys)})"
@@ -353,7 +427,8 @@ def _auto_expire_alerts(
     cursor = connection.execute(
         """UPDATE intelligence_alerts
            SET status='resolved',disposition=?,resolved_at=?,updated_at=?
-           WHERE alert_type=? AND status IN ('open','acknowledged','suppressed')""" + exclusion,
+                     WHERE community_id=? AND alert_type=?
+                         AND status IN ('open','acknowledged','suppressed')""" + exclusion,
         parameters,
     )
     expired = int(cursor.rowcount)
@@ -369,6 +444,7 @@ def _auto_expire_alerts(
 def _upsert_stable_analytics_alert(
     connection: sqlite3.Connection,
     *,
+    community_id: int,
     dedupe_key: str,
     alert_type: str,
     severity: str,
@@ -380,13 +456,14 @@ def _upsert_stable_analytics_alert(
     observation_id: int | None = None,
 ) -> int:
     existed = connection.execute(
-        "SELECT 1 FROM intelligence_alerts WHERE dedupe_key=?", (dedupe_key,)
+        "SELECT 1 FROM intelligence_alerts WHERE community_id=? AND dedupe_key=?",
+        (int(community_id), dedupe_key),
     ).fetchone() is not None
     connection.execute(
         """INSERT INTO intelligence_alerts(
-             user_id,observation_id,alert_type,severity,title,summary,confidence,dedupe_key,
+                         community_id,user_id,observation_id,alert_type,severity,title,summary,confidence,dedupe_key,
              created_at,updated_at
-           ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                     ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(dedupe_key) DO UPDATE SET
              user_id=COALESCE(excluded.user_id,intelligence_alerts.user_id),
              observation_id=COALESCE(excluded.observation_id,intelligence_alerts.observation_id),
@@ -402,21 +479,31 @@ def _upsert_stable_analytics_alert(
                                    AND intelligence_alerts.disposition=? THEN NULL
                               ELSE intelligence_alerts.resolved_at END,
              updated_at=excluded.updated_at""",
-        (user_id, observation_id, alert_type, severity, title, summary, confidence,
+        (int(community_id), user_id, observation_id, alert_type, severity, title, summary, confidence,
          dedupe_key, timestamp, timestamp, AUTO_EXPIRED_DISPOSITION,
          AUTO_EXPIRED_DISPOSITION, AUTO_EXPIRED_DISPOSITION),
     )
     return 0 if existed else 1
 
 
-def review_identity_suggestion(connection: sqlite3.Connection, suggestion_id: int, decision: str, *, operator_id: int | None = None) -> None:
+def review_identity_suggestion(
+    connection: sqlite3.Connection, suggestion_id: int, decision: str, *,
+    operator_id: int | None = None, community_id: int | None = None,
+) -> None:
     decision = decision.strip().casefold()
     if decision not in {"approved", "rejected"}:
         raise ValueError("decision must be approved or rejected")
+    suggestions_table = (
+        "identity_link_suggestions" if community_id is None
+        else "community_identity_link_suggestions"
+    )
+    tenant_scope = "" if community_id is None else " AND s.community_id=?"
     row = connection.execute(
-        """SELECT s.status, l.platform, l.platform_user_id, l.user_id, r.platform, r.platform_user_id, r.user_id
-           FROM identity_link_suggestions s JOIN platform_accounts l ON l.id=s.left_platform_account_id
-           JOIN platform_accounts r ON r.id=s.right_platform_account_id WHERE s.id=?""", (suggestion_id,),
+        f"""SELECT s.status, l.platform, l.platform_user_id, l.user_id, r.platform, r.platform_user_id, r.user_id
+           FROM {suggestions_table} s JOIN platform_accounts l ON l.id=s.left_platform_account_id
+           JOIN platform_accounts r ON r.id=s.right_platform_account_id
+           WHERE s.id=?{tenant_scope}""",
+        (suggestion_id,) if community_id is None else (suggestion_id, community_id),
     ).fetchone()
     if row is None or row[0] != "pending":
         raise ValueError("pending suggestion not found")
@@ -429,7 +516,8 @@ def review_identity_suggestion(connection: sqlite3.Connection, suggestion_id: in
             raise ValueError("accounts must have a canonical user before approval")
         link_platform_account(connection, platform=platform, platform_user_id=platform_user_id, user_id=target_user, operator_id=operator_id)
     connection.execute(
-        "UPDATE identity_link_suggestions SET status=?, reviewed_by_operator_id=?, reviewed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        f"""UPDATE {suggestions_table} SET status=?, reviewed_by_operator_id=?,
+            reviewed_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?""",
         (decision, operator_id, suggestion_id),
     )
 
@@ -510,6 +598,129 @@ def refresh_cohort_baselines(connection: sqlite3.Connection, *, calculated_at: s
                        baseline_mean, z_score, direction, confidence, calculated_at) VALUES (?, 'self', ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (user_id, str(user_id), signal, value, mean, z, "above" if z > 0 else "below", confidence, timestamp),
                 ); anomalies += 1
+    return baselines, anomalies
+
+
+def refresh_community_cohort_baselines(
+    connection: sqlite3.Connection, *, community_id: int,
+    calculated_at: str | None = None,
+) -> tuple[int, int]:
+    timestamp = calculated_at or datetime.now(timezone.utc).isoformat()
+    signals = connection.execute(
+        """SELECT user_id,signal_key,value_real,confidence
+           FROM community_derived_signal_windows
+           WHERE community_id=? AND window_name='24h'""",
+        (community_id,),
+    ).fetchall()
+    current_values = {
+        (int(row[0]), str(row[1])): (float(row[2]), float(row[3])) for row in signals
+    }
+    memberships: dict[int, set[tuple[str, str]]] = defaultdict(set)
+    for user_id, platform in connection.execute(
+        """SELECT DISTINCT COALESCE(messages.user_id,platform_accounts.user_id),
+                          platform_accounts.platform
+           FROM messages JOIN platform_accounts ON platform_accounts.id=messages.platform_account_id
+           WHERE messages.community_id=?
+             AND COALESCE(messages.user_id,platform_accounts.user_id) IS NOT NULL""",
+        (community_id,),
+    ):
+        memberships[int(user_id)].add(("platform", str(platform)))
+    for user_id, context in connection.execute(
+        """SELECT DISTINCT account.user_id,COALESCE(o.context_id,o.container_id)
+           FROM observations o JOIN platform_accounts account ON account.id=o.actor_platform_account_id
+           WHERE o.community_id=? AND account.user_id IS NOT NULL
+             AND COALESCE(o.context_id,o.container_id) IS NOT NULL""",
+        (community_id,),
+    ):
+        memberships[int(user_id)].add(("community", str(context)))
+    cohorts: dict[tuple[str, str, str], list[tuple[int, float, float]]] = defaultdict(list)
+    for (user_id, signal), (value, confidence) in current_values.items():
+        for cohort_type, cohort_key in memberships[user_id]:
+            cohorts[(cohort_type, cohort_key, signal)].append((user_id, value, confidence))
+
+    connection.execute(
+        "DELETE FROM community_cohort_baselines WHERE community_id=?", (community_id,)
+    )
+    connection.execute(
+        "DELETE FROM community_cohort_anomalies WHERE community_id=?", (community_id,)
+    )
+    baselines = anomalies = 0
+    for (cohort_type, cohort_key, signal), values in cohorts.items():
+        numbers = [value for _, value, _ in values]
+        mean = statistics.fmean(numbers)
+        stddev = statistics.pstdev(numbers) if len(numbers) > 1 else 0.0
+        ordered = sorted(numbers)
+        p90 = ordered[min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1)]
+        connection.execute(
+            """INSERT INTO community_cohort_baselines(
+                   community_id,cohort_type,cohort_key,signal_key,sample_size,
+                   mean_value,stddev_value,median_value,p90_value,calculated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (community_id, cohort_type, cohort_key, signal, len(numbers), mean,
+             stddev, statistics.median(numbers), p90, timestamp),
+        )
+        baselines += 1
+        if len(numbers) < COHORT_MIN_SAMPLE_SIZE or stddev == 0:
+            continue
+        for user_id, value, confidence in values:
+            if confidence < COHORT_MIN_CONFIDENCE:
+                continue
+            peer_numbers = [peer for peer_id, peer, _ in values if peer_id != user_id]
+            if len(peer_numbers) < COHORT_MIN_SAMPLE_SIZE - 1:
+                continue
+            peer_mean = statistics.fmean(peer_numbers)
+            peer_stddev = statistics.pstdev(peer_numbers)
+            if peer_stddev == 0:
+                continue
+            z_score = (value - peer_mean) / peer_stddev
+            if abs(z_score) < 1.25:
+                continue
+            connection.execute(
+                """INSERT INTO community_cohort_anomalies(
+                       community_id,user_id,cohort_type,cohort_key,signal_key,
+                       observed_value,baseline_mean,z_score,direction,confidence,calculated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (community_id, user_id, cohort_type, cohort_key, signal, value,
+                 peer_mean, z_score, "above" if z_score > 0 else "below", confidence, timestamp),
+            )
+            anomalies += 1
+
+    histories: dict[tuple[int, str], list[float]] = defaultdict(list)
+    for user_id, signal, value in connection.execute(
+        """SELECT user_id,signal_key,value_real FROM community_derived_signal_history
+           WHERE community_id=? AND window_name='24h' ORDER BY calculated_at""",
+        (community_id,),
+    ):
+        histories[(int(user_id), str(signal))].append(float(value))
+    for (user_id, signal), numbers in histories.items():
+        if len(numbers) < COHORT_MIN_SAMPLE_SIZE or (user_id, signal) not in current_values:
+            continue
+        mean = statistics.fmean(numbers)
+        stddev = statistics.pstdev(numbers)
+        ordered = sorted(numbers)
+        p90 = ordered[min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1)]
+        connection.execute(
+            """INSERT INTO community_cohort_baselines(
+                   community_id,cohort_type,cohort_key,signal_key,sample_size,
+                   mean_value,stddev_value,median_value,p90_value,calculated_at
+               ) VALUES (?,'self',?,?,?,?,?,?,?,?)""",
+            (community_id, str(user_id), signal, len(numbers), mean, stddev,
+             statistics.median(numbers), p90, timestamp),
+        )
+        baselines += 1
+        value, confidence = current_values[(user_id, signal)]
+        if stddev and confidence >= COHORT_MIN_CONFIDENCE:
+            z_score = (value - mean) / stddev
+            if abs(z_score) >= 1.25:
+                connection.execute(
+                    """INSERT INTO community_cohort_anomalies(
+                           community_id,user_id,cohort_type,cohort_key,signal_key,
+                           observed_value,baseline_mean,z_score,direction,confidence,calculated_at
+                       ) VALUES (?,?,'self',?,?,?,?,?,?,?,?)""",
+                    (community_id, user_id, str(user_id), signal, value, mean, z_score,
+                     "above" if z_score > 0 else "below", confidence, timestamp),
+                )
+                anomalies += 1
     return baselines, anomalies
 
 
@@ -617,6 +828,7 @@ def analytics_snapshot(
     connection: sqlite3.Connection,
     *,
     sorts: dict[str, tuple[str, str]] | None = None,
+    community_id: int | None = None,
 ) -> dict[str, object]:
     sorts = sorts or {}
 
@@ -640,29 +852,129 @@ def analytics_snapshot(
         "status": "status COLLATE NOCASE",
     }, "id DESC")
     cohort_order = order_clause("cohort_anomalies", ("z_score", "desc"), {
-        "user_id": "user_id", "cohort_key": "cohort_key COLLATE NOCASE",
-        "signal_key": "signal_key COLLATE NOCASE", "z_score": "z_score",
-        "direction": "direction COLLATE NOCASE", "confidence": "confidence",
-    }, "user_id ASC")
+        "user_id": "a.user_id", "cohort_key": "a.cohort_key COLLATE NOCASE",
+        "signal_key": "a.signal_key COLLATE NOCASE", "z_score": "a.z_score",
+        "direction": "a.direction COLLATE NOCASE", "confidence": "a.confidence",
+    }, "a.user_id ASC")
     evaluation_order = order_clause("evaluation", ("calculated_at", "desc"), {
         "model_key": "model_key COLLATE NOCASE", "model_version": "model_version",
         "sample_size": "sample_size", "calculated_at": "calculated_at",
     }, "id DESC")
+
+    def community_rows(sql: str) -> list[dict[str, object]]:
+        if community_id is None:
+            return []
+        parameters = tuple(int(community_id) for _ in range(sql.count("?")))
+        return [dict(row) for row in connection.execute(sql, parameters).fetchall()]
+
     return {
-        "topics": [dict(row) for row in connection.execute("SELECT * FROM emerging_topics ORDER BY " + topic_order + " LIMIT 25")],
-        "graph": [dict(row) for row in connection.execute("SELECT * FROM graph_metrics ORDER BY " + graph_order + " LIMIT 25")],
-        "graph_temporal_changes": graph_temporal_changes(connection),
-        "identity_suggestions": [dict(row) for row in connection.execute("SELECT * FROM identity_link_suggestions ORDER BY " + identity_order + " LIMIT 25")],
-        "cohort_anomalies": [dict(row) for row in connection.execute("SELECT * FROM cohort_anomalies ORDER BY " + cohort_order + " LIMIT 25")],
-        "evaluation": [dict(row) for row in connection.execute("SELECT * FROM model_evaluation_runs ORDER BY " + evaluation_order + " LIMIT 25")],
+        "growth": community_rows(
+            """WITH dates AS (
+                   SELECT date(joined_at) AS metric_date,1 AS joins,0 AS leaves
+                   FROM community_memberships WHERE community_id=? AND joined_at IS NOT NULL
+                   UNION ALL
+                   SELECT date(left_at),0,1 FROM community_memberships
+                   WHERE community_id=? AND left_at IS NOT NULL
+               )
+               SELECT metric_date,SUM(joins) AS joins,SUM(leaves) AS leaves,
+                      SUM(joins)-SUM(leaves) AS net_growth
+               FROM dates GROUP BY metric_date ORDER BY metric_date DESC LIMIT 30"""
+        ),
+        "repeat_offenses": community_rows(
+            """SELECT ma.target_platform_account_id,pa.username,COUNT(*) AS action_count,
+                      COUNT(DISTINCT ma.action_type) AS sanction_types,
+                      MIN(ma.created_at) AS first_action_at,MAX(ma.created_at) AS latest_action_at
+               FROM moderation_actions ma
+               JOIN platform_accounts pa ON pa.id=ma.target_platform_account_id
+               WHERE ma.community_id=? AND ma.status IN ('pending','completed','confirmed')
+               GROUP BY ma.target_platform_account_id,pa.username HAVING COUNT(*)>1
+               ORDER BY action_count DESC,latest_action_at DESC LIMIT 25"""
+        ),
+        "report_outcomes": community_rows(
+            """SELECT COALESCE(resolution,'open') AS outcome,COUNT(*) AS report_count,
+                      ROUND(AVG(CASE WHEN resolved_at IS NOT NULL THEN
+                         (julianday(resolved_at)-julianday(created_at))*86400 END)) AS avg_resolution_seconds
+               FROM member_reports WHERE community_id=?
+               GROUP BY COALESCE(resolution,'open') ORDER BY report_count DESC,outcome"""
+        ),
+        "appeal_outcomes": community_rows(
+            """SELECT COALESCE(disposition,'open') AS outcome,COUNT(*) AS appeal_count,
+                      ROUND(AVG(CASE WHEN resolved_at IS NOT NULL THEN
+                         (julianday(resolved_at)-julianday(created_at))*86400 END)) AS avg_resolution_seconds
+               FROM member_appeals WHERE community_id=?
+               GROUP BY COALESCE(disposition,'open') ORDER BY appeal_count DESC,outcome"""
+        ),
+        "rule_precision": community_rows(
+            """SELECT mr.id AS rule_id,mr.name,COUNT(DISTINCT m.id) AS matches,
+                      COUNT(DISTINCT rq.id) AS reviewed,
+                      COUNT(DISTINCT CASE WHEN rq.resolution='confirmed' THEN rq.id END) AS confirmed,
+                      COUNT(DISTINCT CASE WHEN rq.resolution='dismissed' THEN rq.id END) AS false_positives,
+                      ROUND(CASE WHEN COUNT(DISTINCT CASE WHEN rq.resolution IN ('confirmed','dismissed') THEN rq.id END)=0
+                         THEN 0.0 ELSE 1.0*COUNT(DISTINCT CASE WHEN rq.resolution='confirmed' THEN rq.id END)/
+                         COUNT(DISTINCT CASE WHEN rq.resolution IN ('confirmed','dismissed') THEN rq.id END) END,3) AS precision
+               FROM moderation_rules mr
+               LEFT JOIN rule_matches rm ON rm.moderation_rule_id=mr.id
+               LEFT JOIN messages m ON m.id=rm.message_id AND m.community_id=mr.community_id
+               LEFT JOIN review_queue rq ON rq.message_id=m.id
+               WHERE mr.community_id=? GROUP BY mr.id,mr.name ORDER BY precision ASC,matches DESC"""
+        ),
+        "topics": [dict(row) for row in connection.execute(
+            "SELECT * FROM emerging_topics" + ("" if community_id is None else " WHERE community_id=?")
+            + " ORDER BY " + topic_order + " LIMIT 25",
+            () if community_id is None else (community_id,),
+        )],
+        "graph": [dict(row) for row in connection.execute(
+            "SELECT * FROM " + ("graph_metrics" if community_id is None else "community_graph_metrics")
+            + ("" if community_id is None else " WHERE community_id=?")
+            + " ORDER BY " + graph_order + " LIMIT 25",
+            () if community_id is None else (community_id,),
+        )],
+        "graph_temporal_changes": graph_temporal_changes(connection, community_id=community_id),
+        "identity_suggestions": [dict(row) for row in connection.execute(
+            "SELECT * FROM " + (
+                "identity_link_suggestions" if community_id is None
+                else "community_identity_link_suggestions"
+            ) + ("" if community_id is None else " WHERE community_id=?")
+            + " ORDER BY " + identity_order + " LIMIT 25",
+            () if community_id is None else (community_id,),
+        )],
+        "cohort_anomalies": [dict(row) for row in connection.execute(
+            (
+                """SELECT a.* FROM cohort_anomalies a
+                   JOIN cohort_baselines b ON b.cohort_type=a.cohort_type
+                    AND b.cohort_key=a.cohort_key AND b.signal_key=a.signal_key
+                   WHERE b.sample_size>=? AND a.confidence>=?"""
+                if community_id is None else
+                """SELECT a.* FROM community_cohort_anomalies a
+                   JOIN community_cohort_baselines b ON b.community_id=a.community_id
+                    AND b.cohort_type=a.cohort_type AND b.cohort_key=a.cohort_key
+                    AND b.signal_key=a.signal_key
+                   WHERE a.community_id=? AND b.sample_size>=? AND a.confidence>=?"""
+            ) + " ORDER BY " + cohort_order + " LIMIT 25",
+            (
+                (COHORT_MIN_SAMPLE_SIZE, COHORT_MIN_CONFIDENCE)
+                if community_id is None else
+                (community_id, COHORT_MIN_SAMPLE_SIZE, COHORT_MIN_CONFIDENCE)
+            ),
+        )],
+        "evaluation": [] if community_id is not None else [
+            dict(row) for row in connection.execute(
+                "SELECT * FROM model_evaluation_runs ORDER BY " + evaluation_order + " LIMIT 25"
+            )
+        ],
     }
 
 
-def graph_temporal_changes(connection: sqlite3.Connection, *, limit: int = 25) -> list[dict[str, object]]:
+def graph_temporal_changes(
+    connection: sqlite3.Connection, *, limit: int = 25, community_id: int | None = None
+) -> list[dict[str, object]]:
+    history_table = "graph_metric_history" if community_id is None else "community_graph_metric_history"
+    community_scope = "" if community_id is None else " WHERE community_id=?"
+    parameters: tuple[object, ...] = () if community_id is None else (community_id,)
     rows = connection.execute(
-        """WITH ranked AS (
+        f"""WITH ranked AS (
              SELECT *, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY calculated_at DESC, id DESC) AS rn
-             FROM graph_metric_history
+             FROM {history_table}{community_scope}
            )
            SELECT current.user_id, current.influence_score,
                   current.influence_score-previous.influence_score AS influence_delta,
@@ -671,7 +983,7 @@ def graph_temporal_changes(connection: sqlite3.Connection, *, limit: int = 25) -
                   current.is_bridge, previous.is_bridge AS previous_is_bridge
            FROM ranked current JOIN ranked previous ON previous.user_id=current.user_id AND previous.rn=2
            WHERE current.rn=1 ORDER BY ABS(current.influence_score-previous.influence_score) DESC LIMIT ?""",
-        (max(1, min(limit, 500)),),
+        (*parameters, max(1, min(limit, 500))),
     ).fetchall()
     return [dict(row) for row in rows]
 

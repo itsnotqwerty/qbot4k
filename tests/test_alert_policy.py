@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from src.contexts import TenantContext
 from src.db import collect_observation, connect_database, initialize_database, operational_readiness_snapshot
 from src.intelligence.analytics import emit_analytics_alerts
 from src.intelligence.workflows import _upsert_relationship, intelligence_summary
@@ -33,6 +34,7 @@ class AlertPolicyTests(unittest.TestCase):
                 context_id="baseline",
                 text="ordinary historical activity",
                 occurred_at=f"2026-08-{day:02d}T10:00:00+00:00",
+                community_id=1,
             ))
 
     def _seed_topics(self, count: int = 12) -> None:
@@ -40,9 +42,9 @@ class AlertPolicyTests(unittest.TestCase):
             unusualness = 30.0 - index
             self.connection.execute(
                 """INSERT INTO emerging_topics(
-                     topic_key,topic_kind,label,current_count,baseline_rate,velocity,
+                                         community_id,topic_key,topic_kind,label,current_count,baseline_rate,velocity,
                      context_count,community_count,unusualness,details_json,calculated_at
-                   ) VALUES (?,?,?,12,1,11,3,3,?,'{}','2026-08-11T12:00:00+00:00')""",
+                                     ) VALUES (1,?,?,?,12,1,11,3,3,?,'{}','2026-08-11T12:00:00+00:00')""",
                 (f"term:signal-{index}", "term", f"signal-{index}", unusualness),
             )
 
@@ -51,12 +53,12 @@ class AlertPolicyTests(unittest.TestCase):
             self._seed_topics(1)
             self.connection.execute(
                 """INSERT INTO intelligence_alerts(
-                     alert_type,severity,title,summary,confidence,dedupe_key
-                   ) VALUES ('emerging_topic','medium','Emerging Topic','legacy',0.5,
+                                         community_id,alert_type,severity,title,summary,confidence,dedupe_key
+                                     ) VALUES (1,'emerging_topic','medium','Emerging Topic','legacy',0.5,
                              'topic:term:legacy:2026-08-11')"""
             )
             created = emit_analytics_alerts(
-                self.connection, calculated_at="2026-08-11T12:00:00+00:00"
+                self.connection, community_id=1, calculated_at="2026-08-11T12:00:00+00:00"
             )
         self.assertEqual(created, 0)
         legacy = self.connection.execute(
@@ -72,10 +74,10 @@ class AlertPolicyTests(unittest.TestCase):
             self._seed_baseline_days()
             self._seed_topics()
             first_created = emit_analytics_alerts(
-                self.connection, calculated_at="2026-08-11T12:00:00+00:00"
+                self.connection, community_id=1, calculated_at="2026-08-11T12:00:00+00:00"
             )
             second_created = emit_analytics_alerts(
-                self.connection, calculated_at="2026-08-12T12:00:00+00:00"
+                self.connection, community_id=1, calculated_at="2026-08-12T12:00:00+00:00"
             )
         self.assertEqual(first_created, 10)
         self.assertEqual(second_created, 0)
@@ -94,7 +96,7 @@ class AlertPolicyTests(unittest.TestCase):
                 (manually_resolved_key,),
             )
             self.connection.execute("DELETE FROM emerging_topics")
-            emit_analytics_alerts(self.connection, calculated_at="2026-08-12T14:00:00+00:00")
+            emit_analytics_alerts(self.connection, community_id=1, calculated_at="2026-08-12T14:00:00+00:00")
         dispositions = dict(self.connection.execute(
             "SELECT dedupe_key,disposition FROM intelligence_alerts WHERE alert_type='emerging_topic'"
         ).fetchall())
@@ -105,12 +107,12 @@ class AlertPolicyTests(unittest.TestCase):
         with self.connection:
             self.connection.execute(
                 """INSERT INTO emerging_topics(
-                     topic_key,topic_kind,label,current_count,baseline_rate,velocity,
+                                         community_id,topic_key,topic_kind,label,current_count,baseline_rate,velocity,
                      context_count,community_count,unusualness,details_json,calculated_at
-                   ) VALUES (?,'term','manual-topic',12,1,11,3,3,25,'{}','2026-08-12')""",
+                                     ) VALUES (1,?,'term','manual-topic',12,1,11,3,3,25,'{}','2026-08-12')""",
                 (topic_key,),
             )
-            emit_analytics_alerts(self.connection, calculated_at="2026-08-12T15:00:00+00:00")
+            emit_analytics_alerts(self.connection, community_id=1, calculated_at="2026-08-12T15:00:00+00:00")
         manual = self.connection.execute(
             "SELECT status,disposition FROM intelligence_alerts WHERE dedupe_key=?",
             (manually_resolved_key,),
@@ -136,16 +138,23 @@ class AlertPolicyTests(unittest.TestCase):
                 (user_id,),
             )
             self.assertEqual(emit_analytics_alerts(
-                self.connection, calculated_at="2026-08-11T12:00:00+00:00"
+                self.connection, community_id=1, calculated_at="2026-08-11T12:00:00+00:00"
             ), 0)
             self.connection.execute(
                 "UPDATE cohort_baselines SET sample_size=6 WHERE cohort_type='platform'"
             )
+            self.connection.execute(
+                """INSERT INTO intelligence_alerts(
+                       community_id,user_id,alert_type,severity,title,summary,
+                       confidence,dedupe_key
+                   ) VALUES (1,?,'membership','low','Membership','Fixture',1.0,?)""",
+                (user_id, f"membership:{user_id}"),
+            )
             self.assertEqual(emit_analytics_alerts(
-                self.connection, calculated_at="2026-08-11T13:00:00+00:00"
+                self.connection, community_id=1, calculated_at="2026-08-11T13:00:00+00:00"
             ), 1)
             self.connection.execute("UPDATE cohort_anomalies SET confidence=0.5")
-            emit_analytics_alerts(self.connection, calculated_at="2026-08-11T14:00:00+00:00")
+            emit_analytics_alerts(self.connection, community_id=1, calculated_at="2026-08-11T14:00:00+00:00")
         row = self.connection.execute(
             "SELECT status,disposition,dedupe_key FROM intelligence_alerts WHERE alert_type='cohort_anomaly'"
         ).fetchone()
@@ -157,11 +166,13 @@ class AlertPolicyTests(unittest.TestCase):
             for index, status in enumerate(("open", "acknowledged", "suppressed", "in_case", "resolved")):
                 self.connection.execute(
                     """INSERT INTO intelligence_alerts(
-                         alert_type,severity,title,summary,confidence,status,dedupe_key
-                       ) VALUES ('test','low','Test','Test',0.5,?,?)""",
+                                                 community_id,alert_type,severity,title,summary,confidence,status,dedupe_key
+                                             ) VALUES (1,'test','low','Test','Test',0.5,?,?)""",
                     (status, f"count-{index}"),
                 )
-        self.assertEqual(intelligence_summary(self.connection).open_alerts, 1)
+        self.assertEqual(
+            intelligence_summary(self.connection, tenant=TenantContext(1)).open_alerts, 1
+        )
         self.assertEqual(operational_readiness_snapshot(self.connection)["counters"]["open_alerts"], 1)
 
     def test_coordination_requires_six_observations_and_old_noise_expires(self) -> None:
@@ -175,7 +186,7 @@ class AlertPolicyTests(unittest.TestCase):
             for index in range(5):
                 _upsert_relationship(
                     self.connection, source, target, "mention", "channel",
-                    f"2026-08-11T12:0{index}:00+00:00", {},
+                    f"2026-08-11T12:0{index}:00+00:00", {"community_id": 1},
                 )
             relationship_id = int(self.connection.execute(
                 "SELECT id FROM entity_relationships"
@@ -187,7 +198,7 @@ class AlertPolicyTests(unittest.TestCase):
         with self.connection:
             _upsert_relationship(
                 self.connection, source, target, "mention", "channel",
-                "2026-08-11T12:05:00+00:00", {},
+                "2026-08-11T12:05:00+00:00", {"community_id": 1},
             )
         alert = self.connection.execute(
             "SELECT status,severity,dedupe_key FROM intelligence_alerts WHERE alert_type='coordination_pattern'"
@@ -200,7 +211,7 @@ class AlertPolicyTests(unittest.TestCase):
             self.connection.execute(
                 "UPDATE entity_relationships SET evidence_count=3 WHERE id=?", (relationship_id,)
             )
-            emit_analytics_alerts(self.connection, calculated_at="2026-08-11T13:00:00+00:00")
+            emit_analytics_alerts(self.connection, community_id=1, calculated_at="2026-08-11T13:00:00+00:00")
         expired = self.connection.execute(
             "SELECT status,disposition FROM intelligence_alerts WHERE alert_type='coordination_pattern'"
         ).fetchone()

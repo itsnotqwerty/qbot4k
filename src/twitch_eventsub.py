@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .models import Observation, coerce_timestamp
+from .contexts import TenantContext
 from .twitch_auth import TwitchTokenManager
 
 
@@ -72,7 +73,7 @@ def verify_eventsub_signature(
 
 
 def observation_from_eventsub(
-    payload: Mapping[str, object], *, message_id: str, community_id: int = 1
+    payload: Mapping[str, object], *, message_id: str, community_id: int
 ) -> Observation | None:
     subscription = payload.get("subscription")
     event = payload.get("event")
@@ -107,7 +108,8 @@ def observation_from_eventsub(
         context_id=broadcaster_id or None, text=text or None,
         occurred_at=coerce_timestamp(str(occurred_at) if occurred_at else None),
         attributes={"eventsub_type": subscription_type, **dict(event)},
-        raw_payload=dict(payload), community_id=max(1, int(community_id)),
+        raw_payload=dict(payload),
+        community_id=TenantContext.require(community_id).community_id,
     )
 
 
@@ -151,7 +153,7 @@ class TwitchEventSubControlPlane:
         token_manager: TwitchTokenManager,
         callback_url: str,
         secret: str,
-        community_id: int = 1,
+        community_id: int,
     ) -> None:
         if not callback_url.startswith("https://"):
             raise ValueError("EventSub callback URL must use HTTPS")
@@ -160,7 +162,7 @@ class TwitchEventSubControlPlane:
         self.token_manager = token_manager
         self.callback_url = callback_url
         self.secret = secret
-        self.community_id = max(1, int(community_id))
+        self.community_id = TenantContext.require(community_id).community_id
 
     def reconcile(
         self,

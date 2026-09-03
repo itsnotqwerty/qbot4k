@@ -10,6 +10,9 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
+TWITCH_OAUTH_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
+
+
 class TwitchAuthError(RuntimeError):
 	pass
 
@@ -28,6 +31,54 @@ class TwitchTokenValidation:
 	login: str
 	client_id: str
 	user_id: str = ""
+
+
+@dataclass(frozen=True)
+class TwitchOAuthGrant:
+	access_token: str
+	refresh_token: str | None
+	scopes: tuple[str, ...]
+
+
+def exchange_twitch_code_for_tokens(
+	client_id: str,
+	client_secret: str,
+	redirect_uri: str,
+	code: str,
+) -> TwitchOAuthGrant:
+	request = Request(
+		TWITCH_OAUTH_TOKEN_URL,
+		data=urlencode({
+			"client_id": client_id.strip(),
+			"client_secret": client_secret.strip(),
+			"code": code.strip(),
+			"grant_type": "authorization_code",
+			"redirect_uri": redirect_uri.strip(),
+		}).encode("utf-8"),
+		headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+		method="POST",
+	)
+	try:
+		with urlopen(request, timeout=15) as response:
+			payload = json.loads(response.read().decode("utf-8"))
+	except HTTPError as exc:
+		detail = exc.read().decode("utf-8", errors="replace")[:500]
+		raise TwitchAuthError(
+			f"Twitch authorization exchange failed: HTTP {exc.code} {detail}"
+		) from exc
+	except URLError as exc:
+		raise TwitchTemporaryAuthError(
+			f"Twitch authorization exchange is unavailable: {exc.reason}"
+		) from exc
+	if not isinstance(payload, dict):
+		raise TwitchAuthError("Twitch authorization response was not an object")
+	access_token = str(payload.get("access_token") or "").strip()
+	if not access_token:
+		raise TwitchAuthError("Twitch authorization response omitted access_token")
+	refresh_token = str(payload.get("refresh_token") or "").strip() or None
+	scopes_raw = payload.get("scope")
+	scopes = tuple(sorted({str(scope).strip() for scope in scopes_raw if str(scope).strip()})) if isinstance(scopes_raw, list) else ()
+	return TwitchOAuthGrant(access_token, refresh_token, scopes)
 
 
 class TwitchTokenManager:

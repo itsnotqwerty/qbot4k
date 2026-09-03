@@ -33,11 +33,25 @@ directories are retained for manual rollback; point `/opt/qbot4k/current` to a
 previous release, run `systemctl daemon-reload`, and restart after confirming
 database compatibility.
 
+For deployments that run directly from a checked-out project directory, use
+the Python deploy kit instead:
+
+```bash
+python deploy/install.py --env .env.production --domain intelligence.example.com --http-only --dry-run
+sudo python3 deploy/install.py --env .env.production --domain intelligence.example.com --http-only
+```
+
+It creates `.venv`, installs `requirements.txt`, securely copies the required
+environment file, and renders project-owned systemd and nginx configuration.
+Rerun without `--http-only` after certificates exist. nginx is validated before
+the service is restarted, and a failed validation restores the prior proxy
+configuration. See `deploy/README.md` for all options.
+
 ## Deployment gate
 
 1. Install `requirements.txt` in a clean virtual environment.
 2. Set a long random dashboard session secret and an independent ingestion token.
-3. Start with `QBOT_MODERATION_SHADOW_MODE=true` and validate review-queue output.
+3. Keep each pilot community in persisted shadow mode and validate review-queue output.
 4. Run `python -m src --env-file /etc/qbot4k/qbot4k.env check-config`,
    `python -m src --env-file /etc/qbot4k/qbot4k.env init-db`, and the complete
    test suite.
@@ -71,7 +85,8 @@ The `open_alerts` counter represents untriaged `open` alerts only. Acknowledged,
 
 ## Incident response
 
-- Set `QBOT_MODERATION_SHADOW_MODE=true` to stop automatic enforcement globally without disabling analysis.
+- Set `community_policy_settings.moderation_shadow_mode=1` for the affected
+    community to stop automatic enforcement without disabling analysis elsewhere.
 - Rotate bot, OAuth, session, and ingestion credentials if exposure is suspected.
 - Preserve the database and logs before replaying failed observations.
 - Use dedupe keys and immutable observation IDs when correlating alerts, cases, and source evidence.

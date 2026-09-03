@@ -3,7 +3,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
-from src.db import connect_database, get_observation
+from src.contexts import TenantContext
+from src.db import connect_database, get_observation, initialize_database
+from src.intelligence.community import register_installation
 from src.models import CollectionResult, IngestionResult
 from src.pipeline.actions import (
     ActionRegistry,
@@ -30,10 +32,32 @@ def ingest_and_analyze(
     *,
     reply_sink: Callable[[str], None] | None = None,
 ) -> IngestionResult | CollectionResult:
+    platform = "discord" if connector.__class__.__name__ == "DiscordConnector" else "twitch"
+    external_community_id = str(
+        payload.get("guild_id") if platform == "discord"
+        else payload.get("channel") or payload.get("channel_id")
+        or ""
+    ).strip()
+    if external_community_id:
+        connection = connect_database(Path(connector.database_path))
+        try:
+            initialize_database(connection)
+            existing = connection.execute(
+                """SELECT 1 FROM community_installations
+                   WHERE platform=? AND external_community_id=?""",
+                (platform, external_community_id),
+            ).fetchone()
+            if existing is None:
+                register_installation(
+                    connection, community_id=1, platform=platform,
+                    external_community_id=external_community_id,
+                    display_name=external_community_id, status="active",
+                )
+        finally:
+            connection.close()
     result = connector.ingest_message(payload)
 
     if result.status == "duplicate":
-        platform = "discord" if connector.__class__.__name__ == "DiscordConnector" else "twitch"
         external_id = payload.get("id") if platform == "discord" else payload.get("message_id")
         connection = connect_database(Path(connector.database_path))
         try:
@@ -75,7 +99,9 @@ def ingest_and_analyze(
             message_id=int(row[0]),
         )
 
-        observation = get_observation(connection, result.observation_id)
+        observation = get_observation(
+            connection, result.observation_id, tenant=TenantContext(1)
+        )
         if observation is None:
             return projected
 

@@ -97,9 +97,7 @@ class AppSettings:
     twitch_channels: tuple[str, ...]
     twitch_join_command_channel: str
     discord_guild_ids: tuple[str, ...]
-    discord_allow_bot_messages: bool
     operator_guild_ids: tuple[str, ...]
-    message_retention_days: int
     audit_retention_days: int
     twitch_bot_token: str | None
     twitch_refresh_token: str | None
@@ -109,7 +107,6 @@ class AppSettings:
     discord_oauth_client_id: str | None
     discord_oauth_client_secret: str | None
     discord_oauth_redirect_uri: str | None
-    moderation_shadow_mode: bool
     ingest_api_token: str | None
     maintenance_interval_seconds: int
     analytics_interval_seconds: int
@@ -119,6 +116,12 @@ class AppSettings:
     default_community_slug: str
     twitch_eventsub_secret: str | None
     twitch_eventsub_callback_url: str | None
+    twitch_oauth_redirect_uri: str | None
+    credential_encryption_key: str | None
+    legal_organization_name: str | None
+    legal_contact_email: str | None
+    legal_jurisdiction: str | None
+    legal_effective_date: str | None
 
     @classmethod
     def from_env(
@@ -201,16 +204,7 @@ class AppSettings:
                 "its_not_qwerty",
             ).strip(),
             discord_guild_ids=_parse_csv(env_map.get("QBOT_DISCORD_GUILD_IDS")),
-            discord_allow_bot_messages=_parse_bool(
-                env_map.get("QBOT_DISCORD_ALLOW_BOT_MESSAGES"),
-                default=False,
-            ),
             operator_guild_ids=_parse_csv(env_map.get("QBOT_OPERATOR_GUILD_IDS")),
-            message_retention_days=_parse_int(
-                "QBOT_MESSAGE_RETENTION_DAYS",
-                env_map.get("QBOT_MESSAGE_RETENTION_DAYS"),
-                90,
-            ),
             audit_retention_days=_parse_int(
                 "QBOT_AUDIT_RETENTION_DAYS",
                 env_map.get("QBOT_AUDIT_RETENTION_DAYS"),
@@ -227,10 +221,6 @@ class AppSettings:
             ),
             discord_oauth_redirect_uri=env_map.get(
                 "QBOT_DISCORD_OAUTH_REDIRECT_URI"
-            ),
-            moderation_shadow_mode=_parse_bool(
-                env_map.get("QBOT_MODERATION_SHADOW_MODE"),
-                default=False,
             ),
             ingest_api_token=env_map.get("QBOT_INGEST_API_TOKEN"),
             maintenance_interval_seconds=_parse_int(
@@ -261,6 +251,12 @@ class AppSettings:
             ).strip().casefold(),
             twitch_eventsub_secret=env_map.get("QBOT_TWITCH_EVENTSUB_SECRET"),
             twitch_eventsub_callback_url=env_map.get("QBOT_TWITCH_EVENTSUB_CALLBACK_URL"),
+            twitch_oauth_redirect_uri=env_map.get("QBOT_TWITCH_OAUTH_REDIRECT_URI"),
+            credential_encryption_key=env_map.get("QBOT_CREDENTIAL_ENCRYPTION_KEY"),
+            legal_organization_name=env_map.get("QBOT_LEGAL_ORGANIZATION_NAME"),
+            legal_contact_email=env_map.get("QBOT_LEGAL_CONTACT_EMAIL"),
+            legal_jurisdiction=env_map.get("QBOT_LEGAL_JURISDICTION"),
+            legal_effective_date=env_map.get("QBOT_LEGAL_EFFECTIVE_DATE"),
         )
         settings.validate()
         return settings
@@ -272,9 +268,6 @@ class AppSettings:
             )
         if self.dashboard_port <= 0 or self.dashboard_port > 65535:
             raise ConfigError("QBOT_DASHBOARD_PORT must be between 1 and 65535")
-
-        if self.message_retention_days <= 0:
-            raise ConfigError("QBOT_MESSAGE_RETENTION_DAYS must be greater than zero")
 
         if self.audit_retention_days <= 0:
             raise ConfigError("QBOT_AUDIT_RETENTION_DAYS must be greater than zero")
@@ -299,6 +292,10 @@ class AppSettings:
                 "QBOT_DASHBOARD_SESSION_SECRET": self.dashboard_session_secret,
                 "QBOT_DISCORD_OAUTH_CLIENT_ID": self.discord_oauth_client_id,
                 "QBOT_DISCORD_OAUTH_CLIENT_SECRET": self.discord_oauth_client_secret,
+                "QBOT_LEGAL_ORGANIZATION_NAME": self.legal_organization_name,
+                "QBOT_LEGAL_CONTACT_EMAIL": self.legal_contact_email,
+                "QBOT_LEGAL_JURISDICTION": self.legal_jurisdiction,
+                "QBOT_LEGAL_EFFECTIVE_DATE": self.legal_effective_date,
             }
             missing_web_values = [
                 key for key, value in required_web_values.items() if not value
@@ -361,9 +358,7 @@ class AppSettings:
             "twitch_channels": list(self.twitch_channels),
             "twitch_join_command_channel": self.twitch_join_command_channel,
             "discord_guild_ids": list(self.discord_guild_ids),
-            "discord_allow_bot_messages": self.discord_allow_bot_messages,
             "operator_guild_ids": list(self.operator_guild_ids),
-            "message_retention_days": self.message_retention_days,
             "audit_retention_days": self.audit_retention_days,
             "web_auth_configured": bool(
                 self.dashboard_session_secret
@@ -377,7 +372,6 @@ class AppSettings:
                 and self.twitch_client_secret
             ),
             "discord_configured": bool(self.discord_bot_token),
-            "moderation_shadow_mode": self.moderation_shadow_mode,
             "ingest_api_token_configured": bool(self.ingest_api_token),
             "maintenance_interval_seconds": self.maintenance_interval_seconds,
             "analytics_interval_seconds": self.analytics_interval_seconds,
@@ -387,5 +381,15 @@ class AppSettings:
             "default_community_slug": self.default_community_slug,
             "twitch_eventsub_configured": bool(
                 self.twitch_eventsub_secret and self.twitch_eventsub_callback_url
+            ),
+            "twitch_oauth_configured": bool(
+                self.twitch_client_id and self.twitch_client_secret
+                and self.credential_encryption_key
+            ),
+            "legal_identity_configured": bool(
+                self.legal_organization_name
+                and self.legal_contact_email
+                and self.legal_jurisdiction
+                and self.legal_effective_date
             ),
         }

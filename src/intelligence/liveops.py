@@ -8,7 +8,7 @@ from typing import Any
 from .professional_ops import moderator_workload_report
 
 
-def live_operations_snapshot(connection: sqlite3.Connection, *, community_id: int = 1) -> dict[str, Any]:
+def live_operations_snapshot(connection: sqlite3.Connection, *, community_id: int) -> dict[str, Any]:
     community = connection.execute(
         "SELECT id,name,slug FROM communities WHERE id=?", (int(community_id),)
     ).fetchone()

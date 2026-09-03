@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+
+from ..contexts import TenantContext
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -116,9 +118,13 @@ def understand_content(text: str, attributes: dict[str, object] | None = None) -
     )
 
 
-def analyze_observation_content(connection: sqlite3.Connection, observation_id: int) -> ContentUnderstanding:
+def analyze_observation_content(
+    connection: sqlite3.Connection, observation_id: int, *, tenant: TenantContext
+) -> ContentUnderstanding:
     row = connection.execute(
-        "SELECT text_raw, attributes_json FROM observations WHERE id = ?", (observation_id,)
+        """SELECT text_raw, attributes_json FROM observations
+           WHERE id = ? AND community_id = ?""",
+        (observation_id, tenant.community_id),
     ).fetchone()
     if row is None:
         raise ValueError("observation not found")
@@ -164,7 +170,7 @@ def emit_content_alert(
         return None
     observation = connection.execute(
         """
-        SELECT actor.user_id, target.user_id
+        SELECT o.community_id, actor.user_id, target.user_id
         FROM observations AS o
         LEFT JOIN platform_accounts AS actor ON actor.id=o.actor_platform_account_id
         LEFT JOIN platform_accounts AS target ON target.id=o.target_platform_account_id
@@ -174,17 +180,19 @@ def emit_content_alert(
     ).fetchone()
     if observation is None:
         return None
-    user_id = observation[0] if observation[0] is not None else observation[1]
+    tenant = TenantContext.require(observation[0])
+    user_id = observation[1] if observation[1] is not None else observation[2]
     severity = "critical" if result.threat_level == "critical" else "high"
     cursor = connection.execute(
         """
         INSERT INTO intelligence_alerts(
-            user_id, observation_id, alert_type, severity, title, summary,
+            community_id, user_id, observation_id, alert_type, severity, title, summary,
             confidence, dedupe_key
-        ) VALUES (?, ?, 'content_threat', ?, 'Potential Threat', ?, ?, ?)
+        ) VALUES (?, ?, ?, 'content_threat', ?, 'Potential Threat', ?, ?, ?)
         ON CONFLICT(dedupe_key) DO NOTHING
         """,
         (
+            tenant.community_id,
             user_id,
             observation_id,
             severity,

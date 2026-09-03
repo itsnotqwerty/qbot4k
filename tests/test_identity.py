@@ -158,6 +158,7 @@ class IdentityTests(unittest.TestCase):
 				connection.execute(
 					"""
 					INSERT INTO messages (
+						community_id,
 						platform,
 						platform_message_id,
 						platform_account_id,
@@ -165,13 +166,14 @@ class IdentityTests(unittest.TestCase):
 						content_raw,
 						content_normalized,
 						sent_at
-					) VALUES ('twitch', 'msg-1', ?, 'channel-1', 'hello', 'hello', '2026-08-01T00:00:00+00:00')
+					) VALUES (1, 'twitch', 'msg-1', ?, 'channel-1', 'hello', 'hello', '2026-08-01T00:00:00+00:00')
 					""",
 					(twitch_account_id,),
 				)
 				connection.execute(
 					"""
 					INSERT INTO messages (
+						community_id,
 						platform,
 						platform_message_id,
 						platform_account_id,
@@ -179,7 +181,7 @@ class IdentityTests(unittest.TestCase):
 						content_raw,
 						content_normalized,
 						sent_at
-					) VALUES ('discord', 'msg-2', ?, 'channel-2', 'hello', 'hello', '2026-08-01T00:00:00+00:00')
+					) VALUES (1, 'discord', 'msg-2', ?, 'channel-2', 'hello', 'hello', '2026-08-01T00:00:00+00:00')
 					""",
 					(discord_account_id,),
 				)
@@ -299,6 +301,7 @@ class IdentityTests(unittest.TestCase):
 			user_id = create_canonical_user(connection, primary_display_name="sam")
 			note_id = add_user_note(
 				connection,
+					community_id=1,
 				user_id=user_id,
 				operator_id=42,
 				body="Needs follow-up",

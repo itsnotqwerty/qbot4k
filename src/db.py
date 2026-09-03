@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Mapping
 
+from .contexts import TenantContext
 from .intelligence.powerusers import (
     POWERUSER_THRESHOLD,
     default_social_score_for_name,
@@ -56,6 +57,10 @@ CREATE TABLE IF NOT EXISTS communities (
     slug TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     timezone TEXT NOT NULL DEFAULT 'UTC',
+    locale TEXT NOT NULL DEFAULT 'en-US',
+    description TEXT NOT NULL DEFAULT '',
+    guidelines TEXT NOT NULL DEFAULT '',
+    notifications_enabled INTEGER NOT NULL DEFAULT 1,
     retention_days INTEGER NOT NULL DEFAULT 90,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -70,12 +75,61 @@ CREATE TABLE IF NOT EXISTS community_installations (
     display_name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     scopes_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    health_status TEXT NOT NULL DEFAULT 'unknown',
+    last_health_check_at TEXT,
+    reconnect_attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
     token_reference TEXT,
     last_verified_at TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(platform, external_community_id)
 );
+
+CREATE TABLE IF NOT EXISTS installation_credentials (
+    id INTEGER PRIMARY KEY,
+    installation_id INTEGER NOT NULL UNIQUE
+        REFERENCES community_installations(id) ON DELETE CASCADE,
+    access_token_ciphertext BLOB NOT NULL,
+    refresh_token_ciphertext BLOB,
+    scopes_json TEXT NOT NULL DEFAULT '[]',
+    key_version INTEGER NOT NULL DEFAULT 1,
+    rotation_count INTEGER NOT NULL DEFAULT 1,
+    rotated_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS twitch_install_intents (
+    nonce TEXT PRIMARY KEY,
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    broadcaster_login TEXT NOT NULL,
+    scopes_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_twitch_install_intents_pending
+    ON twitch_install_intents(expires_at) WHERE consumed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS installation_health_events (
+    id INTEGER PRIMARY KEY,
+    installation_id INTEGER NOT NULL REFERENCES community_installations(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    health_status TEXT NOT NULL,
+    lifecycle_status TEXT NOT NULL,
+    reconnect_attempted INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    checked_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_installation_health_events_lookup
+    ON installation_health_events(community_id, installation_id, checked_at DESC);
 
 CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
@@ -107,6 +161,8 @@ CREATE TABLE IF NOT EXISTS operator_accounts (
     discord_user_id TEXT NOT NULL UNIQUE,
     discord_username TEXT NOT NULL,
     role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled')),
+    session_version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -119,14 +175,80 @@ CREATE TABLE IF NOT EXISTS operator_community_roles (
     PRIMARY KEY(operator_id, community_id)
 );
 
+CREATE TABLE IF NOT EXISTS operator_permission_overrides (
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    permission TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK(decision IN ('grant', 'deny')),
+    updated_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(operator_id, community_id, permission)
+);
+
+CREATE TABLE IF NOT EXISTS operator_invitations (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    target_discord_user_id TEXT NOT NULL,
+    invited_role TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','accepted','revoked','expired')),
+    expires_at TEXT NOT NULL,
+    invited_by_operator_id INTEGER NOT NULL REFERENCES operator_accounts(id),
+    accepted_by_operator_id INTEGER REFERENCES operator_accounts(id),
+    accepted_at TEXT,
+    revoked_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operator_invitation_pending
+    ON operator_invitations(community_id,target_discord_user_id)
+    WHERE status='pending';
+
+CREATE TABLE IF NOT EXISTS operator_discord_guild_permissions (
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    guild_id TEXT NOT NULL,
+    permissions INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(operator_id, guild_id)
+);
+
+CREATE TABLE IF NOT EXISTS discord_install_intents (
+    nonce TEXT PRIMARY KEY,
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    guild_id TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_discord_install_intents_pending
+    ON discord_install_intents(expires_at) WHERE consumed_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS pilot_invitations (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL UNIQUE,
+    expires_at TEXT NOT NULL,
+    created_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    consumed_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pilot_invitations_pending
+    ON pilot_invitations(community_id, expires_at) WHERE consumed_at IS NULL;
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
     observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    installation_id INTEGER REFERENCES community_installations(id) ON DELETE SET NULL,
     platform TEXT NOT NULL,
     platform_message_id TEXT,
     platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
     user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     channel_id TEXT NOT NULL,
     content_raw TEXT NOT NULL,
     content_normalized TEXT NOT NULL,
@@ -167,16 +289,44 @@ CREATE TABLE IF NOT EXISTS twitch_channels (
 CREATE TABLE IF NOT EXISTS moderation_rules (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
-    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     rule_type TEXT NOT NULL,
     pattern TEXT NOT NULL,
     severity TEXT NOT NULL,
     auto_enforce_action TEXT,
     enforcement_mode TEXT NOT NULL DEFAULT 'enforce',
     action_duration_seconds INTEGER NOT NULL DEFAULT 600,
+    platform_scope_json TEXT NOT NULL DEFAULT '["discord","twitch"]',
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS moderation_rule_versions (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    moderation_rule_id INTEGER NOT NULL REFERENCES moderation_rules(id) ON DELETE CASCADE,
+    version_number INTEGER NOT NULL,
+    lifecycle_state TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    impact_json TEXT NOT NULL DEFAULT '{}',
+    created_by_operator_id INTEGER NOT NULL REFERENCES operator_accounts(id),
+    approved_by_operator_id INTEGER REFERENCES operator_accounts(id),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    approved_at TEXT,
+    UNIQUE(moderation_rule_id, version_number)
+);
+
+CREATE TABLE IF NOT EXISTS moderation_rule_exemptions (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    moderation_rule_id INTEGER NOT NULL REFERENCES moderation_rules(id) ON DELETE CASCADE,
+    exemption_type TEXT NOT NULL,
+    exemption_value TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_by_operator_id INTEGER NOT NULL REFERENCES operator_accounts(id),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(community_id, moderation_rule_id, exemption_type, exemption_value)
 );
 
 CREATE TABLE IF NOT EXISTS rule_matches (
@@ -192,6 +342,8 @@ CREATE TABLE IF NOT EXISTS rule_matches (
 
 CREATE TABLE IF NOT EXISTS moderation_actions (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    installation_id INTEGER REFERENCES community_installations(id) ON DELETE SET NULL,
     platform TEXT NOT NULL,
     message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL,
     target_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
@@ -222,6 +374,7 @@ CREATE TABLE IF NOT EXISTS reputation_events (
 CREATE TABLE IF NOT EXISTS user_notes (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     operator_id INTEGER NOT NULL,
     body TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -237,6 +390,41 @@ CREATE TABLE IF NOT EXISTS review_queue (
     resolution TEXT,
     resolution_note TEXT NOT NULL DEFAULT '',
     resolved_by_operator_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS member_reports (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    reporter_platform_account_id INTEGER REFERENCES platform_accounts(id),
+    subject_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
+    category TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    assigned_operator_id INTEGER REFERENCES operator_accounts(id),
+    resolution TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
+    resolved_by_operator_id INTEGER REFERENCES operator_accounts(id),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS member_appeals (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    moderation_action_id INTEGER NOT NULL REFERENCES moderation_actions(id),
+    appellant_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id),
+    reason TEXT NOT NULL,
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    severity TEXT NOT NULL DEFAULT 'medium',
+    status TEXT NOT NULL DEFAULT 'open',
+    assigned_operator_id INTEGER REFERENCES operator_accounts(id),
+    disposition TEXT,
+    resolution_note TEXT NOT NULL DEFAULT '',
+    resolved_by_operator_id INTEGER REFERENCES operator_accounts(id),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     resolved_at TEXT
 );
@@ -322,6 +510,20 @@ CREATE TABLE IF NOT EXISTS service_reliability_buckets (
     PRIMARY KEY(service_name, bucket_start)
 );
 
+CREATE TABLE IF NOT EXISTS tenant_slo_samples (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    metric_name TEXT NOT NULL,
+    value REAL NOT NULL,
+    target_value REAL NOT NULL,
+    status TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_tenant_slo_samples_lookup
+    ON tenant_slo_samples(community_id, metric_name, observed_at DESC);
+
 CREATE INDEX IF NOT EXISTS idx_platform_accounts_user_id
     ON platform_accounts(user_id);
 
@@ -361,7 +563,8 @@ CREATE INDEX IF NOT EXISTS idx_service_reliability_buckets_lookup
 CREATE TABLE IF NOT EXISTS observations (
     id INTEGER PRIMARY KEY,
     platform TEXT NOT NULL,
-    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    installation_id INTEGER REFERENCES community_installations(id) ON DELETE SET NULL,
     event_type TEXT NOT NULL,
     external_event_id TEXT,
     actor_platform_account_id INTEGER
@@ -394,6 +597,7 @@ CREATE INDEX IF NOT EXISTS idx_observations_context_time
 
 CREATE TABLE IF NOT EXISTS processing_jobs (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER REFERENCES communities(id) ON DELETE CASCADE,
     stage TEXT NOT NULL,
     job_type TEXT NOT NULL,
     observation_id INTEGER REFERENCES observations(id) ON DELETE CASCADE,
@@ -428,6 +632,28 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_available
     ON processing_jobs(stage, status, available_at, priority);
+
+CREATE TABLE IF NOT EXISTS tenant_quota_policies (
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    quota_type TEXT NOT NULL,
+    limit_count INTEGER NOT NULL,
+    window_seconds INTEGER NOT NULL DEFAULT 60,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(community_id, quota_type)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_quota_usage (
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    quota_type TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    usage_count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(community_id, quota_type, window_start)
+);
+
+CREATE TABLE IF NOT EXISTS tenant_job_schedule (
+    community_id INTEGER PRIMARY KEY REFERENCES communities(id) ON DELETE CASCADE,
+    last_claim_sequence INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_observation
     ON processing_jobs(observation_id);
@@ -523,9 +749,62 @@ CREATE TABLE IF NOT EXISTS derived_signal_evidence (
     PRIMARY KEY(signal_history_id, observation_id, message_id)
 );
 
+CREATE TABLE IF NOT EXISTS community_signal_calculation_runs (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    trigger_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+    analyzer_version INTEGER NOT NULL,
+    calculated_at TEXT NOT NULL,
+    UNIQUE(community_id, user_id, trigger_observation_id, analyzer_version)
+);
+
+CREATE TABLE IF NOT EXISTS community_derived_signal_windows (
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    signal_key TEXT NOT NULL,
+    window_name TEXT NOT NULL,
+    analyzer_version INTEGER NOT NULL,
+    value_real REAL NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    window_start TEXT,
+    window_end TEXT,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY(community_id, user_id, signal_key, window_name, analyzer_version)
+);
+
+CREATE TABLE IF NOT EXISTS community_derived_signal_history (
+    id INTEGER PRIMARY KEY,
+    calculation_run_id INTEGER NOT NULL
+        REFERENCES community_signal_calculation_runs(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    signal_key TEXT NOT NULL,
+    window_name TEXT NOT NULL,
+    analyzer_version INTEGER NOT NULL,
+    value_real REAL NOT NULL,
+    value_json TEXT NOT NULL DEFAULT '{}',
+    confidence REAL NOT NULL,
+    evidence_count INTEGER NOT NULL,
+    window_start TEXT,
+    window_end TEXT,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_signal_windows_lookup
+    ON community_derived_signal_windows(
+        community_id, signal_key, window_name, value_real DESC
+    );
+CREATE INDEX IF NOT EXISTS idx_community_signal_history_lookup
+    ON community_derived_signal_history(
+        community_id, user_id, signal_key, window_name, calculated_at DESC
+    );
+
 CREATE TABLE IF NOT EXISTS intelligence_alerts (
     id INTEGER PRIMARY KEY,
-    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
     signal_history_id INTEGER REFERENCES derived_signal_history(id) ON DELETE SET NULL,
     observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
@@ -547,7 +826,7 @@ CREATE TABLE IF NOT EXISTS intelligence_alerts (
 
 CREATE TABLE IF NOT EXISTS investigation_cases (
     id INTEGER PRIMARY KEY,
-    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     title TEXT NOT NULL,
     summary TEXT NOT NULL DEFAULT '',
     priority TEXT NOT NULL DEFAULT 'medium',
@@ -589,7 +868,7 @@ CREATE TABLE IF NOT EXISTS case_activity (
 
 CREATE TABLE IF NOT EXISTS entity_relationships (
     id INTEGER PRIMARY KEY,
-    community_id INTEGER NOT NULL DEFAULT 1 REFERENCES communities(id),
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     source_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     target_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     relationship_type TEXT NOT NULL,
@@ -629,6 +908,7 @@ CREATE TABLE IF NOT EXISTS stream_states (
 
 CREATE TABLE IF NOT EXISTS intelligence_reports (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     report_type TEXT NOT NULL,
     subject_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
     title TEXT NOT NULL,
@@ -724,6 +1004,17 @@ CREATE TABLE IF NOT EXISTS saved_queries (
     UNIQUE(operator_id, name)
 );
 
+CREATE TABLE IF NOT EXISTS moderation_saved_filters (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    filters_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(community_id, operator_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS content_analysis (
     observation_id INTEGER PRIMARY KEY REFERENCES observations(id) ON DELETE CASCADE,
     analyzer_version INTEGER NOT NULL,
@@ -770,6 +1061,7 @@ CREATE TABLE IF NOT EXISTS external_feed_sources (
 
 CREATE TABLE IF NOT EXISTS emerging_topics (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     topic_key TEXT NOT NULL UNIQUE,
     topic_kind TEXT NOT NULL,
     label TEXT NOT NULL,
@@ -787,6 +1079,7 @@ CREATE TABLE IF NOT EXISTS emerging_topics (
 
 CREATE TABLE IF NOT EXISTS topic_history (
     id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     topic_key TEXT NOT NULL,
     topic_kind TEXT NOT NULL,
     current_count INTEGER NOT NULL,
@@ -799,6 +1092,7 @@ CREATE TABLE IF NOT EXISTS topic_history (
 );
 
 CREATE TABLE IF NOT EXISTS topic_evidence (
+    community_id INTEGER NOT NULL REFERENCES communities(id),
     topic_key TEXT NOT NULL,
     observation_id INTEGER NOT NULL REFERENCES observations(id) ON DELETE CASCADE,
     context_key TEXT NOT NULL DEFAULT '',
@@ -808,6 +1102,8 @@ CREATE TABLE IF NOT EXISTS topic_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_topics_velocity
     ON emerging_topics(velocity DESC, unusualness DESC);
+CREATE INDEX IF NOT EXISTS idx_topics_community_velocity
+    ON emerging_topics(community_id, velocity DESC, unusualness DESC);
 CREATE INDEX IF NOT EXISTS idx_topic_history_time
     ON topic_history(topic_key, calculated_at DESC);
 
@@ -838,6 +1134,41 @@ CREATE TABLE IF NOT EXISTS graph_metric_history (
     calculated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS community_graph_metrics (
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    in_degree REAL NOT NULL,
+    out_degree REAL NOT NULL,
+    weighted_degree REAL NOT NULL,
+    betweenness REAL NOT NULL,
+    pagerank REAL NOT NULL,
+    cluster_id INTEGER,
+    is_bridge INTEGER NOT NULL DEFAULT 0,
+    influence_score REAL NOT NULL,
+    calculated_at TEXT NOT NULL,
+    PRIMARY KEY (community_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_graph_metric_history (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    in_degree REAL NOT NULL,
+    out_degree REAL NOT NULL,
+    weighted_degree REAL NOT NULL,
+    betweenness REAL NOT NULL,
+    pagerank REAL NOT NULL,
+    cluster_id INTEGER,
+    is_bridge INTEGER NOT NULL DEFAULT 0,
+    influence_score REAL NOT NULL,
+    calculated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_graph_influence
+    ON community_graph_metrics(community_id, influence_score DESC);
+CREATE INDEX IF NOT EXISTS idx_community_graph_history
+    ON community_graph_metric_history(community_id, user_id, calculated_at DESC);
+
 CREATE TABLE IF NOT EXISTS identity_link_suggestions (
     id INTEGER PRIMARY KEY,
     left_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
@@ -857,6 +1188,27 @@ CREATE TABLE IF NOT EXISTS identity_link_suggestions (
 
 CREATE INDEX IF NOT EXISTS idx_identity_suggestions_status
     ON identity_link_suggestions(status, confidence DESC);
+
+CREATE TABLE IF NOT EXISTS community_identity_link_suggestions (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    left_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    right_platform_account_id INTEGER NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+    confidence REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    model_version INTEGER NOT NULL,
+    reviewed_by_operator_id INTEGER,
+    reviewed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(community_id, left_platform_account_id, right_platform_account_id, model_version),
+    CHECK(left_platform_account_id < right_platform_account_id),
+    CHECK(status IN ('pending', 'approved', 'rejected', 'expired'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_identity_suggestions_status
+    ON community_identity_link_suggestions(community_id, status, confidence DESC);
 
 CREATE TABLE IF NOT EXISTS cohort_baselines (
     id INTEGER PRIMARY KEY,
@@ -889,6 +1241,40 @@ CREATE TABLE IF NOT EXISTS cohort_anomalies (
 
 CREATE INDEX IF NOT EXISTS idx_cohort_anomalies_score
     ON cohort_anomalies(ABS(z_score) DESC, confidence DESC);
+
+CREATE TABLE IF NOT EXISTS community_cohort_baselines (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    cohort_type TEXT NOT NULL,
+    cohort_key TEXT NOT NULL,
+    signal_key TEXT NOT NULL,
+    sample_size INTEGER NOT NULL,
+    mean_value REAL NOT NULL,
+    stddev_value REAL NOT NULL,
+    median_value REAL NOT NULL,
+    p90_value REAL NOT NULL,
+    calculated_at TEXT NOT NULL,
+    UNIQUE(community_id, cohort_type, cohort_key, signal_key)
+);
+
+CREATE TABLE IF NOT EXISTS community_cohort_anomalies (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id),
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    cohort_type TEXT NOT NULL,
+    cohort_key TEXT NOT NULL,
+    signal_key TEXT NOT NULL,
+    observed_value REAL NOT NULL,
+    baseline_mean REAL NOT NULL,
+    z_score REAL NOT NULL,
+    direction TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    calculated_at TEXT NOT NULL,
+    UNIQUE(community_id, user_id, cohort_type, cohort_key, signal_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_cohort_anomalies_score
+    ON community_cohort_anomalies(community_id, ABS(z_score) DESC, confidence DESC);
 
 CREATE TABLE IF NOT EXISTS evaluation_labels (
     id INTEGER PRIMARY KEY,
@@ -959,6 +1345,16 @@ CREATE TABLE IF NOT EXISTS community_policy_settings (
     community_id INTEGER PRIMARY KEY REFERENCES communities(id) ON DELETE CASCADE,
     moderation_shadow_mode INTEGER NOT NULL DEFAULT 1,
     automatic_enforcement_enabled INTEGER NOT NULL DEFAULT 0,
+    allow_bot_messages INTEGER NOT NULL DEFAULT 0,
+    anti_abuse_enabled INTEGER NOT NULL DEFAULT 1,
+    anti_abuse_enforcement_mode TEXT NOT NULL DEFAULT 'shadow',
+    message_burst_limit INTEGER NOT NULL DEFAULT 12 CHECK(message_burst_limit > 1),
+    message_burst_window_seconds INTEGER NOT NULL DEFAULT 10 CHECK(message_burst_window_seconds > 0),
+    mention_limit INTEGER NOT NULL DEFAULT 8 CHECK(mention_limit > 0),
+    join_raid_limit INTEGER NOT NULL DEFAULT 25 CHECK(join_raid_limit > 1),
+    join_raid_window_seconds INTEGER NOT NULL DEFAULT 60 CHECK(join_raid_window_seconds > 0),
+    message_retention_days INTEGER NOT NULL DEFAULT 90 CHECK(message_retention_days > 0),
+    analytics_retention_days INTEGER NOT NULL DEFAULT 90 CHECK(analytics_retention_days > 0),
     model_thresholds_json TEXT NOT NULL DEFAULT '{}',
     sharing_policy TEXT NOT NULL DEFAULT 'isolated',
     updated_by_operator_id INTEGER,
@@ -990,6 +1386,7 @@ CREATE TABLE IF NOT EXISTS legal_holds (
 CREATE TABLE IF NOT EXISTS raw_event_archive (
     id INTEGER PRIMARY KEY,
     community_id INTEGER NOT NULL REFERENCES communities(id),
+    installation_id INTEGER REFERENCES community_installations(id) ON DELETE SET NULL,
     observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
     platform TEXT NOT NULL,
     event_type TEXT NOT NULL,
@@ -1084,10 +1481,13 @@ CREATE TABLE IF NOT EXISTS coordination_campaign_members (
 CREATE TABLE IF NOT EXISTS data_subject_requests (
     id INTEGER PRIMARY KEY,
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
     request_type TEXT NOT NULL,
     platform TEXT,
     platform_user_id TEXT,
     status TEXT NOT NULL DEFAULT 'open',
+    requested_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    completed_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
     requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT,
     result_json TEXT NOT NULL DEFAULT '{}'
@@ -1111,6 +1511,7 @@ CREATE TABLE IF NOT EXISTS twitch_eventsub_subscriptions (
 CREATE TABLE IF NOT EXISTS api_clients (
     id INTEGER PRIMARY KEY,
     organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     key_hash TEXT NOT NULL UNIQUE,
     scopes_json TEXT NOT NULL DEFAULT '[]',
@@ -1194,6 +1595,21 @@ CREATE TABLE IF NOT EXISTS moderation_shifts (
     handoff_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS moderation_shift_schedules (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+    starts_at TEXT NOT NULL,
+    ends_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'scheduled' CHECK(status IN ('scheduled','active','completed','cancelled')),
+    created_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_shift_schedules_due
+    ON moderation_shift_schedules(community_id, status, starts_at, ends_at);
+
 CREATE TABLE IF NOT EXISTS raid_playbooks (
     playbook_key TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -1258,6 +1674,100 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
     delivered_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS community_announcements (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    target_installation_id INTEGER REFERENCES community_installations(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    target_external_id TEXT NOT NULL,
+    body TEXT NOT NULL,
+    dedupe_key TEXT,
+    source_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'draft',
+    scheduled_at TEXT,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    created_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    approved_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    approved_at TEXT,
+    delivered_at TEXT,
+    last_error TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS community_announcement_deliveries (
+    id INTEGER PRIMARY KEY,
+    announcement_id INTEGER NOT NULL REFERENCES community_announcements(id) ON DELETE CASCADE,
+    installation_id INTEGER NOT NULL REFERENCES community_installations(id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    provider_message_id TEXT,
+    error_message TEXT,
+    attempted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT,
+    UNIQUE(announcement_id, attempt_number)
+);
+
+CREATE TABLE IF NOT EXISTS community_onboarding_settings (
+    community_id INTEGER PRIMARY KEY REFERENCES communities(id) ON DELETE CASCADE,
+    discord_installation_id INTEGER REFERENCES community_installations(id) ON DELETE CASCADE,
+    welcome_channel_id TEXT,
+    welcome_template TEXT NOT NULL DEFAULT 'Welcome {mention} to the community!',
+    welcome_enabled INTEGER NOT NULL DEFAULT 0,
+    newcomer_role_id TEXT,
+    newcomer_role_enabled INTEGER NOT NULL DEFAULT 0,
+    checkpoint_due_hours INTEGER NOT NULL DEFAULT 24,
+    checkpoint_reminder_enabled INTEGER NOT NULL DEFAULT 0,
+    checkpoint_reminder_template TEXT NOT NULL DEFAULT 'Reminder {mention}: please complete community verification.',
+    verification_resource_enabled INTEGER NOT NULL DEFAULT 0,
+    verification_resource_url TEXT,
+    verification_resource_template TEXT NOT NULL DEFAULT 'You are verified, {mention}. Community resources: {resource_url}',
+    verification_evidence_required INTEGER NOT NULL DEFAULT 0,
+    self_service_verification_enabled INTEGER NOT NULL DEFAULT 0,
+    updated_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS community_onboarding_members (
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    discord_installation_id INTEGER NOT NULL REFERENCES community_installations(id) ON DELETE CASCADE,
+    platform_user_id TEXT NOT NULL,
+    username TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'newcomer',
+    newcomer_role_id TEXT,
+    role_assignment_status TEXT NOT NULL DEFAULT 'disabled',
+    role_assignment_attempts INTEGER NOT NULL DEFAULT 0,
+    role_assignment_error TEXT,
+    joined_at TEXT NOT NULL,
+    checkpoint_due_at TEXT,
+    reminder_sent_at TEXT,
+    verification_evidence TEXT,
+    verified_at TEXT,
+    verified_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(community_id, platform_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_onboarding_resources (
+    id INTEGER PRIMARY KEY,
+    community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    resource_url TEXT NOT NULL,
+    message_template TEXT NOT NULL DEFAULT '{mention}: {title} - {resource_url}',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_by_operator_id INTEGER REFERENCES operator_accounts(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_onboarding_resources_order
+    ON community_onboarding_resources(community_id, enabled, sort_order, id);
+
+CREATE INDEX IF NOT EXISTS idx_onboarding_role_queue
+    ON community_onboarding_members(role_assignment_status, community_id, joined_at);
+
 CREATE TABLE IF NOT EXISTS post_stream_briefings (
     id INTEGER PRIMARY KEY,
     stream_session_id INTEGER NOT NULL UNIQUE REFERENCES stream_sessions(id) ON DELETE CASCADE,
@@ -1304,6 +1814,10 @@ CREATE INDEX IF NOT EXISTS idx_incident_activity_time
     ON incident_activity(incident_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_notification_delivery_queue
     ON notification_deliveries(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_community_announcement_queue
+    ON community_announcements(status, scheduled_at, community_id);
+CREATE INDEX IF NOT EXISTS idx_community_announcement_deliveries
+    ON community_announcement_deliveries(announcement_id, attempted_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audience_edges_community
     ON audience_edges(community_id, edge_type, weight DESC);
 
@@ -1381,7 +1895,9 @@ def _seed_default_tenant(connection: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO communities(id,workspace_id,name,slug) VALUES (1,1,'Default Community','default')"
     )
     connection.execute(
-        "INSERT OR IGNORE INTO community_policy_settings(community_id) VALUES (1)"
+        """INSERT OR IGNORE INTO community_policy_settings(
+               community_id,moderation_shadow_mode
+           ) VALUES (1,0)"""
     )
 
 
@@ -1442,6 +1958,428 @@ def _seed_raid_playbooks(connection: sqlite3.Connection) -> None:
     )
 
 def _migrate_schema(connection: sqlite3.Connection) -> None:
+    migrations = (
+        (1, "processing job leases", None),
+        (2, "canonical identity attribution", None),
+        (3, "intelligence platform P0-P3", None),
+        (4, "community tenancy and professional operations", None),
+        (5, "real-time stream operations and incident command", None),
+        (6, "Discord installation authorization intents", None),
+        (7, "legacy schema convergence", _migrate_legacy_schema),
+        (8, "tenant announcement delivery", None),
+        (9, "community onboarding controls", None),
+        (10, "processing lease recovery", None),
+        (11, "identity unlink attribution", None),
+        (12, "moderation provider confirmation", None),
+        (13, "community analytics isolation", None),
+        (14, "operator access lifecycle", None),
+        (15, "strict tenant ownership", _migrate_strict_tenant_ownership),
+        (16, "provider installation attribution", _migrate_installation_references),
+        (17, "encrypted Twitch installation onboarding", _migrate_twitch_credentials),
+        (18, "API client community ownership", _migrate_api_client_ownership),
+        (19, "community runtime policy", _migrate_community_retention_policy),
+        (20, "community anti-abuse policy", _migrate_community_anti_abuse_policy),
+        (21, "legacy Twitch onboarding convergence", _migrate_legacy_twitch_onboarding),
+        (22, "data subject request community ownership", _migrate_data_subject_request_ownership),
+        (23, "community profile settings", _migrate_community_profile_settings),
+        (24, "saved moderation filters", _migrate_moderation_saved_filters),
+        (25, "moderation rule lifecycle", _migrate_moderation_rule_lifecycle),
+        (26, "tenant slo samples", _migrate_tenant_slo_samples),
+        (27, "tenant quotas and fair jobs", _migrate_tenant_quotas_and_fair_jobs),
+    )
+    for version, name, migration in migrations:
+        if connection.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=?", (version,)
+        ).fetchone() is not None:
+            continue
+        if migration is not None:
+            migration(connection)
+        connection.execute(
+            "INSERT INTO schema_migrations(version,name) VALUES (?,?)",
+            (version, name),
+        )
+
+
+def _migrate_tenant_quotas_and_fair_jobs(connection: sqlite3.Connection) -> None:
+    job_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(processing_jobs)").fetchall()
+    }
+    if "community_id" not in job_columns:
+        connection.execute(
+            "ALTER TABLE processing_jobs ADD COLUMN community_id INTEGER REFERENCES communities(id) ON DELETE CASCADE"
+        )
+    connection.execute(
+        """UPDATE processing_jobs SET community_id=(
+               SELECT community_id FROM observations WHERE observations.id=processing_jobs.observation_id
+           ) WHERE community_id IS NULL AND observation_id IS NOT NULL"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS idx_processing_jobs_tenant_available
+           ON processing_jobs(community_id,stage,status,available_at,priority)"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS tenant_quota_policies (
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               quota_type TEXT NOT NULL,
+               limit_count INTEGER NOT NULL,
+               window_seconds INTEGER NOT NULL DEFAULT 60,
+               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               PRIMARY KEY(community_id,quota_type)
+           )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS tenant_quota_usage (
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               quota_type TEXT NOT NULL,
+               window_start TEXT NOT NULL,
+               usage_count INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(community_id,quota_type,window_start)
+           )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS tenant_job_schedule (
+               community_id INTEGER PRIMARY KEY REFERENCES communities(id) ON DELETE CASCADE,
+               last_claim_sequence INTEGER NOT NULL DEFAULT 0
+           )"""
+    )
+
+
+def _migrate_tenant_slo_samples(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS tenant_slo_samples (
+               id INTEGER PRIMARY KEY,
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               metric_name TEXT NOT NULL,
+               value REAL NOT NULL,
+               target_value REAL NOT NULL,
+               status TEXT NOT NULL,
+               details_json TEXT NOT NULL DEFAULT '{}',
+               observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+           )"""
+    )
+    connection.execute(
+        """CREATE INDEX IF NOT EXISTS idx_tenant_slo_samples_lookup
+           ON tenant_slo_samples(community_id,metric_name,observed_at DESC)"""
+    )
+
+
+def _migrate_moderation_rule_lifecycle(connection: sqlite3.Connection) -> None:
+    rule_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(moderation_rules)").fetchall()
+    }
+    if "platform_scope_json" not in rule_columns:
+        connection.execute(
+            """ALTER TABLE moderation_rules ADD COLUMN platform_scope_json TEXT
+               NOT NULL DEFAULT '["discord","twitch"]'"""
+        )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS moderation_rule_versions (
+               id INTEGER PRIMARY KEY,
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               moderation_rule_id INTEGER NOT NULL REFERENCES moderation_rules(id) ON DELETE CASCADE,
+               version_number INTEGER NOT NULL,
+               lifecycle_state TEXT NOT NULL,
+               config_json TEXT NOT NULL,
+               impact_json TEXT NOT NULL DEFAULT '{}',
+               created_by_operator_id INTEGER NOT NULL REFERENCES operator_accounts(id),
+               approved_by_operator_id INTEGER REFERENCES operator_accounts(id),
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               approved_at TEXT,
+               UNIQUE(moderation_rule_id, version_number)
+           )"""
+    )
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS moderation_rule_exemptions (
+               id INTEGER PRIMARY KEY,
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               moderation_rule_id INTEGER NOT NULL REFERENCES moderation_rules(id) ON DELETE CASCADE,
+               exemption_type TEXT NOT NULL,
+               exemption_value TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               created_by_operator_id INTEGER NOT NULL REFERENCES operator_accounts(id),
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(community_id,moderation_rule_id,exemption_type,exemption_value)
+           )"""
+    )
+
+
+def _migrate_moderation_saved_filters(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS moderation_saved_filters (
+               id INTEGER PRIMARY KEY,
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+               name TEXT NOT NULL,
+               filters_json TEXT NOT NULL DEFAULT '{}',
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               UNIQUE(community_id, operator_id, name)
+           )"""
+    )
+
+
+def _migrate_community_profile_settings(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(communities)").fetchall()
+    }
+    definitions = {
+        "locale": "TEXT NOT NULL DEFAULT 'en-US'",
+        "description": "TEXT NOT NULL DEFAULT ''",
+        "guidelines": "TEXT NOT NULL DEFAULT ''",
+        "notifications_enabled": "INTEGER NOT NULL DEFAULT 1",
+    }
+    for column_name, definition in definitions.items():
+        if column_name not in columns:
+            connection.execute(f"ALTER TABLE communities ADD COLUMN {column_name} {definition}")
+
+
+def _migrate_data_subject_request_ownership(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(data_subject_requests)").fetchall()
+    }
+    if "community_id" not in columns:
+        connection.execute(
+            """ALTER TABLE data_subject_requests ADD COLUMN community_id INTEGER
+               REFERENCES communities(id) ON DELETE CASCADE"""
+        )
+        requests = connection.execute(
+            "SELECT id,organization_id FROM data_subject_requests WHERE community_id IS NULL"
+        ).fetchall()
+        for request in requests:
+            communities = connection.execute(
+                """SELECT c.id FROM communities c
+                   JOIN workspaces w ON w.id=c.workspace_id
+                   WHERE w.organization_id=? ORDER BY c.id LIMIT 2""",
+                (int(request[1]),),
+            ).fetchall()
+            if len(communities) != 1:
+                raise RuntimeError(
+                    f"data subject request {int(request[0])} requires explicit community ownership"
+                )
+            connection.execute(
+                "UPDATE data_subject_requests SET community_id=? WHERE id=?",
+                (int(communities[0][0]), int(request[0])),
+            )
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='data_subject_requests'"
+        ).fetchone()
+        original_sql = str(row[0])
+        strict_sql = original_sql.replace(
+            "community_id INTEGER\n               REFERENCES communities(id) ON DELETE CASCADE",
+            "community_id INTEGER NOT NULL\n               REFERENCES communities(id) ON DELETE CASCADE",
+        )
+        if strict_sql != original_sql:
+            connection.execute("PRAGMA writable_schema=ON")
+            try:
+                connection.execute(
+                    """UPDATE sqlite_schema SET sql=?
+                       WHERE type='table' AND name='data_subject_requests'""",
+                    (strict_sql,),
+                )
+            finally:
+                connection.execute("PRAGMA writable_schema=OFF")
+            schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+            connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(data_subject_requests)").fetchall()
+    }
+    for column_name in ("requested_by_operator_id", "completed_by_operator_id"):
+        if column_name not in columns:
+            connection.execute(
+                f"""ALTER TABLE data_subject_requests ADD COLUMN {column_name} INTEGER
+                    REFERENCES operator_accounts(id) ON DELETE SET NULL"""
+            )
+
+
+def _migrate_legacy_twitch_onboarding(connection: sqlite3.Connection) -> None:
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='twitch_onboarding_states'"
+    ).fetchone() is None:
+        return
+    connection.execute(
+        """INSERT OR IGNORE INTO twitch_install_intents(
+               nonce,operator_id,community_id,broadcaster_login,scopes_json,
+               expires_at,consumed_at,created_at
+           )
+           SELECT nonce,operator_id,community_id,broadcaster_login,
+                  requested_scopes_json,expires_at,
+                  CASE WHEN status='pending' THEN NULL
+                       ELSE COALESCE(completed_at,updated_at) END,
+                  created_at
+            FROM twitch_onboarding_states"""
+    )
+    connection.execute("DROP TABLE twitch_onboarding_states")
+
+
+def _migrate_community_anti_abuse_policy(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(community_policy_settings)").fetchall()
+    }
+    definitions = {
+        "anti_abuse_enabled": "INTEGER NOT NULL DEFAULT 1",
+        "anti_abuse_enforcement_mode": "TEXT NOT NULL DEFAULT 'shadow'",
+        "message_burst_limit": "INTEGER NOT NULL DEFAULT 12 CHECK(message_burst_limit > 1)",
+        "message_burst_window_seconds": "INTEGER NOT NULL DEFAULT 10 CHECK(message_burst_window_seconds > 0)",
+        "mention_limit": "INTEGER NOT NULL DEFAULT 8 CHECK(mention_limit > 0)",
+        "join_raid_limit": "INTEGER NOT NULL DEFAULT 25 CHECK(join_raid_limit > 1)",
+        "join_raid_window_seconds": "INTEGER NOT NULL DEFAULT 60 CHECK(join_raid_window_seconds > 0)",
+    }
+    for column_name, definition in definitions.items():
+        if column_name not in columns:
+            connection.execute(
+                f"ALTER TABLE community_policy_settings ADD COLUMN {column_name} {definition}"
+            )
+
+
+def _migrate_community_retention_policy(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(community_policy_settings)").fetchall()
+    }
+    definitions = {
+        "message_retention_days": "INTEGER NOT NULL DEFAULT 90 CHECK(message_retention_days > 0)",
+        "analytics_retention_days": "INTEGER NOT NULL DEFAULT 90 CHECK(analytics_retention_days > 0)",
+        "allow_bot_messages": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column_name, definition in definitions.items():
+        if column_name not in columns:
+            connection.execute(
+                f"ALTER TABLE community_policy_settings ADD COLUMN {column_name} {definition}"
+            )
+
+
+def _migrate_api_client_ownership(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(api_clients)").fetchall()
+    }
+    if "community_id" in columns:
+        return
+    connection.execute(
+        "ALTER TABLE api_clients ADD COLUMN community_id INTEGER REFERENCES communities(id) ON DELETE CASCADE"
+    )
+    clients = connection.execute(
+        "SELECT id,organization_id FROM api_clients WHERE community_id IS NULL"
+    ).fetchall()
+    for client in clients:
+        communities = connection.execute(
+            """SELECT c.id FROM communities c
+               JOIN workspaces w ON w.id=c.workspace_id
+               WHERE w.organization_id=? ORDER BY c.id LIMIT 2""",
+            (int(client[1]),),
+        ).fetchall()
+        if len(communities) != 1:
+            raise RuntimeError(
+                f"API client {int(client[0])} requires explicit community ownership"
+            )
+        connection.execute(
+            "UPDATE api_clients SET community_id=? WHERE id=?",
+            (int(communities[0][0]), int(client[0])),
+        )
+    row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='api_clients'"
+    ).fetchone()
+    original_sql = str(row[0])
+    strict_sql = original_sql.replace(
+        "community_id INTEGER REFERENCES communities(id) ON DELETE CASCADE",
+        "community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE",
+    )
+    if strict_sql != original_sql:
+        connection.execute("PRAGMA writable_schema=ON")
+        try:
+            connection.execute(
+                "UPDATE sqlite_schema SET sql=? WHERE type='table' AND name='api_clients'",
+                (strict_sql,),
+            )
+        finally:
+            connection.execute("PRAGMA writable_schema=OFF")
+        schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+
+
+def _migrate_legacy_schema(connection: sqlite3.Connection) -> None:
+    operator_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(operator_accounts)").fetchall()
+    }
+    if "session_version" not in operator_columns:
+        connection.execute(
+            "ALTER TABLE operator_accounts ADD COLUMN session_version INTEGER NOT NULL DEFAULT 1"
+        )
+    if "status" not in operator_columns:
+        connection.execute(
+            "ALTER TABLE operator_accounts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+        )
+    installation_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(community_installations)").fetchall()
+    }
+    if "metadata_json" not in installation_columns:
+        connection.execute(
+            "ALTER TABLE community_installations ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    installation_additions = (
+        ("capabilities_json", "TEXT NOT NULL DEFAULT '[]'"),
+        ("health_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("last_health_check_at", "TEXT"),
+        ("reconnect_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_error", "TEXT"),
+    )
+    for column_name, definition in installation_additions:
+        if column_name not in installation_columns:
+            connection.execute(
+                f"ALTER TABLE community_installations ADD COLUMN {column_name} {definition}"
+            )
+    announcement_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(community_announcements)").fetchall()
+    }
+    announcement_additions = (
+        ("target_installation_id", "INTEGER REFERENCES community_installations(id) ON DELETE CASCADE"),
+        ("dedupe_key", "TEXT"),
+        ("source_json", "TEXT NOT NULL DEFAULT '{}'"),
+    )
+    for column_name, definition in announcement_additions:
+        if column_name not in announcement_columns:
+            connection.execute(
+                f"ALTER TABLE community_announcements ADD COLUMN {column_name} {definition}"
+            )
+    connection.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_community_announcement_dedupe
+           ON community_announcements(community_id, dedupe_key) WHERE dedupe_key IS NOT NULL"""
+    )
+    onboarding_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(community_onboarding_settings)").fetchall()
+    }
+    onboarding_additions = (
+        ("newcomer_role_id", "TEXT"),
+        ("newcomer_role_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("checkpoint_due_hours", "INTEGER NOT NULL DEFAULT 24"),
+        ("checkpoint_reminder_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("checkpoint_reminder_template", "TEXT NOT NULL DEFAULT 'Reminder {mention}: please complete community verification.'"),
+        ("verification_resource_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        ("verification_resource_url", "TEXT"),
+        ("verification_resource_template", "TEXT NOT NULL DEFAULT 'You are verified, {mention}. Community resources: {resource_url}'"),
+        ("verification_evidence_required", "INTEGER NOT NULL DEFAULT 0"),
+        ("self_service_verification_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    )
+    for column_name, definition in onboarding_additions:
+        if column_name not in onboarding_columns:
+            connection.execute(
+                f"ALTER TABLE community_onboarding_settings ADD COLUMN {column_name} {definition}"
+            )
+    onboarding_member_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(community_onboarding_members)").fetchall()
+    }
+    onboarding_member_additions = (
+        ("checkpoint_due_at", "TEXT"),
+        ("reminder_sent_at", "TEXT"),
+        ("verification_evidence", "TEXT"),
+    )
+    for column_name, definition in onboarding_member_additions:
+        if column_name not in onboarding_member_columns:
+            connection.execute(
+                f"ALTER TABLE community_onboarding_members ADD COLUMN {column_name} {definition}"
+            )
     processing_columns = {
         str(row[1])
         for row in connection.execute("PRAGMA table_info(processing_jobs)").fetchall()
@@ -1513,6 +2451,12 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         ("moderation_actions", "escalated_at", "TEXT"),
         ("moderation_actions", "provider_confirmed_at", "TEXT"),
         ("moderation_actions", "provider_event_id", "TEXT"),
+        ("moderation_actions", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("user_notes", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("emerging_topics", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("topic_history", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("topic_evidence", "community_id", "INTEGER NOT NULL DEFAULT 1"),
+        ("intelligence_reports", "community_id", "INTEGER NOT NULL DEFAULT 1"),
     )
     for table_name, column_name, definition in migration_columns:
         columns = {
@@ -1534,17 +2478,9 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         "ON entity_relationships(community_id, source_user_id, target_user_id, "
         "relationship_type, context_key)"
     )
-
-    migrations = (
-        (1, "processing job leases"),
-        (2, "canonical identity attribution"),
-        (3, "intelligence platform P0-P3"),
-        (4, "community tenancy and professional operations"),
-        (5, "real-time stream operations and incident command"),
-    )
-    connection.executemany(
-        "INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)",
-        migrations,
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_topics_community_velocity "
+        "ON emerging_topics(community_id, velocity DESC, unusualness DESC)"
     )
 
     connection.execute(
@@ -1612,9 +2548,20 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
         WHERE action.user_id IS NULL
         """
     )
+    connection.execute(
+        """UPDATE moderation_actions AS action
+           SET community_id=(
+               SELECT message.community_id FROM messages AS message
+               WHERE message.id=action.message_id
+           )
+           WHERE action.message_id IS NOT NULL"""
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, sent_at)")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_moderation_actions_user_id ON moderation_actions(user_id, created_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_moderation_actions_community_time ON moderation_actions(community_id, created_at DESC)"
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_observations_community_time ON observations(community_id, occurred_at DESC)"
@@ -1627,6 +2574,143 @@ def _migrate_schema(connection: sqlite3.Connection) -> None:
     )
     _cleanup_legacy_merged_users(connection)
 
+
+def _migrate_strict_tenant_ownership(connection: sqlite3.Connection) -> None:
+    tenant_tables = (
+        "messages", "moderation_rules", "observations", "intelligence_alerts",
+        "investigation_cases", "entity_relationships", "moderation_actions",
+        "user_notes", "emerging_topics", "topic_history", "topic_evidence",
+        "intelligence_reports",
+    )
+    unresolved: list[str] = []
+    for table_name in tenant_tables:
+        connection.execute(
+            f"UPDATE {table_name} SET community_id=1 WHERE community_id IS NULL"
+        )
+        orphan_count = int(connection.execute(
+            f"""SELECT COUNT(*) FROM {table_name} AS owned
+                LEFT JOIN communities ON communities.id=owned.community_id
+                WHERE communities.id IS NULL"""
+        ).fetchone()[0])
+        if orphan_count:
+            unresolved.append(f"{table_name}={orphan_count}")
+    if unresolved:
+        raise RuntimeError("unresolved tenant ownership: " + ", ".join(unresolved))
+
+    schema_updates: list[tuple[str, str]] = []
+    for table_name in tenant_tables:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", (table_name,)
+        ).fetchone()
+        if row is None or row[0] is None:
+            continue
+        original_sql = str(row[0])
+        strict_sql = original_sql.replace(
+            "community_id INTEGER NOT NULL DEFAULT 1",
+            "community_id INTEGER NOT NULL",
+        ).replace(
+            "community_id INTEGER DEFAULT 1",
+            "community_id INTEGER NOT NULL",
+        )
+        if strict_sql != original_sql:
+            schema_updates.append((strict_sql, table_name))
+
+    if schema_updates:
+        connection.execute("PRAGMA writable_schema=ON")
+        try:
+            connection.executemany(
+                "UPDATE sqlite_schema SET sql=? WHERE type='table' AND name=?",
+                schema_updates,
+            )
+        finally:
+            connection.execute("PRAGMA writable_schema=OFF")
+        schema_version = int(connection.execute("PRAGMA schema_version").fetchone()[0])
+        connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+
+
+def _migrate_installation_references(connection: sqlite3.Connection) -> None:
+    for table_name in (
+        "observations", "messages", "moderation_actions", "raw_event_archive",
+    ):
+        columns = {
+            str(row[1]) for row in connection.execute(
+                f"PRAGMA table_info({table_name})"
+            ).fetchall()
+        }
+        if "installation_id" not in columns:
+            connection.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN installation_id INTEGER "
+                "REFERENCES community_installations(id) ON DELETE SET NULL"
+            )
+
+    connection.execute(
+        """UPDATE observations AS observation
+           SET installation_id=(
+               SELECT installation.id FROM community_installations AS installation
+               WHERE installation.community_id=observation.community_id
+                 AND installation.platform=observation.platform
+                 AND installation.external_community_id IN (
+                     observation.context_id, observation.container_id
+                 )
+               ORDER BY installation.id LIMIT 1
+           )
+           WHERE installation_id IS NULL"""
+    )
+    for table_name in ("messages", "moderation_actions", "raw_event_archive"):
+        source_join = {
+            "messages": "observation.id=owned.observation_id",
+            "moderation_actions": (
+                "observation.id=(SELECT message.observation_id FROM messages AS message "
+                "WHERE message.id=owned.message_id)"
+            ),
+            "raw_event_archive": "observation.id=owned.observation_id",
+        }[table_name]
+        connection.execute(
+            f"""UPDATE {table_name} AS owned
+                SET installation_id=(
+                    SELECT observation.installation_id FROM observations AS observation
+                    WHERE {source_join}
+                )
+                WHERE installation_id IS NULL"""
+        )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_installation_time "
+        "ON observations(community_id, installation_id, occurred_at DESC)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_messages_installation_time "
+        "ON messages(community_id, installation_id, sent_at DESC)"
+    )
+
+
+def _migrate_twitch_credentials(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """CREATE TABLE IF NOT EXISTS installation_credentials (
+               id INTEGER PRIMARY KEY,
+               installation_id INTEGER NOT NULL UNIQUE
+                   REFERENCES community_installations(id) ON DELETE CASCADE,
+               access_token_ciphertext BLOB NOT NULL,
+               refresh_token_ciphertext BLOB,
+               scopes_json TEXT NOT NULL DEFAULT '[]',
+               key_version INTEGER NOT NULL DEFAULT 1,
+               rotation_count INTEGER NOT NULL DEFAULT 1,
+               rotated_at TEXT,
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+           );
+           CREATE TABLE IF NOT EXISTS twitch_install_intents (
+               nonce TEXT PRIMARY KEY,
+               operator_id INTEGER NOT NULL REFERENCES operator_accounts(id) ON DELETE CASCADE,
+               community_id INTEGER NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+               broadcaster_login TEXT NOT NULL,
+               scopes_json TEXT NOT NULL,
+               expires_at TEXT NOT NULL,
+               consumed_at TEXT,
+               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+           );
+           CREATE INDEX IF NOT EXISTS idx_twitch_install_intents_pending
+               ON twitch_install_intents(expires_at) WHERE consumed_at IS NULL;"""
+    )
 
 def _cleanup_legacy_merged_users(connection: sqlite3.Connection) -> None:
     from .intelligence.userprofiles import _merge_canonical_users
@@ -2089,6 +3173,9 @@ def upsert_operator_account(
     role: str,
 ) -> int:
     with connection:
+        existing = connection.execute(
+            "SELECT id FROM operator_accounts WHERE discord_user_id=?", (discord_user_id,)
+        ).fetchone()
         connection.execute(
             """
             INSERT INTO operator_accounts (
@@ -2112,7 +3199,7 @@ def upsert_operator_account(
             """,
             (discord_user_id,),
         ).fetchone()
-        if row is not None:
+        if row is not None and existing is None:
             scoped_role = "owner" if role.strip().casefold() == "admin" else role.strip().casefold()
             connection.execute(
                 """INSERT INTO operator_community_roles(operator_id, community_id, role)
@@ -2221,6 +3308,12 @@ def persist_normalized_message(
     observation_id: int | None = None,
     moderation_shadow_mode: bool = False,
 ) -> IngestionResult:
+    from .contexts import TenantContext
+
+    tenant = TenantContext.require(
+        message.metadata.get("community_id"),
+        installation_id=message.metadata.get("installation_id"),
+    )
     platform_account_id = ensure_platform_account(
         connection,
         platform=message.platform,
@@ -2236,6 +3329,7 @@ def persist_normalized_message(
                 INSERT INTO messages (
                     platform,
                     community_id,
+                    installation_id,
                     platform_message_id,
                     platform_account_id,
                     channel_id,
@@ -2243,11 +3337,12 @@ def persist_normalized_message(
                     content_normalized,
                     sent_at,
                     observation_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message.platform,
-                    int(message.metadata.get("community_id") or 1),
+                    tenant.community_id,
+                    tenant.installation_id,
                     message.platform_message_id,
                     platform_account_id,
                     message.channel_id,
@@ -2306,8 +3401,11 @@ def persist_normalized_message(
                     source_id=message_id,
                 )
 
-            community_id = int(message.metadata.get("community_id") or 1)
-            moderation_rules = load_enabled_moderation_rules(connection, community_id=community_id)
+            community_id = tenant.community_id
+            moderation_rules = load_enabled_moderation_rules(
+                connection, community_id=community_id, platform=message.platform,
+                channel_id=message.channel_id, platform_account_id=platform_account_id,
+            )
             builtin_egregious_rule = next(
                 (r for r in moderation_rules if r.name == BUILTIN_EGREGIOUS_RULE_NAME),
                 None,
@@ -2316,6 +3414,7 @@ def persist_normalized_message(
                 findings = evaluate_message_moderation(message, moderation_rules)
                 record_moderation_findings(
                     connection,
+                    tenant=tenant,
                     message_id=message_id,
                     platform=message.platform,
                     findings=findings,
@@ -2342,6 +3441,7 @@ def persist_normalized_message(
                 if egregious_findings:
                     record_moderation_findings(
                         connection,
+                        tenant=tenant,
                         message_id=message_id,
                         platform=message.platform,
                         findings=egregious_findings,
@@ -2361,6 +3461,16 @@ def persist_normalized_message(
                             source_type="moderation",
                             source_id=message_id,
                         )
+            from .intelligence.abuse import apply_message_abuse_policy
+            apply_message_abuse_policy(
+                connection,
+                community_id=community_id,
+                installation_id=tenant.installation_id,
+                message_id=message_id,
+                platform_account_id=platform_account_id,
+                user_id=canonical_user_id,
+                message=message,
+            )
         return IngestionResult(
             status="persisted",
             platform=message.platform,
@@ -2657,6 +3767,7 @@ def update_twitch_channel_status(
 def upsert_moderation_rule(
     connection: sqlite3.Connection,
     *,
+    community_id: int,
     name: str,
     rule_type: str,
     pattern: str,
@@ -2665,7 +3776,7 @@ def upsert_moderation_rule(
     enabled: bool = True,
     enforcement_mode: str = "enforce",
     action_duration_seconds: int = 600,
-    community_id: int = 1,
+    platform_scope: tuple[str, ...] = ("discord", "twitch"),
 ) -> int:
     cleaned_name = name.strip()
     cleaned_type = rule_type.strip().casefold()
@@ -2683,6 +3794,12 @@ def upsert_moderation_rule(
     if normalized_mode not in {"enforce", "review", "shadow", "disabled"}:
         raise ValueError("enforcement_mode must be enforce, review, shadow, or disabled")
     duration = max(1, min(int(action_duration_seconds), 2_419_200))
+    normalized_platforms = tuple(dict.fromkeys(
+        str(platform).strip().casefold() for platform in platform_scope
+        if str(platform).strip()
+    ))
+    if not normalized_platforms or not set(normalized_platforms).issubset({"discord", "twitch"}):
+        raise ValueError("platform_scope must contain discord or twitch")
     with connection:
         connection.execute(
             """
@@ -2695,8 +3812,9 @@ def upsert_moderation_rule(
                 auto_enforce_action,
                 enabled,
                 enforcement_mode,
-                action_duration_seconds
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                action_duration_seconds,
+                platform_scope_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(community_id, name)
             DO UPDATE SET
                 rule_type = excluded.rule_type,
@@ -2706,6 +3824,7 @@ def upsert_moderation_rule(
                 enabled = excluded.enabled,
                 enforcement_mode = excluded.enforcement_mode,
                 action_duration_seconds = excluded.action_duration_seconds,
+                platform_scope_json = excluded.platform_scope_json,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (
@@ -2718,6 +3837,7 @@ def upsert_moderation_rule(
                 int(enabled),
                 normalized_mode,
                 duration,
+                json.dumps(normalized_platforms),
             ),
         )
         row = connection.execute(
@@ -2732,12 +3852,13 @@ def upsert_moderation_rule(
 
 
 def load_enabled_moderation_rules(
-    connection: sqlite3.Connection, *, community_id: int = 1
+    connection: sqlite3.Connection, *, community_id: int, platform: str | None = None,
+    channel_id: str | None = None, platform_account_id: int | None = None,
 ) -> list[ModerationRule]:
     rows = connection.execute(
         """
         SELECT id, name, rule_type, pattern, severity, auto_enforce_action, enabled,
-               enforcement_mode, action_duration_seconds
+               enforcement_mode, action_duration_seconds, platform_scope_json
         FROM moderation_rules
         WHERE enabled = 1 AND community_id = ?
         ORDER BY id
@@ -2745,6 +3866,19 @@ def load_enabled_moderation_rules(
         ,
         (int(community_id),),
     ).fetchall()
+    exempt_rule_ids: set[int] = set()
+    exemption_values = [
+        ("channel", channel_id),
+        ("platform_account", str(platform_account_id) if platform_account_id is not None else None),
+    ]
+    for exemption_type, exemption_value in exemption_values:
+        if exemption_value is not None:
+            exempt_rule_ids.update(int(row[0]) for row in connection.execute(
+                """SELECT moderation_rule_id FROM moderation_rule_exemptions
+                   WHERE community_id=? AND exemption_type=? AND exemption_value=?""",
+                (int(community_id), exemption_type, exemption_value),
+            ).fetchall())
+    normalized_platform = platform.strip().casefold() if platform else None
     return [
         ModerationRule(
             id=int(row[0]),
@@ -2758,12 +3892,15 @@ def load_enabled_moderation_rules(
             action_duration_seconds=int(row[8]),
         )
         for row in rows
+        if int(row[0]) not in exempt_rule_ids
+        and (normalized_platform is None or normalized_platform in json.loads(str(row[9])))
     ]
 
 
 def record_moderation_findings(
     connection: sqlite3.Connection,
     *,
+    tenant: TenantContext,
     message_id: int,
     platform: str,
     findings: list[ModerationFinding],
@@ -2773,9 +3910,12 @@ def record_moderation_findings(
         return
 
     message_row = connection.execute(
-        "SELECT user_id, observation_id FROM messages WHERE id = ?",
-        (message_id,),
+        """SELECT user_id, observation_id, community_id, installation_id
+           FROM messages WHERE id = ? AND community_id = ?""",
+        (message_id, tenant.community_id),
     ).fetchone()
+    if message_row is None:
+        raise LookupError("message not found")
     user_id = (
         int(message_row[0])
         if message_row is not None and message_row[0] is not None
@@ -2783,9 +3923,11 @@ def record_moderation_findings(
     )
     observation_id = (
         int(message_row[1])
-        if message_row is not None and message_row[1] is not None
+        if message_row[1] is not None
         else None
     )
+    community_id = int(message_row[2])
+    installation_id = int(message_row[3]) if message_row[3] is not None else None
 
     for finding in findings:
         effective_mode = "shadow" if force_shadow else finding.enforcement_mode
@@ -2814,12 +3956,13 @@ def record_moderation_findings(
             connection.execute(
                 """
                 INSERT INTO intelligence_alerts(
-                    user_id, observation_id, alert_type, severity, title, summary,
+                    community_id, user_id, observation_id, alert_type, severity, title, summary,
                     confidence, dedupe_key
-                ) VALUES (?, ?, 'moderation_finding', ?, ?, ?, 1.0, ?)
+                ) VALUES (?, ?, ?, 'moderation_finding', ?, ?, ?, 1.0, ?)
                 ON CONFLICT(dedupe_key) DO NOTHING
                 """,
                 (
+                    community_id,
                     user_id,
                     observation_id,
                     finding.severity,
@@ -2833,9 +3976,16 @@ def record_moderation_findings(
             and effective_mode == "enforce"
         )
         if should_enforce:
+            from .contexts import TenantContext
+            from .intelligence.quotas import consume_tenant_quota
+            consume_tenant_quota(
+                connection, tenant=TenantContext(int(community_id)), quota_type="moderation",
+            )
             connection.execute(
                 """
                 INSERT INTO moderation_actions (
+                    community_id,
+                    installation_id,
                     platform,
                     message_id,
                     target_platform_account_id,
@@ -2849,6 +3999,8 @@ def record_moderation_findings(
                 ) VALUES (
                     ?,
                     ?,
+                    ?,
+                    ?,
                     (SELECT platform_account_id FROM messages WHERE id = ?),
                     (SELECT user_id FROM messages WHERE id = ?),
                     ?,
@@ -2860,6 +4012,8 @@ def record_moderation_findings(
                 )
                 """,
                 (
+                    community_id,
+                    installation_id,
                     platform,
                     message_id,
                     message_id,
@@ -2901,6 +4055,7 @@ def record_moderation_action(
     status: str = "pending",
     actor_type: str = "system",
     actor_id: int | None = None,
+    community_id: int,
 ) -> int:
     attribution = connection.execute(
         """
@@ -2915,10 +4070,16 @@ def record_moderation_action(
         (message_id, target_platform_account_id),
     ).fetchone()
     attributed_user_id = attribution[0] if attribution is not None else None
+    from .contexts import TenantContext
+    from .intelligence.quotas import consume_tenant_quota
+    consume_tenant_quota(
+        connection, tenant=TenantContext(int(community_id)), quota_type="moderation",
+    )
     with connection:
         cursor = connection.execute(
             """
             INSERT INTO moderation_actions (
+                community_id,
                 platform,
                 message_id,
                 target_platform_account_id,
@@ -2928,9 +4089,10 @@ def record_moderation_action(
                 actor_id,
                 reason,
                 status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                int(community_id),
                 platform,
                 message_id,
                 target_platform_account_id,
@@ -2948,6 +4110,8 @@ def record_moderation_action(
 def list_pending_moderation_actions_for_message(
     connection: sqlite3.Connection,
     message_id: int,
+    *,
+    tenant: TenantContext,
 ) -> list[sqlite3.Row]:
     rows = connection.execute(
         """
@@ -2963,10 +4127,11 @@ def list_pending_moderation_actions_for_message(
         FROM moderation_actions
         INNER JOIN platform_accounts ON platform_accounts.id = moderation_actions.target_platform_account_id
         WHERE moderation_actions.message_id = ?
+                    AND moderation_actions.community_id = ?
           AND moderation_actions.status = 'pending'
         ORDER BY moderation_actions.id
         """,
-        (message_id,),
+        (message_id, tenant.community_id),
     ).fetchall()
     return list(rows)
 
@@ -2975,25 +4140,29 @@ def mark_moderation_action_completed(
     connection: sqlite3.Connection,
     action_id: int,
     *,
+    tenant: TenantContext,
     provider_status: str | None = None,
     provider_response: Mapping[str, object] | None = None,
 ) -> None:
     with connection:
-        connection.execute(
+        cursor = connection.execute(
             """
             UPDATE moderation_actions
             SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
                 error_message = NULL, provider_status = ?, provider_response_json = ?,
                 provider_confirmed_at = CASE WHEN platform='twitch' THEN CURRENT_TIMESTAMP
                                              ELSE provider_confirmed_at END
-            WHERE id = ?
+            WHERE id = ? AND community_id = ?
             """,
             (
                 provider_status,
                 json.dumps(dict(provider_response or {}), sort_keys=True),
                 action_id,
+                tenant.community_id,
             ),
         )
+        if cursor.rowcount != 1:
+            raise LookupError("tenant moderation action not found")
 
 
 def _utcnow_iso() -> str:
@@ -3253,6 +4422,11 @@ def persist_observation(
     connection: sqlite3.Connection,
     observation: Observation,
 ) -> ObservationResult:
+    from .contexts import TenantContext
+
+    tenant = TenantContext.require(
+        observation.community_id, installation_id=observation.installation_id
+    )
     actor_account_id = None
     target_account_id = None
 
@@ -3284,6 +4458,7 @@ def persist_observation(
                 INSERT INTO observations (
                     platform,
                     community_id,
+                    installation_id,
                     event_type,
                     external_event_id,
                     actor_platform_account_id,
@@ -3295,11 +4470,12 @@ def persist_observation(
                     raw_payload_json,
                     occurred_at,
                     schema_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     observation.platform,
-                    max(1, int(observation.community_id)),
+                    tenant.community_id,
+                    tenant.installation_id,
                     observation.event_type,
                     observation.external_event_id,
                     actor_account_id,
@@ -3349,11 +4525,31 @@ def enqueue_processing_job(
     payload: Mapping[str, object] | None = None,
     priority: int = 100,
     max_attempts: int = 5,
+    community_id: int | None = None,
 ) -> int | None:
+    resolved_community_id = int(community_id) if community_id is not None else None
+    if resolved_community_id is None and observation_id is not None:
+        ownership = connection.execute(
+            "SELECT community_id FROM observations WHERE id=?", (int(observation_id),),
+        ).fetchone()
+        if ownership is None:
+            raise ValueError("processing job observation was not found")
+        resolved_community_id = int(ownership[0])
+    if connection.execute(
+        "SELECT 1 FROM processing_jobs WHERE idempotency_key=?", (idempotency_key,),
+    ).fetchone() is not None:
+        return None
+    if resolved_community_id is not None:
+        from .contexts import TenantContext
+        from .intelligence.quotas import consume_tenant_quota
+        consume_tenant_quota(
+            connection, tenant=TenantContext(resolved_community_id), quota_type="jobs",
+        )
     with connection:
         cursor = connection.execute(
             """
             INSERT INTO processing_jobs (
+                community_id,
                 stage,
                 job_type,
                 observation_id,
@@ -3361,10 +4557,11 @@ def enqueue_processing_job(
                 priority,
                 max_attempts,
                 idempotency_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(idempotency_key) DO NOTHING
             """,
             (
+                resolved_community_id,
                 stage,
                 job_type,
                 observation_id,
@@ -3495,6 +4692,13 @@ def collect_observation(
     connection: sqlite3.Connection,
     observation: Observation,
 ) -> CollectedObservation:
+    from .contexts import TenantContext
+    from .intelligence.quotas import consume_tenant_quota
+    consume_tenant_quota(
+        connection, tenant=TenantContext.require(
+            observation.community_id, installation_id=observation.installation_id,
+        ), quota_type="ingestion",
+    )
     with connection:
         result = persist_observation(
             connection,
@@ -3527,13 +4731,19 @@ def collect_observation(
             separators=(",", ":"),
             default=str,
         )
+        from .contexts import TenantContext
+
+        tenant = TenantContext.require(
+            observation.community_id, installation_id=observation.installation_id
+        )
         connection.execute(
             """INSERT OR IGNORE INTO raw_event_archive(
-                   community_id,observation_id,platform,event_type,external_event_id,
+                   community_id,installation_id,observation_id,platform,event_type,external_event_id,
                    payload_sha256,payload_json
-               ) VALUES (?,?,?,?,?,?,?)""",
+               ) VALUES (?,?,?,?,?,?,?,?)""",
             (
-                max(1, int(observation.community_id)),
+                tenant.community_id,
+                tenant.installation_id,
                 observation_id,
                 observation.platform,
                 observation.event_type,
@@ -3611,6 +4821,8 @@ def normalized_message_from_observation(
 def get_observation(
     connection: sqlite3.Connection,
     observation_id: int,
+    *,
+    tenant: TenantContext,
 ) -> sqlite3.Row | None:
     return connection.execute(
         """
@@ -3629,7 +4841,7 @@ def get_observation(
         LEFT JOIN platform_accounts AS target
             ON target.id =
                observations.target_platform_account_id
-        WHERE observations.id = ?
+        WHERE observations.id = ? AND observations.community_id = ?
         """,
-        (observation_id,),
+        (observation_id, tenant.community_id),
     ).fetchone()

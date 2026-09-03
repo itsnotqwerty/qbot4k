@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -30,6 +31,10 @@ class FoundationTests(unittest.TestCase):
             "QBOT_DATABASE_PATH": str(Path(tmpdir) / "qbot4k.sqlite3"),
             "QBOT_ENABLED_SERVICES": "web,jobs",
             "QBOT_DASHBOARD_SESSION_SECRET": "session-secret",
+            "QBOT_LEGAL_ORGANIZATION_NAME": "QBot4K Test Operations",
+            "QBOT_LEGAL_CONTACT_EMAIL": "privacy@example.test",
+            "QBOT_LEGAL_JURISDICTION": "Test Jurisdiction",
+            "QBOT_LEGAL_EFFECTIVE_DATE": "2026-09-02",
             "QBOT_DISCORD_OAUTH_CLIENT_ID": "oauth-client-id",
             "QBOT_DISCORD_OAUTH_CLIENT_SECRET": "oauth-client-secret",
             "QBOT_DISCORD_OAUTH_REDIRECT_URI": "http://127.0.0.1/callback",
@@ -178,21 +183,431 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(ghost_count, 0)
         self.assertEqual(merged_event_owner, 2)
 
+    def test_schema_migrations_are_ordered_and_idempotent(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "migrations.sqlite3"
+            connection = connect_database(database_path)
+            try:
+                initialize_database(connection)
+                initial = [tuple(row) for row in connection.execute(
+                    "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+                )]
+
+                initialize_database(connection, force=True)
+                repeated = [tuple(row) for row in connection.execute(
+                    "SELECT version, name, applied_at FROM schema_migrations ORDER BY version"
+                )]
+            finally:
+                connection.close()
+
+        self.assertEqual([row[0] for row in initial], list(range(1, 28)))
+        self.assertEqual(repeated, initial)
+
+    def test_tenant_job_migration_upgrades_pre_27_schema(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "pre-v27.sqlite3")
+            try:
+                initialize_database(connection)
+                with connection:
+                    connection.execute("DROP INDEX idx_processing_jobs_tenant_available")
+                    connection.execute("ALTER TABLE processing_jobs DROP COLUMN community_id")
+                    connection.execute("DELETE FROM schema_migrations WHERE version=27")
+
+                initialize_database(connection, force=True)
+                columns = {
+                    str(row[1]) for row in connection.execute(
+                        "PRAGMA table_info(processing_jobs)"
+                    ).fetchall()
+                }
+                indexes = {
+                    str(row[1]) for row in connection.execute(
+                        "PRAGMA index_list(processing_jobs)"
+                    ).fetchall()
+                }
+            finally:
+                connection.close()
+
+        self.assertIn("community_id", columns)
+        self.assertIn("idx_processing_jobs_tenant_available", indexes)
+
+    def test_api_client_ownership_migration_backfills_and_requires_community(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "api-client-v17.sqlite3")
+            initialize_database(connection)
+            with connection:
+                connection.execute("DROP TABLE api_request_usage")
+                connection.execute("DROP TABLE api_clients")
+                connection.execute(
+                    """CREATE TABLE api_clients (
+                           id INTEGER PRIMARY KEY,
+                           organization_id INTEGER NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+                           name TEXT NOT NULL,
+                           key_hash TEXT NOT NULL UNIQUE,
+                           scopes_json TEXT NOT NULL DEFAULT '[]',
+                           status TEXT NOT NULL DEFAULT 'active',
+                           rate_limit_per_minute INTEGER NOT NULL DEFAULT 120,
+                           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                           revoked_at TEXT
+                       )"""
+                )
+                connection.execute(
+                    "INSERT INTO api_clients(organization_id,name,key_hash) VALUES (1,'legacy','legacy-key')"
+                )
+                connection.execute("DELETE FROM schema_migrations WHERE version=18")
+
+            initialize_database(connection, force=True)
+
+            self.assertEqual(
+                connection.execute(
+                    "SELECT community_id FROM api_clients WHERE key_hash='legacy-key'"
+                ).fetchone()[0],
+                1,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """INSERT INTO api_clients(organization_id,name,key_hash,community_id)
+                       VALUES (1,'invalid','invalid-key',NULL)"""
+                )
+            connection.close()
+
+    def test_data_subject_request_migration_backfills_strict_community_owner(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "subject-request-v21.sqlite3")
+            initialize_database(connection)
+            with connection:
+                connection.execute("DROP TABLE data_subject_requests")
+                connection.execute(
+                    """CREATE TABLE data_subject_requests (
+                           id INTEGER PRIMARY KEY,
+                           organization_id INTEGER NOT NULL REFERENCES organizations(id),
+                           request_type TEXT NOT NULL,
+                           status TEXT NOT NULL DEFAULT 'open',
+                           result_json TEXT NOT NULL DEFAULT '{}'
+                       )"""
+                )
+                connection.execute(
+                    """INSERT INTO data_subject_requests(organization_id,request_type)
+                       VALUES (1,'export')"""
+                )
+                connection.execute("DELETE FROM schema_migrations WHERE version=22")
+
+            initialize_database(connection, force=True)
+
+            owner = connection.execute(
+                "SELECT community_id FROM data_subject_requests WHERE id=1"
+            ).fetchone()[0]
+            columns = {
+                str(row[1]): int(row[3])
+                for row in connection.execute("PRAGMA table_info(data_subject_requests)")
+            }
+            self.assertEqual(owner, 1)
+            self.assertEqual(columns["community_id"], 1)
+            connection.close()
+
+    def test_community_runtime_policy_migration_backfills_defaults(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "community-policy-v18.sqlite3")
+            initialize_database(connection)
+            with connection:
+                connection.execute("ALTER TABLE community_policy_settings DROP COLUMN message_retention_days")
+                connection.execute("ALTER TABLE community_policy_settings DROP COLUMN analytics_retention_days")
+                connection.execute("ALTER TABLE community_policy_settings DROP COLUMN allow_bot_messages")
+                connection.execute("DELETE FROM schema_migrations WHERE version=19")
+
+            initialize_database(connection, force=True)
+
+            policy = connection.execute(
+                """SELECT message_retention_days,analytics_retention_days,allow_bot_messages
+                   FROM community_policy_settings WHERE community_id=1"""
+            ).fetchone()
+            self.assertEqual(tuple(policy), (90, 90, 0))
+            connection.close()
+
+    def test_community_anti_abuse_policy_migration_backfills_shadow_defaults(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "anti-abuse-v19.sqlite3")
+            initialize_database(connection)
+            columns = (
+                "anti_abuse_enabled", "anti_abuse_enforcement_mode", "message_burst_limit",
+                "message_burst_window_seconds", "mention_limit", "join_raid_limit",
+                "join_raid_window_seconds",
+            )
+            with connection:
+                for column in columns:
+                    connection.execute(f"ALTER TABLE community_policy_settings DROP COLUMN {column}")
+                connection.execute("DELETE FROM schema_migrations WHERE version=20")
+
+            initialize_database(connection, force=True)
+
+            policy = connection.execute(
+                """SELECT anti_abuse_enabled,anti_abuse_enforcement_mode,
+                          message_burst_limit,message_burst_window_seconds,
+                          mention_limit,join_raid_limit,join_raid_window_seconds
+                   FROM community_policy_settings WHERE community_id=1"""
+            ).fetchone()
+            self.assertEqual(tuple(policy), (1, "shadow", 12, 10, 8, 25, 60))
+            connection.close()
+
+    def test_legacy_twitch_onboarding_migration_preserves_intent(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "twitch-onboarding-v20.sqlite3")
+            initialize_database(connection)
+            with connection:
+                connection.execute(
+                    """INSERT INTO operator_accounts(
+                           id,discord_user_id,discord_username,role
+                       ) VALUES (1,'legacy-operator','Legacy Operator','admin')"""
+                )
+                connection.execute(
+                    """CREATE TABLE twitch_onboarding_states (
+                           nonce TEXT PRIMARY KEY,
+                           operator_id INTEGER NOT NULL REFERENCES operator_accounts(id),
+                           community_id INTEGER NOT NULL REFERENCES communities(id),
+                           broadcaster_login TEXT NOT NULL,
+                           requested_scopes_json TEXT NOT NULL DEFAULT '[]',
+                           status TEXT NOT NULL DEFAULT 'pending',
+                           installation_id INTEGER,
+                           expires_at TEXT NOT NULL,
+                           completed_at TEXT,
+                           last_error TEXT,
+                           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                       )"""
+                )
+                connection.execute(
+                    """INSERT INTO twitch_onboarding_states(
+                           nonce,operator_id,community_id,broadcaster_login,
+                           requested_scopes_json,status,expires_at
+                       ) VALUES ('legacy-nonce',1,1,'streamer',?,
+                                 'pending','2099-01-01T00:00:00+00:00')""",
+                    ('["chat:read"]',),
+                )
+                connection.execute("DELETE FROM schema_migrations WHERE version=21")
+
+            initialize_database(connection, force=True)
+
+            intent = connection.execute(
+                """SELECT operator_id,community_id,broadcaster_login,scopes_json,consumed_at
+                   FROM twitch_install_intents WHERE nonce='legacy-nonce'"""
+            ).fetchone()
+            legacy_table = connection.execute(
+                """SELECT 1 FROM sqlite_master
+                   WHERE type='table' AND name='twitch_onboarding_states'"""
+            ).fetchone()
+            self.assertEqual(tuple(intent), (1, 1, "streamer", '["chat:read"]', None))
+            self.assertIsNone(legacy_table)
+            connection.close()
+
+    def test_legacy_schema_convergence_runs_once_at_version_seven(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "legacy-v6.sqlite3"
+            connection = connect_database(database_path)
+            initialize_database(connection)
+            with connection:
+                connection.execute("DELETE FROM schema_migrations WHERE version >= 7")
+                connection.execute("ALTER TABLE community_installations DROP COLUMN last_error")
+
+            initialize_database(connection, force=True)
+            columns = {
+                str(row[1]) for row in connection.execute(
+                    "PRAGMA table_info(community_installations)"
+                )
+            }
+            self.assertIn("last_error", columns)
+
+            with mock.patch("src.db._migrate_legacy_schema") as convergence:
+                initialize_database(connection, force=True)
+            convergence.assert_not_called()
+            connection.close()
+
+    def test_provider_installation_references_backfill_from_observation(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "installation-backfill.sqlite3")
+            initialize_database(connection)
+            with connection:
+                installation_id = int(connection.execute(
+                    """INSERT INTO community_installations(
+                           community_id,platform,external_community_id,display_name,status
+                       ) VALUES (1,'discord','guild-legacy','Legacy Guild','active')
+                       RETURNING id"""
+                ).fetchone()[0])
+                account_id = int(connection.execute(
+                    """INSERT INTO platform_accounts(platform,platform_user_id,username)
+                       VALUES ('discord','legacy-user','Legacy User') RETURNING id"""
+                ).fetchone()[0])
+                observation_id = int(connection.execute(
+                    """INSERT INTO observations(
+                           platform,community_id,event_type,external_event_id,
+                           actor_platform_account_id,container_id,context_id,occurred_at
+                       ) VALUES (
+                           'discord',1,'message.created','legacy-event',?,
+                           'channel-1','guild-legacy','2026-09-02T00:00:00+00:00'
+                       ) RETURNING id""",
+                    (account_id,),
+                ).fetchone()[0])
+                message_id = int(connection.execute(
+                    """INSERT INTO messages(
+                           observation_id,platform,platform_message_id,
+                           platform_account_id,community_id,channel_id,
+                           content_raw,content_normalized,sent_at
+                       ) VALUES (
+                           ?,'discord','legacy-message',?,1,'channel-1',
+                           'hello','hello','2026-09-02T00:00:00+00:00'
+                       ) RETURNING id""",
+                    (observation_id, account_id),
+                ).fetchone()[0])
+                action_id = int(connection.execute(
+                    """INSERT INTO moderation_actions(
+                           community_id,platform,message_id,target_platform_account_id,
+                           action_type,actor_type,status
+                       ) VALUES (1,'discord',?,?,'warn','system','completed')
+                       RETURNING id""",
+                    (message_id, account_id),
+                ).fetchone()[0])
+                archive_id = int(connection.execute(
+                    """INSERT INTO raw_event_archive(
+                           community_id,observation_id,platform,event_type,
+                           external_event_id,payload_sha256,payload_json
+                       ) VALUES (1,?,'discord','message.created','legacy-event','digest','{}')
+                       RETURNING id""",
+                    (observation_id,),
+                ).fetchone()[0])
+                connection.execute("DELETE FROM schema_migrations WHERE version=16")
+
+            initialize_database(connection, force=True)
+            for table_name, row_id in (
+                ("observations", observation_id),
+                ("messages", message_id),
+                ("moderation_actions", action_id),
+                ("raw_event_archive", archive_id),
+            ):
+                with self.subTest(table=table_name):
+                    value = connection.execute(
+                        f"SELECT installation_id FROM {table_name} WHERE id=?", (row_id,)
+                    ).fetchone()[0]
+                    self.assertEqual(int(value), installation_id)
+            connection.close()
+
+    def test_strict_tenant_migration_backfills_legacy_null_without_default(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "legacy-tenant.sqlite3"
+            connection = connect_database(database_path)
+            initialize_database(connection)
+            with connection:
+                connection.execute("DELETE FROM schema_migrations WHERE version=15")
+                connection.execute("PRAGMA writable_schema=ON")
+                connection.execute(
+                    """UPDATE sqlite_schema
+                       SET sql=replace(
+                           sql,
+                           'community_id INTEGER NOT NULL REFERENCES communities(id)',
+                           'community_id INTEGER DEFAULT 1 REFERENCES communities(id)'
+                       )
+                       WHERE type='table' AND name='investigation_cases'"""
+                )
+                connection.execute("PRAGMA writable_schema=OFF")
+                schema_version = int(
+                    connection.execute("PRAGMA schema_version").fetchone()[0]
+                )
+                connection.execute(f"PRAGMA schema_version={schema_version + 1}")
+            connection.close()
+
+            connection = connect_database(database_path)
+            try:
+                with connection:
+                    connection.execute(
+                        """INSERT INTO investigation_cases(
+                               community_id,title
+                           ) VALUES (NULL,'Legacy case')"""
+                    )
+                initialize_database(connection, force=True)
+                community_id = int(connection.execute(
+                    "SELECT community_id FROM investigation_cases WHERE title='Legacy case'"
+                ).fetchone()[0])
+                community_column = next(
+                    row for row in connection.execute(
+                        "PRAGMA table_info(investigation_cases)"
+                    ) if str(row[1]) == "community_id"
+                )
+
+                self.assertEqual(community_id, 1)
+                self.assertEqual(int(community_column[3]), 1)
+                self.assertIsNone(community_column[4])
+                with self.assertRaises(Exception):
+                    connection.execute(
+                        "INSERT INTO investigation_cases(title) VALUES ('Missing tenant')"
+                    )
+            finally:
+                connection.close()
+
+    def test_strict_tenant_migration_rejects_unresolved_ownership(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            database_path = Path(tmpdir) / "orphan-tenant.sqlite3"
+            connection = connect_database(database_path)
+            try:
+                initialize_database(connection)
+                with connection:
+                    connection.execute("DELETE FROM schema_migrations WHERE version=15")
+                connection.execute("PRAGMA foreign_keys=OFF")
+                with connection:
+                    connection.execute(
+                        """INSERT INTO investigation_cases(
+                               community_id,title
+                           ) VALUES (999,'Orphan case')"""
+                    )
+                connection.execute("PRAGMA foreign_keys=ON")
+
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "unresolved tenant ownership: investigation_cases=1",
+                ):
+                    initialize_database(connection, force=True)
+                applied = connection.execute(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version=15"
+                ).fetchone()[0]
+                self.assertEqual(applied, 0)
+            finally:
+                connection.close()
+
+    def test_tenant_owned_tables_are_not_null_without_defaults(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            connection = connect_database(Path(tmpdir) / "strict-schema.sqlite3")
+            try:
+                initialize_database(connection)
+                for table_name in (
+                    "messages", "moderation_rules", "observations",
+                    "intelligence_alerts", "investigation_cases",
+                    "entity_relationships", "moderation_actions", "user_notes",
+                    "emerging_topics", "topic_history", "topic_evidence",
+                    "intelligence_reports",
+                ):
+                    with self.subTest(table=table_name):
+                        column = next(
+                            row for row in connection.execute(
+                                f"PRAGMA table_info({table_name})"
+                            ) if str(row[1]) == "community_id"
+                        )
+                        self.assertEqual(int(column[3]), 1)
+                        self.assertIsNone(column[4])
+            finally:
+                connection.close()
+
     def test_settings_validate_with_web_defaults(self) -> None:
         with TemporaryDirectory() as tmpdir:
             settings = AppSettings.from_env(self.build_env(tmpdir))
             self.assertEqual(settings.dashboard_port, 8080)
             self.assertEqual(settings.enabled_services, ("web", "jobs"))
             self.assertEqual(settings.twitch_channels, ("its_not_qwerty",))
-            self.assertFalse(settings.discord_allow_bot_messages)
+            self.assertFalse(hasattr(settings, "discord_allow_bot_messages"))
 
-    def test_settings_can_enable_discord_bot_message_ingestion(self) -> None:
+    def test_tenant_policy_environment_is_not_application_configuration(self) -> None:
         with TemporaryDirectory() as tmpdir:
             settings = AppSettings.from_env(
                 self.build_env(tmpdir, QBOT_DISCORD_ALLOW_BOT_MESSAGES="true")
             )
 
-        self.assertTrue(settings.discord_allow_bot_messages)
+        self.assertFalse(hasattr(settings, "discord_allow_bot_messages"))
+        self.assertNotIn("discord_allow_bot_messages", settings.safe_summary())
 
     def test_explicit_environment_file_is_read_and_authoritative(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -252,25 +667,20 @@ class FoundationTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["database_path"], str(database_path))
 
-    def test_systemd_templates_reset_legacy_paths(self) -> None:
+    def test_release_installer_renders_python_systemd_template(self) -> None:
         project_root = Path(__file__).resolve().parents[1]
-        service = (project_root / "deploy" / "qbot4k.service").read_text(
+        service = (project_root / "deploy" / "systemd.service.template").read_text(
             encoding="utf-8"
         )
-        override = (
-            project_root / "deploy" / "zz-qbot4k-installer.conf"
-        ).read_text(encoding="utf-8")
+        installer = (project_root / "install.sh").read_text(encoding="utf-8")
 
-        expected_entrypoint = (
-            "/opt/qbot4k/current/.venv/bin/python "
-            "/opt/qbot4k/current/src/__main__.py "
-            "--env-file /etc/qbot4k/qbot4k.env run"
-        )
-        self.assertIn(f"ExecStart={expected_entrypoint}", service)
-        self.assertIn("ExecStart=\n", override)
-        self.assertIn(f"ExecStart={expected_entrypoint}", override)
-        self.assertIn("ReadWritePaths=\n", override)
-        self.assertIn("/opt/qbot4k/data", override)
+        self.assertIn("ExecStart=__PYTHON__ -m src", service)
+        self.assertIn("ProtectSystem=strict", service)
+        self.assertIn("-/var/lib/qbot4k", service)
+        self.assertIn("-/var/backups/qbot4k", service)
+        self.assertIn("systemd.service.template", installer)
+        self.assertIn("/opt/qbot4k/current/.venv/bin/python", installer)
+        self.assertIn("rm -f -- \"$UNIT_DROPIN_FILE\"", installer)
 
     def test_settings_fail_fast_when_web_auth_missing(self) -> None:
         with TemporaryDirectory() as tmpdir:

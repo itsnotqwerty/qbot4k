@@ -8,9 +8,10 @@ from unittest import mock
 
 from src.config import AppSettings
 from src.__main__ import run_application
-from src.db import connect_database
+from src.db import connect_database, initialize_database
 from src.discord import DiscordConnector
 from src.jobs import run_maintenance_jobs
+from src.intelligence.community import register_installation
 from src.pipeline.actions import ActionRegistry, ModerationActionHandler
 from src.pipeline.workers import DiscordWorker
 from src.twitch import TwitchConnectionError, TwitchConnector
@@ -26,7 +27,23 @@ class ImmediateBlockerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def register_provider(self, platform: str, external_community_id: str) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            register_installation(
+                connection,
+                community_id=1,
+                platform=platform,
+                external_community_id=external_community_id,
+                display_name=external_community_id,
+                status="active",
+            )
+        finally:
+            connection.close()
+
     def test_discord_moderation_findings_execute_through_action_worker(self) -> None:
+        self.register_provider("discord", "guild-1")
         connector = DiscordConnector(self.database_path, bot_token="test-token")
         result = connector.ingest_message({
             "id": "discord-egregious-1",
@@ -99,6 +116,7 @@ class ImmediateBlockerTests(unittest.TestCase):
             self.assertEqual(run_application(once=False), 0)
 
     def test_twitch_moderation_findings_execute_through_action_worker(self) -> None:
+        self.register_provider("twitch", "sample_channel")
         connector = TwitchConnector(self.database_path)
         result = connector.ingest_message({
             "message_id": "twitch-egregious-1",
@@ -212,6 +230,9 @@ class ImmediateBlockerTests(unittest.TestCase):
         try:
             with connection:
                 connection.execute(
+                    "UPDATE community_policy_settings SET message_retention_days=1 WHERE community_id=1"
+                )
+                connection.execute(
                     """
                     INSERT INTO processing_jobs (
                         stage, job_type, payload_json, status, completed_at,
@@ -230,7 +251,6 @@ class ImmediateBlockerTests(unittest.TestCase):
             "QBOT_DATABASE_PATH": str(self.database_path),
             "QBOT_BACKUP_DIR": str(self.root / "backups"),
             "QBOT_ENABLED_SERVICES": "jobs",
-            "QBOT_MESSAGE_RETENTION_DAYS": "1",
             "QBOT_AUDIT_RETENTION_DAYS": "1",
         })
         report = run_maintenance_jobs(

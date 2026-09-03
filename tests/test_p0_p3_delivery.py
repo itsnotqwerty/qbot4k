@@ -6,14 +6,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from src.contexts import TenantContext
 from src.db import collect_observation, connect_database, initialize_database
 from src.intelligence.analytics import record_evaluation_label, run_model_evaluation
 from src.intelligence.content import analyze_observation_content, emit_content_alert
+from src.intelligence.community import create_community, create_organization, create_workspace
 from src.intelligence.workflows import (
     add_case_entity,
     add_case_evidence,
     add_case_note,
     create_case_from_alert,
+    dispose_alert,
+    generate_intelligence_report,
+    intelligence_summary,
     update_alert_workflow,
     update_case,
 )
@@ -39,9 +44,12 @@ class P0P3DeliveryTests(unittest.TestCase):
             actor_platform_user_id="actor-1", actor_username="Actor",
             context_id="public", text="I will attack the site now",
             occurred_at="2026-08-11T12:00:00+00:00",
+            community_id=1,
         ))
         with self.connection:
-            analysis = analyze_observation_content(self.connection, int(result.observation_id))
+            analysis = analyze_observation_content(
+                self.connection, int(result.observation_id), tenant=TenantContext(1)
+            )
             alert_id = emit_content_alert(self.connection, int(result.observation_id), analysis)
         row = self.connection.execute(
             "SELECT observation_id,severity,dedupe_key FROM intelligence_alerts WHERE id=?", (alert_id,)
@@ -54,16 +62,32 @@ class P0P3DeliveryTests(unittest.TestCase):
             "INSERT INTO users(primary_display_name) VALUES ('Subject')"
         ).lastrowid)
         alert_id = int(self.connection.execute(
-            """INSERT INTO intelligence_alerts(user_id,alert_type,severity,title,summary,confidence,dedupe_key)
-               VALUES (?,'test','high','Finding','Evidence summary',0.9,'case-test')""", (user_id,)
+                """INSERT INTO intelligence_alerts(community_id,user_id,alert_type,severity,title,summary,confidence,dedupe_key)
+                    VALUES (1,?,'test','high','Finding','Evidence summary',0.9,'case-test')""", (user_id,)
         ).lastrowid)
         with self.connection:
-            case_id = create_case_from_alert(self.connection, alert_id, operator_id=7)
-            update_case(self.connection, case_id, status="active", priority="critical", operator_id=7)
-            add_case_entity(self.connection, case_id, user_id, role="subject", operator_id=7)
-            add_case_evidence(self.connection, case_id, alert_id=alert_id, note="Corroborated", operator_id=7)
-            add_case_note(self.connection, case_id, "Analyst note", operator_id=7)
-            update_alert_workflow(self.connection, alert_id, status="acknowledged", assigned_operator_id=7, operator_id=7)
+            case_id = create_case_from_alert(
+                self.connection, alert_id, community_id=1, operator_id=7
+            )
+            update_case(
+                self.connection, case_id, community_id=1,
+                status="active", priority="critical", operator_id=7,
+            )
+            add_case_entity(
+                self.connection, case_id, user_id, community_id=1,
+                role="subject", operator_id=7,
+            )
+            add_case_evidence(
+                self.connection, case_id, community_id=1,
+                alert_id=alert_id, note="Corroborated", operator_id=7,
+            )
+            add_case_note(
+                self.connection, case_id, "Analyst note", community_id=1, operator_id=7
+            )
+            update_alert_workflow(
+                self.connection, alert_id, community_id=1,
+                status="acknowledged", assigned_operator_id=7, operator_id=7,
+            )
         case = self.connection.execute(
             "SELECT status,priority FROM investigation_cases WHERE id=?", (case_id,)
         ).fetchone()
@@ -76,6 +100,77 @@ class P0P3DeliveryTests(unittest.TestCase):
         self.assertGreaterEqual(self.connection.execute(
             "SELECT COUNT(*) FROM case_activity WHERE case_id=?", (case_id,)
         ).fetchone()[0], 4)
+
+    def test_alert_case_and_report_lifecycle_is_tenant_isolated(self) -> None:
+        organization_id = create_organization(
+            self.connection, name="Intelligence Organization", slug="intelligence-organization"
+        )
+        workspace_id = create_workspace(
+            self.connection, organization_id=organization_id,
+            name="Intelligence Workspace", slug="intelligence-workspace",
+        )
+        community_id = create_community(
+            self.connection, workspace_id=workspace_id,
+            name="Intelligence Community", slug="intelligence-community",
+        )
+        user_id = int(self.connection.execute(
+            "INSERT INTO users(primary_display_name) VALUES ('Tenant A Subject')"
+        ).lastrowid)
+        alert_id = int(self.connection.execute(
+            """INSERT INTO intelligence_alerts(
+                   community_id,user_id,alert_type,severity,title,summary,confidence,dedupe_key
+               ) VALUES (1,?,'test','high','Tenant A Finding','Private',0.9,'tenant-a-alert')""",
+            (user_id,),
+        ).lastrowid)
+        with self.connection:
+            case_id = create_case_from_alert(
+                self.connection, alert_id, operator_id=7, community_id=1
+            )
+            report_id = generate_intelligence_report(
+                self.connection, report_type="daily_summary", community_id=1
+            )
+
+        blocked_operations = (
+            lambda: create_case_from_alert(
+                self.connection, alert_id, operator_id=8, community_id=community_id
+            ),
+            lambda: update_case(
+                self.connection, case_id, status="closed", community_id=community_id
+            ),
+            lambda: add_case_entity(
+                self.connection, case_id, user_id, community_id=community_id
+            ),
+            lambda: add_case_evidence(
+                self.connection, case_id, alert_id=alert_id, community_id=community_id
+            ),
+            lambda: add_case_note(
+                self.connection, case_id, "cross tenant", community_id=community_id
+            ),
+            lambda: update_alert_workflow(
+                self.connection, alert_id, status="acknowledged", community_id=community_id
+            ),
+            lambda: dispose_alert(
+                self.connection, alert_id, "confirmed", community_id=community_id
+            ),
+        )
+        for operation in blocked_operations:
+            with self.assertRaises(ValueError):
+                operation()
+
+        tenant_a_summary = intelligence_summary(self.connection, tenant=TenantContext(1))
+        tenant_b_summary = intelligence_summary(
+            self.connection, tenant=TenantContext(community_id)
+        )
+        self.assertEqual((tenant_a_summary.open_alerts, tenant_a_summary.open_cases), (0, 1))
+        self.assertEqual((tenant_b_summary.open_alerts, tenant_b_summary.open_cases), (0, 0))
+        self.assertEqual(tenant_a_summary.reports, 1)
+        self.assertEqual(tenant_b_summary.reports, 0)
+        self.assertEqual(self.connection.execute(
+            "SELECT community_id FROM intelligence_reports WHERE id=?", (report_id,)
+        ).fetchone()[0], 1)
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM intelligence_alerts WHERE id=?", (alert_id,)
+        ).fetchone()[0], "in_case")
 
     def test_evaluation_uses_score_captured_at_adjudication(self) -> None:
         user_id = int(self.connection.execute(

@@ -7,6 +7,8 @@ from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ..contexts import ActorAttribution, TenantContext
+
 
 SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
@@ -16,7 +18,7 @@ def project_stream_session(connection: sqlite3.Connection, observation: sqlite3.
     if event_type not in {"stream.started", "stream.updated", "stream.ended"}:
         return None
     attributes = _json_object(observation["attributes_json"])
-    community_id = int(observation["community_id"] or 1)
+    community_id = TenantContext.require(observation["community_id"]).community_id
     platform = str(observation["platform"])
     stream_key = str(
         observation["context_id"] or observation["container_id"]
@@ -235,11 +237,15 @@ def escalate_incident(
 def handoff_shift(
     connection: sqlite3.Connection,
     *,
-    community_id: int,
-    outgoing_operator_id: int,
+    tenant: TenantContext,
+    actor: ActorAttribution,
     incoming_operator_id: int,
     note: str,
 ) -> int:
+    if actor.actor_type != "operator" or actor.actor_id is None:
+        raise PermissionError("shift handoff requires an operator actor")
+    community_id = tenant.community_id
+    outgoing_operator_id = actor.actor_id
     with connection:
         active = connection.execute(
             """SELECT id FROM moderation_shifts WHERE community_id=? AND status='active'
@@ -272,14 +278,170 @@ def handoff_shift(
     return int(cursor.lastrowid)
 
 
-def activate_playbook(
+def schedule_moderation_shift(
+    connection: sqlite3.Connection,
+    *,
+    tenant: TenantContext,
+    actor: ActorAttribution,
+    operator_id: int,
+    starts_at: str,
+    ends_at: str,
+) -> int:
+    if actor.actor_type != "operator" or actor.actor_id is None:
+        raise PermissionError("shift scheduling requires an operator actor")
+    community_id = tenant.community_id
+    created_by_operator_id = actor.actor_id
+    start = _aware_timestamp(starts_at)
+    end = _aware_timestamp(ends_at)
+    if end <= start:
+        raise ValueError("shift end must be after its start")
+    membership = connection.execute(
+        "SELECT 1 FROM operator_community_roles WHERE operator_id=? AND community_id=?",
+        (int(operator_id), int(community_id)),
+    ).fetchone()
+    if membership is None:
+        raise ValueError("on-call operator is not assigned to this community")
+    overlap = connection.execute(
+        """SELECT 1 FROM moderation_shift_schedules
+           WHERE community_id=? AND status IN ('scheduled','active')
+             AND starts_at<? AND ends_at>?""",
+        (int(community_id), end.isoformat(), start.isoformat()),
+    ).fetchone()
+    if overlap is not None:
+        raise ValueError("shift overlaps an existing on-call schedule")
+    with connection:
+        cursor = connection.execute(
+            """INSERT INTO moderation_shift_schedules(
+                   community_id,operator_id,starts_at,ends_at,created_by_operator_id
+               ) VALUES (?,?,?,?,?)""",
+            (
+                int(community_id), int(operator_id), start.isoformat(), end.isoformat(),
+                int(created_by_operator_id),
+            ),
+        )
+        schedule_id = int(cursor.lastrowid)
+        connection.execute(
+            """INSERT INTO audit_log(
+                   actor_type,actor_id,action_type,entity_type,entity_id,payload_json
+               ) VALUES ('operator',?,'operations.shift_scheduled','moderation_shift_schedule',?,?)""",
+            (
+                int(created_by_operator_id), schedule_id,
+                json.dumps({
+                    "community_id": int(community_id), "operator_id": int(operator_id),
+                    "starts_at": start.isoformat(), "ends_at": end.isoformat(),
+                }, sort_keys=True),
+            ),
+        )
+    return schedule_id
+
+
+def list_moderation_shift_schedule(
+    connection: sqlite3.Connection, *, community_id: int
+) -> list[sqlite3.Row]:
+    return list(connection.execute(
+        """SELECT s.id,s.operator_id,o.discord_username,s.starts_at,s.ends_at,s.status
+           FROM moderation_shift_schedules s
+           JOIN operator_accounts o ON o.id=s.operator_id
+           WHERE s.community_id=? ORDER BY s.starts_at,s.id""",
+        (int(community_id),),
+    ).fetchall())
+
+
+def activate_scheduled_on_call(
+    connection: sqlite3.Connection, *, community_id: int, now: datetime | None = None
+) -> int | None:
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    with connection:
+        connection.execute(
+                """UPDATE moderation_shift_schedules SET status='completed',updated_at=CURRENT_TIMESTAMP
+                    WHERE community_id=? AND status IN ('scheduled','active') AND ends_at<=?""",
+            (int(community_id), current.isoformat()),
+        )
+        row = connection.execute(
+            """SELECT id,operator_id FROM moderation_shift_schedules
+               WHERE community_id=? AND status IN ('scheduled','active')
+                 AND starts_at<=? AND ends_at>?
+               ORDER BY starts_at DESC,id DESC LIMIT 1""",
+            (int(community_id), current.isoformat(), current.isoformat()),
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute(
+            """UPDATE moderation_shift_schedules SET status='active',updated_at=CURRENT_TIMESTAMP
+               WHERE id=?""",
+            (int(row[0]),),
+        )
+        active_shift = connection.execute(
+            """SELECT id,lead_operator_id FROM moderation_shifts
+               WHERE community_id=? AND status='active' ORDER BY started_at DESC,id DESC LIMIT 1""",
+            (int(community_id),),
+        ).fetchone()
+        if active_shift is None or int(active_shift[1]) != int(row[1]):
+            if active_shift is not None:
+                connection.execute(
+                    """UPDATE moderation_shifts SET status='completed',ended_at=CURRENT_TIMESTAMP
+                       WHERE id=?""",
+                    (int(active_shift[0]),),
+                )
+            connection.execute(
+                """INSERT INTO moderation_shifts(community_id,lead_operator_id,status,handoff_note)
+                   VALUES (?,?,'active','Scheduled on-call activation')""",
+                (int(community_id), int(row[1])),
+            )
+    return int(row[1])
+
+
+def route_incident_to_on_call(
     connection: sqlite3.Connection,
     *,
     community_id: int,
+    incident_id: int,
+    routed_by_operator_id: int,
+    now: datetime | None = None,
+) -> int:
+    operator_id = activate_scheduled_on_call(
+        connection, community_id=int(community_id), now=now
+    )
+    if operator_id is None:
+        raise ValueError("no operator is currently on call")
+    with connection:
+        cursor = connection.execute(
+            """UPDATE operations_incidents SET assigned_operator_id=?,status='active',
+                   updated_at=CURRENT_TIMESTAMP
+               WHERE id=? AND community_id=? AND status NOT IN ('closed','resolved')""",
+            (int(operator_id), int(incident_id), int(community_id)),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("open incident was not found")
+        _incident_activity(
+            connection, int(incident_id), int(routed_by_operator_id), "routed_on_call", "",
+            {"assigned_operator_id": int(operator_id)},
+        )
+    return int(operator_id)
+
+
+def _aware_timestamp(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid shift timestamp") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("shift timestamp must include a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def activate_playbook(
+    connection: sqlite3.Connection,
+    *,
+    tenant: TenantContext,
+    actor: ActorAttribution,
     playbook_key: str,
-    operator_id: int,
     incident_id: int | None = None,
 ) -> dict[str, Any]:
+    if actor.actor_type != "operator" or actor.actor_id is None:
+        raise PermissionError("playbook activation requires an operator actor")
+    community_id = tenant.community_id
+    operator_id = actor.actor_id
     playbook = connection.execute(
         """SELECT name,severity,steps_json FROM raid_playbooks
            WHERE playbook_key=? AND enabled=1""",
@@ -287,6 +449,11 @@ def activate_playbook(
     ).fetchone()
     if playbook is None:
         raise ValueError("enabled playbook was not found")
+    if incident_id is not None and connection.execute(
+        "SELECT 1 FROM operations_incidents WHERE id=? AND community_id=?",
+        (int(incident_id), community_id),
+    ).fetchone() is None:
+        raise ValueError("tenant incident was not found")
     steps = json.loads(str(playbook[2]))
     with connection:
         cursor = connection.execute(
@@ -299,8 +466,8 @@ def activate_playbook(
         if incident_id is not None:
             connection.execute(
                 """UPDATE operations_incidents SET playbook_key=?,status='active',
-                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                (playbook_key.strip(), int(incident_id)),
+                       updated_at=CURRENT_TIMESTAMP WHERE id=? AND community_id=?""",
+                (playbook_key.strip(), int(incident_id), community_id),
             )
             _incident_activity(connection, incident_id, operator_id, "playbook_activated",
                                str(playbook[0]), {"playbook_key": playbook_key.strip()})
@@ -324,6 +491,7 @@ def record_audience_event(connection: sqlite3.Connection, observation: sqlite3.R
         return None
     weight = float(attributes.get("viewers") or attributes.get("viewer_count") or 1)
     occurred = str(observation["occurred_at"])
+    community_id = int(observation["community_id"])
     connection.execute(
         """INSERT INTO audience_edges(
                community_id,source_key,target_key,edge_type,weight,event_count,
@@ -332,14 +500,14 @@ def record_audience_event(connection: sqlite3.Connection, observation: sqlite3.R
            ON CONFLICT(community_id,source_key,target_key,edge_type) DO UPDATE SET
                weight=audience_edges.weight+excluded.weight,event_count=audience_edges.event_count+1,
                last_observed_at=excluded.last_observed_at,evidence_json=excluded.evidence_json""",
-        (int(observation["community_id"] or 1), source, target,
+        (community_id, source, target,
          "raid" if event_type == "channel.raided" else "shared_audience", max(1.0, weight),
          occurred, occurred, json.dumps({"observation_id": int(observation["id"]), **attributes}, sort_keys=True)),
     )
     row = connection.execute(
         """SELECT id FROM audience_edges WHERE community_id=? AND source_key=?
            AND target_key=? AND edge_type=?""",
-        (int(observation["community_id"] or 1), source, target,
+        (community_id, source, target,
          "raid" if event_type == "channel.raided" else "shared_audience"),
     ).fetchone()
     return int(row[0]) if row is not None else None
@@ -420,7 +588,7 @@ def refresh_stream_cohorts(connection: sqlite3.Connection, stream_session_id: in
 
 
 def moderator_workload_report(
-    connection: sqlite3.Connection, *, community_id: int = 1, days: int = 7
+    connection: sqlite3.Connection, *, community_id: int, days: int = 7
 ) -> dict[str, Any]:
     operators = [dict(row) for row in connection.execute(
         """SELECT oa.id,oa.discord_username,
@@ -605,13 +773,16 @@ def create_notification_destination(
     return int(cursor.lastrowid)
 
 
-def dispatch_pending_notifications(connection: sqlite3.Connection, *, limit: int = 25) -> int:
+def dispatch_pending_notifications(
+    connection: sqlite3.Connection, *, tenant: TenantContext, limit: int = 25
+) -> int:
     rows = connection.execute(
         """SELECT d.id,d.payload_json,n.destination_type,n.target
            FROM notification_deliveries d JOIN notification_destinations n ON n.id=d.destination_id
-           WHERE d.status IN ('pending','retry') AND n.enabled=1 AND d.attempts<5
+              WHERE d.status IN ('pending','retry') AND n.enabled=1 AND d.attempts<5
+                 AND n.community_id=?
            ORDER BY d.created_at LIMIT ?""",
-        (max(1, int(limit)),),
+          (tenant.community_id, max(1, int(limit))),
     ).fetchall()
     delivered = 0
     for row in rows:

@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
 
+from ..contexts import TenantContext
 from .policy import (
     AUTO_EXPIRED_DISPOSITION,
     COORDINATION_ALERT_MEDIUM_EVIDENCE,
@@ -37,18 +38,39 @@ class IntelligenceSummary:
 def process_intelligence_observation(
     connection: sqlite3.Connection,
     *,
+    tenant: TenantContext,
     user_id: int,
     observation_id: int,
 ) -> None:
+    community_row = connection.execute(
+        "SELECT community_id FROM observations WHERE id=? AND community_id=?",
+        (observation_id, tenant.community_id),
+    ).fetchone()
+    if community_row is None:
+        raise ValueError("observation not found")
+    record_community_temporal_signal_run(
+        connection,
+        community_id=tenant.community_id,
+        user_id=user_id,
+        trigger_observation_id=observation_id,
+    )
     run_id = record_temporal_signal_run(
         connection,
+        community_id=tenant.community_id,
         user_id=user_id,
         trigger_observation_id=observation_id,
     )
     if run_id is None:
         return
-    extract_observation_relationships(connection, observation_id=observation_id)
-    evaluate_signal_alerts(connection, user_id=user_id, calculation_run_id=run_id)
+    extract_observation_relationships(
+        connection, tenant=tenant, observation_id=observation_id
+    )
+    evaluate_signal_alerts(
+        connection,
+        user_id=user_id,
+        calculation_run_id=run_id,
+        community_id=tenant.community_id,
+    )
     calculate_social_score(
         connection,
         user_id,
@@ -60,6 +82,7 @@ def process_intelligence_observation(
 def record_temporal_signal_run(
     connection: sqlite3.Connection,
     *,
+    community_id: int,
     user_id: int,
     trigger_observation_id: int | None = None,
     calculated_at: str | None = None,
@@ -86,7 +109,9 @@ def record_temporal_signal_run(
 
     window_values: dict[str, dict[str, float]] = {}
     for window_name, duration in WINDOWS:
-        values = _calculate_window_values(connection, user_id, timestamp, duration)
+        values = _calculate_window_values(
+            connection, user_id, timestamp, duration, community_id=community_id
+        )
         window_values[window_name] = values
         evidence_count = int(values["activity.message_count"])
         confidence = round(min(1.0, evidence_count / 20.0), 4)
@@ -193,7 +218,124 @@ def record_temporal_signal_run(
     return run_id
 
 
-def evaluate_signal_alerts(connection: sqlite3.Connection, *, user_id: int, calculation_run_id: int) -> int:
+def record_community_temporal_signal_run(
+    connection: sqlite3.Connection,
+    *,
+    community_id: int,
+    user_id: int,
+    trigger_observation_id: int | None = None,
+    calculated_at: str | None = None,
+) -> int | None:
+    timestamp = calculated_at or _observation_time(connection, trigger_observation_id) or _utcnow()
+    cursor = connection.execute(
+        """INSERT INTO community_signal_calculation_runs(
+               community_id,user_id,trigger_observation_id,analyzer_version,calculated_at
+           ) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(community_id,user_id,trigger_observation_id,analyzer_version)
+           DO NOTHING""",
+        (community_id, user_id, trigger_observation_id, SIGNAL_ANALYZER_VERSION, timestamp),
+    )
+    if cursor.rowcount == 0:
+        return None
+    run_id = int(cursor.lastrowid)
+    window_values: dict[str, dict[str, float | str | None]] = {}
+    for window_name, duration in WINDOWS:
+        values = _calculate_window_values(
+            connection, user_id, timestamp, duration, community_id=community_id
+        )
+        window_values[window_name] = values
+        evidence_count = int(values["activity.message_count"])
+        confidence = round(min(1.0, evidence_count / 20.0), 4)
+        window_start = (
+            (datetime.fromisoformat(timestamp).astimezone(timezone.utc) - duration).isoformat()
+            if duration is not None else values.get("window_start")
+        )
+        for signal_key in (
+            "activity.message_count", "behavior.positive_message_ratio",
+            "behavior.negative_message_ratio", "moderation.finding_rate",
+            "moderation.severity_index", "risk.composite",
+        ):
+            value = float(values[signal_key])
+            details = {
+                "window": window_name,
+                "message_count": evidence_count,
+                "negative_count": int(values["negative_count"]),
+                "positive_count": int(values["positive_count"]),
+                "finding_count": int(values["finding_count"]),
+                "formula_version": SIGNAL_ANALYZER_VERSION,
+                "community_id": community_id,
+            }
+            parameters = (
+                community_id, user_id, signal_key, window_name, SIGNAL_ANALYZER_VERSION,
+                value, json.dumps(details, sort_keys=True), confidence, evidence_count,
+                window_start, timestamp, timestamp,
+            )
+            connection.execute(
+                """INSERT INTO community_derived_signal_windows(
+                       community_id,user_id,signal_key,window_name,analyzer_version,
+                       value_real,value_json,confidence,evidence_count,
+                       window_start,window_end,calculated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(community_id,user_id,signal_key,window_name,analyzer_version)
+                   DO UPDATE SET value_real=excluded.value_real,value_json=excluded.value_json,
+                       confidence=excluded.confidence,evidence_count=excluded.evidence_count,
+                       window_start=excluded.window_start,window_end=excluded.window_end,
+                       calculated_at=excluded.calculated_at""",
+                parameters,
+            )
+            connection.execute(
+                """INSERT INTO community_derived_signal_history(
+                       community_id,calculation_run_id,user_id,signal_key,window_name,
+                       analyzer_version,value_real,value_json,confidence,evidence_count,
+                       window_start,window_end,calculated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (community_id, run_id, *parameters[1:]),
+            )
+
+    velocity = float(window_values["24h"]["behavior.negative_message_ratio"]) - float(
+        window_values["7d"]["behavior.negative_message_ratio"]
+    )
+    evidence_count = int(window_values["7d"]["activity.message_count"])
+    confidence = round(min(1.0, evidence_count / 20.0), 4)
+    details = json.dumps({
+        "current_24h": window_values["24h"]["behavior.negative_message_ratio"],
+        "baseline_7d": window_values["7d"]["behavior.negative_message_ratio"],
+        "community_id": community_id,
+    }, sort_keys=True)
+    window_start = (datetime.fromisoformat(timestamp) - timedelta(days=7)).isoformat()
+    connection.execute(
+        """INSERT INTO community_derived_signal_windows(
+               community_id,user_id,signal_key,window_name,analyzer_version,value_real,
+               value_json,confidence,evidence_count,window_start,window_end,calculated_at
+           ) VALUES (?, ?,'behavior.negative_velocity','24h_vs_7d',?,?,?,?,?,?,?,?)
+           ON CONFLICT(community_id,user_id,signal_key,window_name,analyzer_version)
+           DO UPDATE SET value_real=excluded.value_real,value_json=excluded.value_json,
+               confidence=excluded.confidence,evidence_count=excluded.evidence_count,
+               window_start=excluded.window_start,window_end=excluded.window_end,
+               calculated_at=excluded.calculated_at""",
+        (community_id, user_id, SIGNAL_ANALYZER_VERSION, velocity, details, confidence,
+         evidence_count, window_start, timestamp, timestamp),
+    )
+    connection.execute(
+        """INSERT INTO community_derived_signal_history(
+               community_id,calculation_run_id,user_id,signal_key,window_name,
+               analyzer_version,value_real,value_json,confidence,evidence_count,
+               window_start,window_end,calculated_at
+           ) VALUES (?, ?, ?,'behavior.negative_velocity','24h_vs_7d',?,?,?,?,?,?,?,?)""",
+        (community_id, run_id, user_id, SIGNAL_ANALYZER_VERSION, velocity, details,
+         confidence, evidence_count, window_start, timestamp, timestamp),
+    )
+    return run_id
+
+
+def evaluate_signal_alerts(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    calculation_run_id: int,
+    community_id: int,
+) -> int:
+    tenant = TenantContext.require(community_id)
     rows = connection.execute(
         """
         SELECT id, signal_key, window_name, value_real, confidence, evidence_count, calculated_at
@@ -218,26 +360,28 @@ def evaluate_signal_alerts(connection: sqlite3.Connection, *, user_id: int, calc
         cursor = connection.execute(
             """
             INSERT INTO intelligence_alerts (
-                user_id, signal_history_id, alert_type, severity, title,
+                community_id, user_id, signal_history_id, alert_type, severity, title,
                 summary, confidence, dedupe_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(dedupe_key) DO NOTHING
             """,
-            (user_id, history_id, alert_type, severity, alert_type.replace("_", " ").title(), summary, confidence, f"{user_id}:{alert_type}:{bucket}"),
+            (tenant.community_id, user_id, history_id, alert_type, severity, alert_type.replace("_", " ").title(), summary, confidence, f"{tenant.community_id}:{user_id}:{alert_type}:{bucket}"),
         )
         created += int(cursor.rowcount == 1)
     return created
 
 
-def extract_observation_relationships(connection: sqlite3.Connection, *, observation_id: int) -> int:
+def extract_observation_relationships(
+    connection: sqlite3.Connection, *, tenant: TenantContext, observation_id: int
+) -> int:
     observation = connection.execute(
         """
         SELECT observations.*, actor.user_id AS actor_user_id
         FROM observations
         LEFT JOIN platform_accounts actor ON actor.id = observations.actor_platform_account_id
-        WHERE observations.id = ?
+        WHERE observations.id = ? AND observations.community_id = ?
         """,
-        (observation_id,),
+        (observation_id, tenant.community_id),
     ).fetchone()
     if observation is None or observation["actor_user_id"] is None:
         return 0
@@ -293,16 +437,31 @@ def extract_observation_relationships(connection: sqlite3.Connection, *, observa
     return created
 
 
-def create_case_from_alert(connection: sqlite3.Connection, alert_id: int, *, operator_id: int | None = None) -> int:
-    existing = connection.execute("SELECT case_id FROM case_evidence WHERE alert_id = ? ORDER BY id LIMIT 1", (alert_id,)).fetchone()
+def create_case_from_alert(
+    connection: sqlite3.Connection, alert_id: int, *, community_id: int,
+    operator_id: int | None = None,
+) -> int:
+    existing = connection.execute(
+        """SELECT case_evidence.case_id FROM case_evidence
+           JOIN investigation_cases ON investigation_cases.id=case_evidence.case_id
+           WHERE case_evidence.alert_id=? AND investigation_cases.community_id=?
+           ORDER BY case_evidence.id LIMIT 1""",
+        (alert_id, community_id),
+    ).fetchone()
     if existing is not None:
         return int(existing[0])
-    alert = connection.execute("SELECT user_id, title, summary, severity, signal_history_id FROM intelligence_alerts WHERE id = ?", (alert_id,)).fetchone()
+    alert = connection.execute(
+        """SELECT user_id, title, summary, severity, signal_history_id
+           FROM intelligence_alerts WHERE id=? AND community_id=?""",
+        (alert_id, community_id),
+    ).fetchone()
     if alert is None:
         raise ValueError("alert not found")
     cursor = connection.execute(
-        "INSERT INTO investigation_cases (title, summary, priority, owner_operator_id) VALUES (?, ?, ?, ?)",
-        (str(alert[1]), str(alert[2]), str(alert[3]), operator_id),
+        """INSERT INTO investigation_cases(
+               community_id,title,summary,priority,owner_operator_id
+           ) VALUES (?, ?, ?, ?, ?)""",
+        (community_id, str(alert[1]), str(alert[2]), str(alert[3]), operator_id),
     )
     case_id = int(cursor.lastrowid)
     if alert[0] is not None:
@@ -339,9 +498,13 @@ def update_case(
     status: str | None = None,
     owner_operator_id: int | None = None,
     operator_id: int | None = None,
+    community_id: int,
 ) -> None:
     """Update case workflow state and append an immutable activity record."""
-    row = connection.execute("SELECT * FROM investigation_cases WHERE id=?", (case_id,)).fetchone()
+    row = connection.execute(
+        "SELECT * FROM investigation_cases WHERE id=? AND community_id=?",
+        (case_id, community_id),
+    ).fetchone()
     if row is None:
         raise ValueError("case not found")
     normalized_priority = (priority or str(row["priority"])).strip().casefold()
@@ -370,9 +533,18 @@ def update_case(
 
 
 def add_case_entity(connection: sqlite3.Connection, case_id: int, user_id: int, *,
-                    role: str = "subject", operator_id: int | None = None) -> None:
-    _require_case(connection, case_id)
-    if connection.execute("SELECT 1 FROM users WHERE id=?", (user_id,)).fetchone() is None:
+                    community_id: int, role: str = "subject",
+                    operator_id: int | None = None) -> None:
+    _require_case(connection, case_id, community_id=community_id)
+    if connection.execute(
+        """SELECT 1 FROM users WHERE id=? AND (
+               EXISTS (SELECT 1 FROM messages WHERE messages.user_id=users.id AND messages.community_id=?)
+               OR EXISTS (SELECT 1 FROM intelligence_alerts
+                          WHERE intelligence_alerts.user_id=users.id
+                            AND intelligence_alerts.community_id=?)
+           )""",
+        (user_id, community_id, community_id),
+    ).fetchone() is None:
         raise ValueError("user not found")
     normalized_role = role.strip().casefold() or "subject"
     connection.execute(
@@ -386,12 +558,25 @@ def add_case_entity(connection: sqlite3.Connection, case_id: int, user_id: int, 
 
 
 def add_case_evidence(connection: sqlite3.Connection, case_id: int, *,
+                      community_id: int,
                       observation_id: int | None = None, message_id: int | None = None,
                       alert_id: int | None = None, signal_history_id: int | None = None,
                       note: str = "", operator_id: int | None = None) -> int:
-    _require_case(connection, case_id)
+    _require_case(connection, case_id, community_id=community_id)
     if all(value is None for value in (observation_id, message_id, alert_id, signal_history_id)):
         raise ValueError("case evidence requires an evidence reference")
+    if observation_id is not None and connection.execute(
+        "SELECT 1 FROM observations WHERE id=? AND community_id=?", (observation_id, community_id)
+    ).fetchone() is None:
+        raise ValueError("observation not found")
+    if message_id is not None and connection.execute(
+        "SELECT 1 FROM messages WHERE id=? AND community_id=?", (message_id, community_id)
+    ).fetchone() is None:
+        raise ValueError("message not found")
+    if alert_id is not None and connection.execute(
+        "SELECT 1 FROM intelligence_alerts WHERE id=? AND community_id=?", (alert_id, community_id)
+    ).fetchone() is None:
+        raise ValueError("alert not found")
     cursor = connection.execute(
         """INSERT INTO case_evidence(case_id,observation_id,message_id,signal_history_id,alert_id,note)
            VALUES (?,?,?,?,?,?)""",
@@ -406,8 +591,8 @@ def add_case_evidence(connection: sqlite3.Connection, case_id: int, *,
 
 
 def add_case_note(connection: sqlite3.Connection, case_id: int, body: str, *,
-                  operator_id: int | None = None) -> int:
-    _require_case(connection, case_id)
+                  community_id: int, operator_id: int | None = None) -> int:
+    _require_case(connection, case_id, community_id=community_id)
     cleaned = body.strip()
     if not cleaned:
         raise ValueError("case note must not be empty")
@@ -415,8 +600,10 @@ def add_case_note(connection: sqlite3.Connection, case_id: int, body: str, *,
 
 
 def update_alert_workflow(connection: sqlite3.Connection, alert_id: int, *,
+                          community_id: int,
                           status: str | None = None, assigned_operator_id: int | None = None,
-                          suppress_until: str | None = None, operator_id: int | None = None) -> None:
+                          suppress_until: str | None = None,
+                          operator_id: int | None = None) -> None:
     normalized = status.strip().casefold() if status else None
     if normalized not in {None, "open", "acknowledged", "in_case", "resolved", "suppressed"}:
         raise ValueError("invalid alert status")
@@ -425,8 +612,8 @@ def update_alert_workflow(connection: sqlite3.Connection, alert_id: int, *,
            assigned_operator_id=COALESCE(?,assigned_operator_id),
            acknowledged_at=CASE WHEN ?='acknowledged' THEN COALESCE(acknowledged_at,CURRENT_TIMESTAMP) ELSE acknowledged_at END,
            suppressed_until=CASE WHEN ?='suppressed' THEN ? ELSE suppressed_until END,
-           updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-        (normalized, assigned_operator_id, normalized, normalized, suppress_until, alert_id),
+              updated_at=CURRENT_TIMESTAMP WHERE id=? AND community_id=?""",
+          (normalized, assigned_operator_id, normalized, normalized, suppress_until, alert_id, community_id),
     )
     if cursor.rowcount != 1:
         raise ValueError("alert not found")
@@ -439,8 +626,13 @@ def update_alert_workflow(connection: sqlite3.Connection, alert_id: int, *,
     )
 
 
-def _require_case(connection: sqlite3.Connection, case_id: int) -> None:
-    if connection.execute("SELECT 1 FROM investigation_cases WHERE id=?", (case_id,)).fetchone() is None:
+def _require_case(
+    connection: sqlite3.Connection, case_id: int, *, community_id: int
+) -> None:
+    if connection.execute(
+        "SELECT 1 FROM investigation_cases WHERE id=? AND community_id=?",
+        (case_id, community_id),
+    ).fetchone() is None:
         raise ValueError("case not found")
 
 
@@ -455,19 +647,25 @@ def _record_case_activity(connection: sqlite3.Connection, case_id: int, operator
     return int(cursor.lastrowid)
 
 
-def dispose_alert(connection: sqlite3.Connection, alert_id: int, disposition: str, *, operator_id: int | None = None) -> None:
+def dispose_alert(
+    connection: sqlite3.Connection, alert_id: int, disposition: str, *, community_id: int,
+    operator_id: int | None = None,
+) -> None:
     normalized = disposition.strip().casefold()
     if normalized not in {"confirmed", "benign", "unresolved", "escalated"}:
         raise ValueError("invalid disposition")
-    alert = connection.execute("SELECT user_id FROM intelligence_alerts WHERE id = ?", (alert_id,)).fetchone()
+    alert = connection.execute(
+        "SELECT user_id FROM intelligence_alerts WHERE id=? AND community_id=?",
+        (alert_id, community_id),
+    ).fetchone()
     cursor = connection.execute(
         """
         UPDATE intelligence_alerts
         SET status='resolved', disposition=?, assigned_operator_id=?,
             resolved_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-        WHERE id=?
+        WHERE id=? AND community_id=?
         """,
-        (normalized, operator_id, alert_id),
+        (normalized, operator_id, alert_id, community_id),
     )
     if cursor.rowcount != 1:
         raise ValueError("alert not found")
@@ -489,23 +687,73 @@ def dispose_alert(connection: sqlite3.Connection, alert_id: int, disposition: st
         calculate_social_score(connection, int(alert[0]))
 
 
-def generate_intelligence_report(connection: sqlite3.Connection, *, user_id: int | None = None, report_type: str = "entity_profile") -> int:
+def generate_intelligence_report(
+    connection: sqlite3.Connection, *, user_id: int | None = None,
+    report_type: str = "entity_profile", community_id: int,
+) -> int:
+    tenant = TenantContext.require(community_id)
+    community_id = tenant.community_id
+    tenant_clause = " AND community_id=?"
+    tenant_params: tuple[object, ...] = (community_id,)
     if user_id is None:
         title = "Daily Intelligence Summary"
-        alerts = [dict(row) for row in connection.execute("SELECT id, severity, title, summary, user_id, created_at FROM intelligence_alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50").fetchall()]
-        cases = [dict(row) for row in connection.execute("SELECT id, title, priority, status, updated_at FROM investigation_cases WHERE status != 'closed' ORDER BY updated_at DESC LIMIT 50").fetchall()]
-        content: Mapping[str, object] = {"alerts": alerts, "cases": cases, "relationship_count": int(connection.execute("SELECT COUNT(*) FROM entity_relationships").fetchone()[0])}
+        alerts = [dict(row) for row in connection.execute(
+            "SELECT id,severity,title,summary,user_id,created_at FROM intelligence_alerts "
+            "WHERE status='open'" + tenant_clause + " ORDER BY created_at DESC LIMIT 50",
+            tenant_params,
+        ).fetchall()]
+        cases = [dict(row) for row in connection.execute(
+            "SELECT id,title,priority,status,updated_at FROM investigation_cases "
+            "WHERE status!='closed'" + tenant_clause + " ORDER BY updated_at DESC LIMIT 50",
+            tenant_params,
+        ).fetchall()]
+        relationship_count = int(connection.execute(
+            "SELECT COUNT(*) FROM entity_relationships WHERE community_id=?",
+            tenant_params,
+        ).fetchone()[0])
+        content: Mapping[str, object] = {
+            "alerts": alerts, "cases": cases, "relationship_count": relationship_count,
+        }
         summary = f"{len(alerts)} untriaged alerts, {len(cases)} open cases, {content['relationship_count']} relationships."
         evidence = [{"alert_id": item["id"]} for item in alerts]
     else:
-        user = connection.execute("SELECT primary_display_name, current_reputation_score FROM users WHERE id = ?", (user_id,)).fetchone()
+        user = connection.execute(
+            """SELECT primary_display_name,current_reputation_score FROM users WHERE id=?
+               AND (? IS NULL OR EXISTS (
+                   SELECT 1 FROM messages WHERE messages.user_id=users.id AND messages.community_id=?
+               ) OR EXISTS (
+                   SELECT 1 FROM intelligence_alerts
+                   WHERE intelligence_alerts.user_id=users.id AND intelligence_alerts.community_id=?
+               ))""",
+            (user_id, community_id, community_id, community_id),
+        ).fetchone()
         if user is None:
             raise ValueError("user not found")
         title = f"Entity Profile: {user[0]}"
-        signals = [dict(row) for row in connection.execute("SELECT signal_key, window_name, value_real, confidence, evidence_count, calculated_at FROM derived_signal_windows WHERE user_id = ? ORDER BY signal_key, window_name", (user_id,)).fetchall()]
-        relationships = [dict(row) for row in connection.execute("SELECT relationship_type, source_user_id, target_user_id, context_key, strength, evidence_count, last_observed_at FROM entity_relationships WHERE source_user_id = ? OR target_user_id = ? ORDER BY strength DESC LIMIT 50", (user_id, user_id)).fetchall()]
-        alerts = [dict(row) for row in connection.execute("SELECT id, severity, title, summary, status, created_at FROM intelligence_alerts WHERE user_id = ? ORDER BY created_at DESC LIMIT 50", (user_id,)).fetchall()]
-        score = get_current_social_score(connection, user_id)
+        signals_table = (
+            "derived_signal_windows" if community_id is None
+            else "community_derived_signal_windows"
+        )
+        signal_scope = "" if community_id is None else " AND community_id=?"
+        signals = [dict(row) for row in connection.execute(
+            f"""SELECT signal_key,window_name,value_real,confidence,evidence_count,calculated_at
+                FROM {signals_table} WHERE user_id=?{signal_scope}
+                ORDER BY signal_key,window_name""",
+            (user_id,) if community_id is None else (user_id, community_id),
+        ).fetchall()]
+        relationships = [dict(row) for row in connection.execute(
+            """SELECT relationship_type,source_user_id,target_user_id,context_key,
+                      strength,evidence_count,last_observed_at FROM entity_relationships
+               WHERE (source_user_id=? OR target_user_id=?)""" + tenant_clause
+            + " ORDER BY strength DESC LIMIT 50",
+            (user_id, user_id, *tenant_params),
+        ).fetchall()]
+        alerts = [dict(row) for row in connection.execute(
+            "SELECT id,severity,title,summary,status,created_at FROM intelligence_alerts "
+            "WHERE user_id=?" + tenant_clause + " ORDER BY created_at DESC LIMIT 50",
+            (user_id, *tenant_params),
+        ).fetchall()]
+        score = None
         content = {
             "user_id": user_id,
             "display_name": str(user[0]),
@@ -519,11 +767,12 @@ def generate_intelligence_report(connection: sqlite3.Connection, *, user_id: int
     cursor = connection.execute(
         """
         INSERT INTO intelligence_reports (
-            report_type, subject_user_id, title, summary, content_json,
+            community_id, report_type, subject_user_id, title, summary, content_json,
             evidence_json, generator_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (report_type, user_id, title, summary, json.dumps(content, sort_keys=True), json.dumps(evidence, sort_keys=True), REPORT_GENERATOR_VERSION),
+        (community_id, report_type, user_id, title, summary, json.dumps(content, sort_keys=True),
+         json.dumps(evidence, sort_keys=True), REPORT_GENERATOR_VERSION),
     )
     report_id = int(cursor.lastrowid)
     connection.execute(
@@ -533,25 +782,43 @@ def generate_intelligence_report(connection: sqlite3.Connection, *, user_id: int
     return report_id
 
 
-def intelligence_summary(connection: sqlite3.Connection) -> IntelligenceSummary:
+def intelligence_summary(
+    connection: sqlite3.Connection, *, tenant: TenantContext
+) -> IntelligenceSummary:
+    params = (tenant.community_id,)
     return IntelligenceSummary(
-        open_alerts=int(connection.execute("SELECT COUNT(*) FROM intelligence_alerts WHERE status = 'open'").fetchone()[0]),
-        open_cases=int(connection.execute("SELECT COUNT(*) FROM investigation_cases WHERE status != 'closed'").fetchone()[0]),
-        relationships=int(connection.execute("SELECT COUNT(*) FROM entity_relationships").fetchone()[0]),
-        reports=int(connection.execute("SELECT COUNT(*) FROM intelligence_reports").fetchone()[0]),
+        open_alerts=int(connection.execute(
+            "SELECT COUNT(*) FROM intelligence_alerts WHERE status='open' AND community_id=?", params
+        ).fetchone()[0]),
+        open_cases=int(connection.execute(
+            "SELECT COUNT(*) FROM investigation_cases WHERE status!='closed' AND community_id=?", params
+        ).fetchone()[0]),
+        relationships=int(connection.execute(
+            "SELECT COUNT(*) FROM entity_relationships WHERE community_id=?", params,
+        ).fetchone()[0]),
+        reports=int(connection.execute(
+            "SELECT COUNT(*) FROM intelligence_reports WHERE community_id=?", params,
+        ).fetchone()[0]),
     )
 
 
-def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_at: str, duration: timedelta | None) -> dict[str, float | str | None]:
+def _calculate_window_values(
+    connection: sqlite3.Connection, user_id: int, end_at: str,
+    duration: timedelta | None, *, community_id: int,
+) -> dict[str, float | str | None]:
     cutoff = (datetime.fromisoformat(end_at).astimezone(timezone.utc) - duration).isoformat() if duration else None
     condition = "AND messages.sent_at >= ? AND messages.sent_at <= ?" if cutoff else "AND messages.sent_at <= ?"
-    bindings: tuple[object, ...] = (user_id, cutoff, end_at) if cutoff else (user_id, end_at)
+    community_condition = " AND messages.community_id=?"
+    bindings: tuple[object, ...] = (
+        (user_id, cutoff, end_at) if cutoff else (user_id, end_at)
+    ) + (community_id,)
     activity = connection.execute(
         f"""
         SELECT COUNT(DISTINCT messages.id), MIN(messages.sent_at)
         FROM platform_accounts
         INNER JOIN messages ON messages.platform_account_id = platform_accounts.id
-        WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ? {condition}
+                WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
+                    {condition}{community_condition}
         """,
         bindings,
     ).fetchone()
@@ -566,7 +833,7 @@ def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_a
         INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
         WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
           AND reputation_events.source_type = 'message'
-          {condition}
+          {condition}{community_condition}
         """,
         bindings,
     ).fetchone()
@@ -579,7 +846,8 @@ def _calculate_window_values(connection: sqlite3.Connection, user_id: int, end_a
         FROM rule_matches
         INNER JOIN messages ON messages.id=rule_matches.message_id
         INNER JOIN platform_accounts ON platform_accounts.id=messages.platform_account_id
-        WHERE COALESCE(messages.user_id, platform_accounts.user_id)=? {condition}
+                WHERE COALESCE(messages.user_id, platform_accounts.user_id)=?
+                    {condition}{community_condition}
         """,
         bindings,
     ).fetchone()
@@ -650,14 +918,16 @@ def _trigger_evidence(
 
 
 def _upsert_relationship(connection: sqlite3.Connection, source: int, target: int, kind: str, context: str, occurred_at: str, evidence: Mapping[str, object]) -> None:
-    community_id = int(evidence.get("community_id") or 1)
     if evidence.get("observation_id") is not None:
         scope = connection.execute(
             "SELECT community_id FROM observations WHERE id=?",
             (int(evidence["observation_id"]),),
         ).fetchone()
-        if scope is not None:
-            community_id = int(scope[0] or 1)
+        if scope is None:
+            raise ValueError("relationship observation not found")
+        community_id = TenantContext.require(scope[0]).community_id
+    else:
+        community_id = TenantContext.require(evidence.get("community_id")).community_id
     connection.execute(
         """
         INSERT INTO entity_relationships (

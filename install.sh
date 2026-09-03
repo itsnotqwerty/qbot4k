@@ -75,8 +75,7 @@ done
 [ "$(id -u)" -eq 0 ] || fail "run as root (for example: sudo ./install.sh)"
 [ -d "$SOURCE_DIR/src" ] || fail "src/ was not found beside install.sh"
 [ -f "$SOURCE_DIR/requirements.txt" ] || fail "requirements.txt was not found beside install.sh"
-[ -f "$SOURCE_DIR/deploy/qbot4k.service" ] || fail "deploy/qbot4k.service is missing"
-[ -f "$SOURCE_DIR/deploy/zz-qbot4k-installer.conf" ] || fail "deployment override is missing"
+[ -f "$SOURCE_DIR/deploy/systemd.service.template" ] || fail "systemd service template is missing"
 command -v systemctl >/dev/null 2>&1 || fail "systemctl is required"
 command -v useradd >/dev/null 2>&1 || fail "useradd is required"
 command -v groupadd >/dev/null 2>&1 || fail "groupadd is required"
@@ -126,8 +125,8 @@ install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
     "$COMPAT_DATA_DIR" "$STATE_DIR" "$STATE_DATA_DIR" "$BACKUP_DIR"
 install -d -m 0750 -o root -g "$SERVICE_GROUP" "$CONFIG_DIR"
 chown -R "$SERVICE_USER:$SERVICE_GROUP" \
-    "$COMPAT_DATA_DIR" "$STATE_DIR" "$BACKUP_DIR"
-
+    "$COMPAT_DATA_DIR" "$STATE_DIR" "$BACKUP_DIR" "$CONFIG_DIR"
+-
 RELEASE_DIR=$(mktemp -d "${RELEASE_ROOT}/release.XXXXXXXX")
 install -d -m 0755 "$RELEASE_DIR/src" "$RELEASE_DIR/docs" "$RELEASE_DIR/deploy"
 cp -a "$SOURCE_DIR/src/." "$RELEASE_DIR/src/"
@@ -171,11 +170,14 @@ QBOT_DISCORD_OAUTH_CLIENT_ID=
 QBOT_DISCORD_OAUTH_CLIENT_SECRET=
 QBOT_DISCORD_OAUTH_REDIRECT_URI=
 QBOT_OPERATOR_GUILD_IDS=
+QBOT_LEGAL_ORGANIZATION_NAME=
+QBOT_LEGAL_CONTACT_EMAIL=
+QBOT_LEGAL_JURISDICTION=
+QBOT_LEGAL_EFFECTIVE_DATE=
 
 # Optional collection services and credentials.
 QBOT_DISCORD_BOT_TOKEN=
 QBOT_DISCORD_GUILD_IDS=
-QBOT_DISCORD_ALLOW_BOT_MESSAGES=false
 QBOT_TWITCH_BOT_TOKEN=
 QBOT_TWITCH_REFRESH_TOKEN=
 QBOT_TWITCH_CLIENT_ID=
@@ -185,20 +187,22 @@ QBOT_TWITCH_EVENTSUB_SECRET=
 QBOT_TWITCH_EVENTSUB_CALLBACK_URL=
 
 # Safety and scheduling.
-QBOT_MODERATION_SHADOW_MODE=true
 QBOT_MAINTENANCE_INTERVAL_SECONDS=60
 QBOT_ANALYTICS_INTERVAL_SECONDS=300
 QBOT_BACKUP_INTERVAL_SECONDS=3600
 QBOT_BACKUP_RETENTION_COUNT=48
-QBOT_MESSAGE_RETENTION_DAYS=30
 QBOT_AUDIT_RETENTION_DAYS=90
 EOF
-    chown root:"$SERVICE_GROUP" "$CONFIG_FILE"
+    chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
     chmod 0640 "$CONFIG_FILE"
     printf 'Created %s with generated secrets and a non-web initial profile.\n' "$CONFIG_FILE"
 else
     printf 'Preserved existing configuration: %s\n' "$CONFIG_FILE"
 fi
+
+# Keep runtime token rotation functional across upgrades.
+chown "$SERVICE_USER:$SERVICE_GROUP" "$CONFIG_FILE"
+chmod 0640 "$CONFIG_FILE"
 
 run_as_service() {
     command_name=$1
@@ -226,10 +230,20 @@ ln -s "$RELEASE_DIR" "$NEXT_LINK"
 mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
 RELEASE_ACTIVATED=1
 
-install -m 0644 "$RELEASE_DIR/deploy/qbot4k.service" "$UNIT_FILE"
-install -d -m 0755 -o root -g root "$UNIT_DROPIN_DIR"
-install -m 0644 \
-    "$RELEASE_DIR/deploy/zz-qbot4k-installer.conf" "$UNIT_DROPIN_FILE"
+RENDERED_UNIT="${RELEASE_DIR}/qbot4k.service"
+sed \
+    -e 's|__DESCRIPTION__|QBot4K intelligence platform|g' \
+    -e 's|__APP_USER__|qbot4k|g' \
+    -e 's|__APP_GROUP__|qbot4k|g' \
+    -e 's|__APP_DIR__|"/opt/qbot4k/current"|g' \
+    -e 's|__CONFIG_DIR__|"/etc/qbot4k"|g' \
+    -e 's|__PORT__|8080|g' \
+    -e 's|__ENV_FILE__|"/etc/qbot4k/qbot4k.env"|g' \
+    -e 's|__PYTHON__|"/opt/qbot4k/current/.venv/bin/python"|g' \
+    "$RELEASE_DIR/deploy/systemd.service.template" >"$RENDERED_UNIT"
+install -m 0644 "$RENDERED_UNIT" "$UNIT_FILE"
+# Remove the installer-owned override used by pre-template releases.
+rm -f -- "$UNIT_DROPIN_FILE"
 if [ -d "$POLKIT_RULE_DIR" ]; then
     install -m 0644 "$RELEASE_DIR/deploy/49-qbot4k.rules" "$POLKIT_RULE_FILE"
 fi

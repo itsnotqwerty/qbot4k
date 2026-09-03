@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -14,10 +15,18 @@ from src.db import (
 	upsert_operator_account,
 	upsert_simple_command_definition,
 )
-from src.discord import DiscordConnector
+from src.discord import DiscordConnector, normalize_discord_message
 from src.commands import CommandContext, _format_command_template, build_default_command_registry, render_command_reply
-from src.twitch import TwitchConnector, TwitchConnectionError
+from src.twitch import TwitchConnector, TwitchConnectionError, normalize_twitch_message
 from tests.pipeline_support import ingest_and_analyze
+from src.intelligence.community import (
+	create_community,
+	create_organization,
+	create_workspace,
+	register_installation,
+	set_operator_permission_override,
+)
+from src.intelligence.onboarding import configure_welcome, queue_member_welcome, save_onboarding_resource
 from src.intelligence.userprofiles import create_canonical_user, link_platform_account
 
 
@@ -53,6 +62,93 @@ class DiscordCommandTests(unittest.TestCase):
 
 	def tearDown(self) -> None:
 		self.tempdir.cleanup()
+
+	def test_verify_command_enforces_tenant_self_service_gates(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			operator_id = upsert_operator_account(
+				connection, discord_user_id="operator-1", discord_username="operator", role="admin"
+			)
+			organization_id = create_organization(connection, name="Org", slug="org")
+			workspace_id = create_workspace(
+				connection, organization_id=organization_id, name="Workspace", slug="workspace"
+			)
+			community_id = create_community(
+				connection, workspace_id=workspace_id, name="Community", slug="community"
+			)
+			installation_id = register_installation(
+				connection, community_id=community_id, platform="discord",
+				external_community_id="guild-verify", display_name="Guild Verify",
+			)
+			configure_welcome(
+				connection, community_id=community_id, discord_installation_id=installation_id,
+				welcome_channel_id="welcome-1", welcome_template="Welcome {mention}", enabled=True,
+				operator_id=operator_id, self_service_verification_enabled=False,
+			)
+			queue_member_welcome(
+				connection, community_id=community_id, guild_id="guild-verify", user_id="member-1",
+				username="member", event_id="join-1", occurred_at="2026-01-01T00:00:00+00:00",
+			)
+			context = CommandContext(
+				platform="discord", database_path=self.database_path, connection=connection,
+				author_platform_user_id="member-1", author_username="member", channel_id="welcome-1",
+				guild_id="guild-verify", message_id="message-verify", content="!verify",
+				community_id=community_id,
+			)
+			registry = build_default_command_registry()
+			disabled_reply = registry.dispatch("!verify", context)
+			self.assertIn("disabled", str(render_command_reply(disabled_reply, "discord")))
+
+			configure_welcome(
+				connection, community_id=community_id, discord_installation_id=installation_id,
+				welcome_channel_id="welcome-1", welcome_template="Welcome {mention}", enabled=True,
+				operator_id=operator_id, self_service_verification_enabled=True,
+				verification_resource_enabled=True, verification_resource_url="https://example.com/start",
+			)
+			save_onboarding_resource(
+				connection, community_id=community_id, operator_id=operator_id, title="Rules",
+				resource_url="https://example.com/rules",
+				message_template="{mention}: {title} {resource_url}",
+			)
+			success_reply = registry.dispatch("!verify", context)
+			self.assertIn("Verification complete", str(render_command_reply(success_reply, "discord")))
+			member = connection.execute(
+				"SELECT status,verified_by_operator_id FROM community_onboarding_members WHERE community_id=? AND platform_user_id=?",
+				(community_id, "member-1"),
+			).fetchone()
+			self.assertEqual((member[0], member[1]), ("verified", None))
+			self.assertEqual(connection.execute(
+				"SELECT COUNT(*) FROM audit_log WHERE action_type='onboarding.member_self_verified' AND actor_id='member-1'"
+			).fetchone()[0], 1)
+			self.assertEqual(connection.execute(
+				"SELECT COUNT(*) FROM community_announcements WHERE community_id=? AND json_extract(source_json,'$.type') LIKE 'member_verification%'",
+				(community_id,),
+			).fetchone()[0], 2)
+			repeated_reply = registry.dispatch("!verify", context)
+			self.assertIn("No pending", str(render_command_reply(repeated_reply, "discord")))
+			wrong_tenant = registry.dispatch("!verify", replace(context, guild_id="other-guild"))
+			self.assertIn("No pending", str(render_command_reply(wrong_tenant, "discord")))
+			queue_member_welcome(
+				connection, community_id=community_id, guild_id="guild-verify", user_id="member-2",
+				username="member-two", event_id="join-2", occurred_at="2026-01-02T00:00:00+00:00",
+			)
+			configure_welcome(
+				connection, community_id=community_id, discord_installation_id=installation_id,
+				welcome_channel_id="welcome-1", welcome_template="Welcome {mention}", enabled=True,
+				operator_id=operator_id, self_service_verification_enabled=True,
+				verification_evidence_required=True,
+			)
+			evidence_reply = registry.dispatch(
+				"!verify", replace(context, author_platform_user_id="member-2")
+			)
+			self.assertIn("evidence is required", str(render_command_reply(evidence_reply, "discord")))
+			self.assertEqual(connection.execute(
+				"SELECT status FROM community_onboarding_members WHERE community_id=? AND platform_user_id=?",
+				(community_id, "member-2"),
+			).fetchone()[0], "newcomer")
+		finally:
+			connection.close()
 
 	def test_credit_command_renders_profile_embed(self) -> None:
 		connection = connect_database(self.database_path)
@@ -173,6 +269,47 @@ class DiscordCommandTests(unittest.TestCase):
 		payload = json.loads(captured_request.data.decode("utf-8"))
 		self.assertEqual(payload["embeds"][0]["title"], "Social Credit Profile")
 		self.assertEqual(payload["embeds"][0]["fields"][0]["name"], "Social Credit")
+
+	def test_connector_command_dispatch_propagates_installation_tenant(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			organization_id = create_organization(connection, name="Commands", slug="commands")
+			workspace_id = create_workspace(
+				connection, organization_id=organization_id, name="Commands", slug="commands"
+			)
+			community_id = create_community(
+				connection, workspace_id=workspace_id, name="Second", slug="second"
+			)
+			register_installation(
+				connection, community_id=community_id, platform="discord",
+				external_community_id="guild-second", display_name="Guild Second",
+			)
+			register_installation(
+				connection, community_id=community_id, platform="twitch",
+				external_community_id="channel-second", display_name="Channel Second",
+			)
+			registry = mock.Mock(wraps=build_default_command_registry())
+			registry.dispatch.return_value = None
+			DiscordConnector(
+				self.database_path, bot_token="token", command_registry=registry
+			)._dispatch_registered_command(connection, normalize_discord_message({
+				"id": "discord-command", "timestamp": "2026-08-06T05:00:00Z",
+				"channel_id": "channel-1", "guild_id": "guild-second", "content": "!credit",
+				"author": {"id": "member-1", "username": "member"},
+			}))
+			TwitchConnector(
+				self.database_path, command_registry=registry
+			)._dispatch_registered_command(connection, normalize_twitch_message({
+				"message_id": "twitch-command", "timestamp": "2026-08-06T05:00:00Z",
+				"channel": "channel-second", "content": "!credit",
+				"user_id": "member-1", "username": "member",
+			}))
+		finally:
+			connection.close()
+
+		contexts = [call.args[1] for call in registry.dispatch.call_args_list]
+		self.assertEqual([context.community_id for context in contexts], [community_id, community_id])
 
 	def test_twitch_connector_sends_plaintext_credit_response(self) -> None:
 		captured_messages: list[str] = []
@@ -878,6 +1015,7 @@ class DiscordCommandTests(unittest.TestCase):
 				guild_id=None,
 				message_id="message-3",
 				content="!addcom !website https://gatewaycorporate.org/",
+				community_id=1,
 			)
 			reply = registry.dispatch("!addcom !website https://gatewaycorporate.org/", context)
 			added_reply = render_command_reply(reply, "twitch")
@@ -908,6 +1046,35 @@ class DiscordCommandTests(unittest.TestCase):
 			self.assertIsNone(reply)
 		finally:
 			connection.close()
+
+	def test_command_editing_requires_tenant_scoped_capability(self) -> None:
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			operator_id = upsert_operator_account(
+				connection, discord_user_id="viewer-1", discord_username="viewer", role="viewer"
+			)
+			registry = build_default_command_registry()
+			context = CommandContext(
+				platform="discord", database_path=self.database_path, connection=connection,
+				author_platform_user_id="viewer-1", author_username="viewer",
+				channel_id="channel-1", guild_id="guild-1", message_id="message-1",
+				content="!addcom !status ready", community_id=1,
+			)
+
+			denied = registry.dispatch(context.content, context)
+			missing_tenant = registry.dispatch(context.content, replace(context, community_id=None))
+			set_operator_permission_override(
+				connection, operator_id=operator_id, community_id=1,
+				permission="settings.manage", decision="grant", actor_operator_id=operator_id,
+			)
+			allowed = registry.dispatch(context.content, context)
+		finally:
+			connection.close()
+
+		self.assertIn("restricted", str(render_command_reply(denied, "discord")))
+		self.assertIn("restricted", str(render_command_reply(missing_tenant, "discord")))
+		self.assertIn("Added !status", str(render_command_reply(allowed, "discord")))
 
 	def test_alias_command_duplicates_existing_simple_command(self) -> None:
 		connection = connect_database(self.database_path)
@@ -964,6 +1131,7 @@ class DiscordCommandTests(unittest.TestCase):
 				guild_id=None,
 				message_id="message-alias-1",
 				content="!alias !site !website",
+				community_id=1,
 			)
 
 			reply = registry.dispatch("!alias !site !website", context)
@@ -1027,6 +1195,7 @@ class DiscordCommandTests(unittest.TestCase):
 				guild_id=None,
 				message_id="message-alias-2",
 				content="!alias !site !missing",
+				community_id=1,
 			)
 
 			reply = registry.dispatch("!alias !site !missing", context)

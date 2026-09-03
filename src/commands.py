@@ -12,6 +12,7 @@ from urllib.parse import quote_plus
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from .contexts import TenantContext
 from .db import (
 	delete_simple_command_definition,
 	get_command_definition,
@@ -19,10 +20,13 @@ from .db import (
 	get_simple_command_definition,
 	upsert_simple_command_definition,
 )
+from .intelligence.community import operator_has_permission
 from .intelligence.userprofiles import get_canonical_user_profile_for_platform_account
+from .intelligence.onboarding import self_verify_onboarding_member
+from .surface_policy import require_non_http_surface
 
 
-RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom", "alias"}
+RESERVED_COMMAND_NAMES = {"addcom", "delcom", "editcom", "alias", "verify"}
 _HTTP_TEMPLATE_CALL_PATTERN = re.compile(
 	r"\{(GET|POST|PUT|DELETE)\}\((https?://[^\s)]+)\)(?:\[([^\]]+)\])?",
 	re.IGNORECASE,
@@ -47,6 +51,7 @@ class CommandContext:
 	guild_id: str | None
 	message_id: str | None
 	content: str
+	community_id: int | None = None
 	command_name: str = ""
 	command_args: tuple[str, ...] = ()
 
@@ -109,6 +114,23 @@ def build_default_command_registry() -> CommandRegistry:
 	return CommandRegistry()
 
 
+def require_command_surface(context: CommandContext, command_name: str) -> None:
+	TenantContext.require(context.community_id)
+	normalized_name = command_name.strip().casefold()
+	surface = f"command:{normalized_name}" if normalized_name in RESERVED_COMMAND_NAMES | {"credit"} else "command:custom"
+	guard = {
+		"addcom": "command_operator",
+		"editcom": "command_operator",
+		"delcom": "command_operator",
+		"alias": "command_operator",
+		"verify": "platform_identity",
+		"credit": "installation_context",
+	}.get(normalized_name, "installation_context")
+	require_non_http_surface(surface, guard=guard)
+	if guard == "platform_identity" and not context.author_platform_user_id.strip():
+		raise PermissionError("platform identity is required")
+
+
 def render_command_reply(reply: CommandReply, platform: str) -> dict[str, object] | str:
 	platform_name = platform.casefold().strip()
 	if platform_name == "discord":
@@ -132,6 +154,8 @@ def _resolve_command_reply(context: CommandContext) -> CommandReply | None:
 		return _alias_command(context)
 	if command_name == "credit":
 		return _credit_command(context)
+	if command_name == "verify":
+		return _verify_command(context)
 	simple_definition = get_simple_command_definition(context.connection, command_name)
 	if simple_definition is None or not bool(simple_definition["enabled"]):
 		return None
@@ -304,8 +328,24 @@ def _normalize_custom_command_name(raw_name: str) -> str:
 
 
 def _can_edit_commands(context: CommandContext) -> bool:
+	try:
+		community_id = TenantContext.require(context.community_id).community_id
+	except (TypeError, ValueError):
+		return False
+	try:
+		policy = require_non_http_surface(
+			f"command:{context.command_name}", guard="command_operator"
+		)
+	except (PermissionError, ValueError):
+		return False
 	if context.platform == "discord":
-		return get_operator_account_by_discord_user_id(context.connection, context.author_platform_user_id) is not None
+		operator = get_operator_account_by_discord_user_id(
+			context.connection, context.author_platform_user_id
+		)
+		return operator is not None and operator_has_permission(
+			context.connection, operator_id=int(operator[0]), community_id=community_id,
+			permission=policy.capability,
+		)
 	profile = get_canonical_user_profile_for_platform_account(
 		context.connection,
 		platform=context.platform,
@@ -313,15 +353,47 @@ def _can_edit_commands(context: CommandContext) -> bool:
 	)
 	if profile is None:
 		return False
-	operator_ids = {
-		str(row[0])
-		for row in context.connection.execute("SELECT discord_user_id FROM operator_accounts").fetchall()
+	operators = {
+		str(row[1]): int(row[0])
+		for row in context.connection.execute(
+			"SELECT id,discord_user_id FROM operator_accounts"
+		).fetchall()
 	}
-	if not operator_ids:
+	if not operators:
 		return False
-	return any(
-		account.platform == "discord" and account.platform_user_id in operator_ids
+	operator_ids = {
+		operators[account.platform_user_id]
 		for account in profile.linked_accounts
+		if account.platform == "discord" and account.platform_user_id in operators
+	}
+	return any(
+		operator_has_permission(
+			context.connection, operator_id=operator_id, community_id=community_id,
+			permission=policy.capability,
+		)
+		for operator_id in operator_ids
+	)
+
+
+def _verify_command(context: CommandContext) -> CommandReply:
+	if context.platform != "discord" or not context.guild_id:
+		return _command_result_reply(
+			"!verify", "Self-service verification is available in Discord servers only."
+		)
+	try:
+		community_id = TenantContext.require(context.community_id).community_id
+		self_verify_onboarding_member(
+			context.connection, community_id=community_id,
+			platform_user_id=context.author_platform_user_id,
+		)
+	except LookupError:
+		return _command_result_reply(
+			"!verify", "No pending verification checkpoint was found for you."
+		)
+	except PermissionError as exc:
+		return _command_result_reply("!verify", str(exc).capitalize() + ".")
+	return _command_result_reply(
+		"!verify", "Verification complete. Welcome to the community."
 	)
 
 

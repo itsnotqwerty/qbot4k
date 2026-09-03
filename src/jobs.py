@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import logging
 import sqlite3
@@ -15,6 +16,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .config import AppSettings
+from .contexts import TenantContext
 from .db import (
 	connect_database,
 	has_twitch_live_announcement,
@@ -27,11 +29,13 @@ from .permissions import _everyone_cannot_view
 from .token_store import persist_refreshed_twitch_tokens
 from .twitch_auth import TwitchAuthError, TwitchTokenManager
 from .intelligence.signals import refresh_all_derived_signals
+from .intelligence.announcements import dispatch_due_announcements, queue_system_announcement
+from .intelligence.onboarding import dispatch_newcomer_roles, queue_due_checkpoint_reminders
 from .intelligence.scoring import SOCIAL_SCORE_MODEL_VERSION, calculate_social_score
 from .models import Observation
 from .db import collect_observation
 from .intelligence.analytics import (
-	refresh_cohort_baselines,
+	refresh_community_cohort_baselines,
 	refresh_emerging_topics,
 	refresh_graph_analytics,
 	refresh_identity_suggestions,
@@ -40,6 +44,7 @@ from .intelligence.analytics import (
 )
 from .pipeline.handlers import recover_expired_processing_jobs
 from .intelligence.recovery import flush_raw_event_archive
+from .surface_policy import require_non_http_surface
 from .intelligence.professional_ops import (
     dispatch_pending_notifications,
     refresh_stream_cohorts,
@@ -105,6 +110,7 @@ def run_maintenance_jobs(
 	perform_analytics: bool = True,
 	perform_backup: bool = True,
 ) -> MaintenanceReport:
+	require_non_http_surface("job:maintenance", guard="system")
 	current_time = now or datetime.now(UTC)
 	connection = connection_factory(settings.database_path)
 	try:
@@ -118,12 +124,26 @@ def run_maintenance_jobs(
 		if perform_maintenance:
 			recover_expired_processing_jobs(connection)
 			raw_events_archived = flush_raw_event_archive(connection, settings.raw_archive_dir)
-			deleted_messages = purge_expired_messages(connection, current_time, settings.message_retention_days)
-			deleted_observations = purge_expired_observations(connection, current_time, settings.message_retention_days)
+			retention_policies = connection.execute(
+				"""SELECT community_id,message_retention_days
+				   FROM community_policy_settings ORDER BY community_id"""
+			).fetchall()
+			deleted_messages = sum(
+				purge_expired_messages(
+					connection, current_time, int(policy[1]), community_id=int(policy[0])
+				)
+				for policy in retention_policies
+			)
+			deleted_observations = sum(
+				purge_expired_observations(
+					connection, current_time, int(policy[1]), community_id=int(policy[0])
+				)
+				for policy in retention_policies
+			)
 			deleted_audit_rows = purge_expired_audit_log(connection, current_time, settings.audit_retention_days)
-			deleted_score_runs = purge_expired_score_runs(connection, current_time, settings.message_retention_days)
-			deleted_signal_runs = purge_expired_signal_runs(connection, current_time, settings.message_retention_days)
-			deleted_processing_jobs = purge_expired_processing_jobs(connection, current_time, settings.message_retention_days)
+			deleted_score_runs = purge_expired_score_runs(connection, current_time, settings.audit_retention_days)
+			deleted_signal_runs = purge_expired_signal_runs(connection, current_time, settings.audit_retention_days)
+			deleted_processing_jobs = purge_expired_processing_jobs(connection, current_time, settings.audit_retention_days)
 			rollup_rows = refresh_metrics_rollups(connection, current_time)
 		if perform_analytics:
 			refresh_all_derived_signals(connection)
@@ -137,13 +157,54 @@ def run_maintenance_jobs(
 					"SELECT id FROM stream_sessions WHERE status='live'"
 				).fetchall():
 					refresh_stream_cohorts(connection, int(active_session[0]))
-				topic_count = refresh_emerging_topics(connection, now=current_time)
-				graph_node_count = refresh_graph_analytics(connection, calculated_at=current_time.isoformat())
-				identity_suggestion_count = refresh_identity_suggestions(connection)
-				cohort_baseline_count, _ = refresh_cohort_baselines(connection, calculated_at=current_time.isoformat())
+				topic_count = sum(
+					refresh_emerging_topics(
+						connection, now=current_time, community_id=int(community[0])
+					)
+					for community in connection.execute(
+						"SELECT id FROM communities ORDER BY id"
+					).fetchall()
+				)
+				graph_node_count = sum(
+					refresh_graph_analytics(
+						connection, calculated_at=current_time.isoformat(),
+						community_id=int(community[0]),
+					)
+					for community in connection.execute(
+						"SELECT id FROM communities ORDER BY id"
+					).fetchall()
+				)
+				identity_suggestion_count = sum(
+					refresh_identity_suggestions(
+						connection, community_id=int(community[0])
+					)
+					for community in connection.execute(
+						"SELECT id FROM communities ORDER BY id"
+					).fetchall()
+				)
+				cohort_baseline_count = sum(
+					refresh_community_cohort_baselines(
+						connection, community_id=int(community[0]),
+						calculated_at=current_time.isoformat(),
+					)[0]
+					for community in connection.execute(
+						"SELECT id FROM communities ORDER BY id"
+					).fetchall()
+				)
 				evaluation_run_id = run_model_evaluation(connection)
-				emit_analytics_alerts(connection, calculated_at=current_time.isoformat())
-			dispatch_pending_notifications(connection)
+				for community in connection.execute(
+					"SELECT id FROM communities WHERE status='active' ORDER BY id"
+				).fetchall():
+					emit_analytics_alerts(
+						connection, community_id=int(community[0]),
+						calculated_at=current_time.isoformat(),
+					)
+			for community in connection.execute(
+				"SELECT id FROM communities WHERE status='active' ORDER BY id"
+			).fetchall():
+				dispatch_pending_notifications(
+					connection, tenant=TenantContext(int(community[0]))
+				)
 			record_operational_metric(connection, "analytics.refresh.success", 1.0, observed_at=current_time.isoformat())
 		if perform_maintenance:
 			record_operational_metric(connection, "maintenance.success", 1.0, observed_at=current_time.isoformat())
@@ -185,7 +246,11 @@ def run_maintenance_jobs(
 	)
 
 
-def run_twitch_live_announcement_job(settings: AppSettings) -> int:
+def run_twitch_live_announcement_job(
+	settings: AppSettings,
+	twitch_token_manager: TwitchTokenManager | None = None,
+) -> int:
+	require_non_http_surface("job:twitch_live_announcements", guard="system")
 	if not settings.discord_bot_token or not settings.twitch_bot_token:
 		JOBS_LOGGER.warning(
 			"skipping twitch live announcements: missing bot token discord=%s twitch=%s",
@@ -194,23 +259,148 @@ def run_twitch_live_announcement_job(settings: AppSettings) -> int:
 		)
 		return 0
 
-	guild_ids = _resolve_target_discord_guild_ids(settings.discord_bot_token, settings.discord_guild_ids)
-	if not guild_ids:
-		JOBS_LOGGER.warning("skipping twitch live announcements: no connected Discord guilds discovered")
-		return 0
-
-	twitch_token_manager = _build_twitch_token_manager(settings)
-	announcements_sent = 0
-	for twitch_channel_name in settings.twitch_channels:
-		stream = _fetch_twitch_live_stream(twitch_channel_name, twitch_token_manager)
-		_record_twitch_stream_lifecycle(settings.database_path, twitch_channel_name, stream)
-		if stream is None:
-			JOBS_LOGGER.info("no active twitch stream detected for channel=%s", twitch_channel_name)
-			continue
-		announcements_sent += _announce_stream_to_guilds(
-			settings, guild_ids, twitch_channel_name, stream, deduplicate=True
+	twitch_token_manager = twitch_token_manager or _build_twitch_token_manager(settings)
+	tenant_targets = _tenant_live_announcement_targets(settings.database_path)
+	if not tenant_targets:
+		JOBS_LOGGER.warning(
+			"skipping twitch live announcements: no active paired tenant installations"
 		)
-	return announcements_sent
+		return 0
+	return _run_tenant_twitch_live_announcements(
+		settings, twitch_token_manager, tenant_targets
+	)
+
+
+def _tenant_live_announcement_targets(database_path: Path) -> list[sqlite3.Row]:
+	connection = connect_database(database_path)
+	try:
+		initialize_database(connection)
+		return list(connection.execute(
+			"""SELECT t.community_id,t.id AS twitch_installation_id,
+			          json_extract(t.metadata_json,'$.channel_login') AS channel_login,
+			          d.id AS discord_installation_id,d.external_community_id AS discord_guild_id
+			   FROM community_installations t
+			   JOIN community_installations d
+			     ON d.community_id=t.community_id AND d.platform='discord' AND d.status='active'
+			   WHERE t.platform='twitch' AND t.status='active'
+			     AND TRIM(COALESCE(json_extract(t.metadata_json,'$.channel_login'),''))<>''
+			   ORDER BY t.community_id,t.id,d.id"""
+		).fetchall())
+	finally:
+		connection.close()
+
+
+def _run_tenant_twitch_live_announcements(
+	settings: AppSettings,
+	token_manager: TwitchTokenManager,
+	targets: list[sqlite3.Row],
+) -> int:
+	stream_cache: dict[tuple[int, int], TwitchLiveStream | None] = {}
+	connection = connect_database(settings.database_path)
+	try:
+		initialize_database(connection)
+		for target in targets:
+			community_id = int(target["community_id"])
+			twitch_installation_id = int(target["twitch_installation_id"])
+			channel_login = str(target["channel_login"])
+			cache_key = (community_id, twitch_installation_id)
+			if cache_key not in stream_cache:
+				stream_cache[cache_key] = _fetch_twitch_live_stream(channel_login, token_manager)
+				_record_twitch_stream_lifecycle(
+					settings.database_path, channel_login, stream_cache[cache_key],
+					community_id=community_id,
+				)
+			stream = stream_cache[cache_key]
+			if stream is None:
+				continue
+			guild_id = str(target["discord_guild_id"])
+			guild_channels = _fetch_discord_guild_channels(guild_id, settings.discord_bot_token)
+			target_channel_id = _pick_best_discord_channel_for_stream(
+				guild_channels, stream.title, stream.game_name, guild_id=guild_id
+			)
+			if not target_channel_id:
+				continue
+			for channel in guild_channels:
+				upsert_discord_channel(
+					connection, guild_id=guild_id,
+					channel_id=str(channel.get("id") or "").strip(),
+					channel_name=str(channel.get("name") or "").strip(),
+					channel_type=int(channel.get("type") or 0),
+				)
+			title_suffix = f" - {stream.title}" if stream.title else ""
+			queue_system_announcement(
+				connection, community_id=community_id,
+				target_installation_id=int(target["discord_installation_id"]),
+				target_external_id=target_channel_id,
+				body=f"@here {channel_login} is live: {stream.url}{title_suffix}",
+				dedupe_key=f"twitch-live:{twitch_installation_id}:{stream.stream_id}:{target['discord_installation_id']}",
+				source={
+					"type": "twitch_live", "stream_id": stream.stream_id,
+					"twitch_installation_id": twitch_installation_id,
+				},
+				scheduled_at=datetime.now(UTC).isoformat(),
+			)
+		return dispatch_due_announcements(
+			connection,
+			lambda platform, guild_id, channel_id, body, source: _send_scheduled_announcement(
+				settings.discord_bot_token, platform, guild_id, channel_id, body, source
+			),
+		)
+	finally:
+		connection.close()
+
+
+def run_scheduled_announcement_job(
+	settings: AppSettings,
+	*,
+	now: datetime | None = None,
+) -> int:
+	require_non_http_surface("job:scheduled_announcements", guard="system")
+	if not settings.discord_bot_token:
+		JOBS_LOGGER.warning("scheduled announcements skipped: missing Discord bot token")
+		return 0
+	connection = connect_database(settings.database_path)
+	try:
+		initialize_database(connection)
+		return dispatch_due_announcements(
+			connection,
+			lambda platform, guild_id, channel_id, body, source: _send_scheduled_announcement(
+				settings.discord_bot_token, platform, guild_id, channel_id, body, source
+			),
+			now=now,
+		)
+	finally:
+		connection.close()
+
+
+def run_onboarding_role_job(settings: AppSettings) -> int:
+	require_non_http_surface("job:onboarding_roles", guard="system")
+	if not settings.discord_bot_token:
+		JOBS_LOGGER.warning("newcomer role assignments skipped: missing Discord bot token")
+		return 0
+	connection = connect_database(settings.database_path)
+	try:
+		initialize_database(connection)
+		return dispatch_newcomer_roles(
+			connection,
+			lambda guild_id, user_id, role_id: _assign_discord_member_role(
+				settings.discord_bot_token, guild_id, user_id, role_id
+			),
+		)
+	finally:
+		connection.close()
+
+
+def run_onboarding_checkpoint_job(
+	settings: AppSettings, *, now: datetime | None = None
+) -> int:
+	require_non_http_surface("job:onboarding_checkpoints", guard="system")
+	connection = connect_database(settings.database_path)
+	try:
+		initialize_database(connection)
+		return queue_due_checkpoint_reminders(connection, now=now)
+	finally:
+		connection.close()
 
 
 def _announce_stream_to_guilds(
@@ -282,6 +472,8 @@ def _record_twitch_stream_lifecycle(
 	database_path: Path,
 	channel_name: str,
 	stream: TwitchLiveStream | None,
+	*,
+	community_id: int,
 ) -> None:
 	"""Project polling changes into the common observation/analysis pipeline."""
 	connection = connect_database(database_path)
@@ -289,9 +481,10 @@ def _record_twitch_stream_lifecycle(
 		initialize_database(connection)
 		latest = connection.execute(
 			"""SELECT event_type,external_event_id,attributes_json FROM observations
-			   WHERE platform='twitch' AND context_id=? AND event_type LIKE 'stream.%'
+			   WHERE platform='twitch' AND context_id=? AND community_id=?
+			     AND event_type LIKE 'stream.%'
 			   ORDER BY occurred_at DESC,id DESC LIMIT 1""",
-			(channel_name,),
+			(channel_name, int(community_id)),
 		).fetchone()
 		if stream is None:
 			if latest is None or str(latest[0]) == "stream.ended":
@@ -318,6 +511,7 @@ def _record_twitch_stream_lifecycle(
 			container_id=channel_name, context_id=channel_name,
 			text=stream.title if stream is not None else None,
 			occurred_at=datetime.now(UTC).isoformat(), attributes=attributes,
+			community_id=int(community_id),
 		))
 	finally:
 		connection.close()
@@ -397,17 +591,19 @@ def purge_expired_messages(
 	connection: sqlite3.Connection,
 	now: datetime,
 	retention_days: int,
+	*,
+	community_id: int,
 ) -> int:
 	cutoff = _cutoff_timestamp(now, retention_days)
 	with connection:
 		cursor = connection.execute(
-			"""DELETE FROM messages WHERE datetime(sent_at) < datetime(?)
+			"""DELETE FROM messages WHERE community_id=? AND datetime(sent_at) < datetime(?)
 			   AND NOT EXISTS (
 			       SELECT 1 FROM legal_holds
 			       WHERE legal_holds.community_id=messages.community_id
 			         AND legal_holds.status='active'
 			   )""",
-			(cutoff,),
+			(int(community_id), cutoff),
 		)
 	return int(cursor.rowcount or 0)
 
@@ -415,13 +611,15 @@ def purge_expired_observations(
 	connection: sqlite3.Connection,
 	now: datetime,
 	retention_days: int,
+	*,
+	community_id: int,
 ) -> int:
 	cutoff = _cutoff_timestamp(now, retention_days)
 
 	with connection:
 		cursor = connection.execute(
 			"""
-			DELETE FROM observations WHERE occurred_at < ?
+			DELETE FROM observations WHERE community_id=? AND occurred_at < ?
 				AND NOT EXISTS (
 					SELECT 1 FROM legal_holds
 					WHERE legal_holds.community_id=observations.community_id
@@ -433,7 +631,7 @@ def purge_expired_observations(
 					WHERE observation_id IS NOT NULL
 				)
 			""",
-			(cutoff,),
+			(int(community_id), cutoff),
 		)
 
 	return int(cursor.rowcount or 0)
@@ -579,6 +777,56 @@ def create_database_backup(
 		expired.unlink(missing_ok=True)
 		expired.with_suffix(expired.suffix + ".json").unlink(missing_ok=True)
 	return backup_path, backup_metadata_path, backup_sha256
+
+
+def restore_database_backup(
+	backup_path: Path,
+	restore_path: Path,
+	*,
+	expected_sha256: str,
+) -> dict[str, object]:
+	"""Restore a backup to a separate path and verify integrity and table counts."""
+	if backup_path.resolve() == restore_path.resolve():
+		raise ValueError("restore path must be isolated from the backup")
+	if restore_path.exists():
+		raise FileExistsError("restore path already exists")
+	actual_sha256 = _sha256sum(backup_path)
+	if not hmac.compare_digest(actual_sha256, expected_sha256.strip().casefold()):
+		raise ValueError("backup checksum mismatch")
+	restore_path.parent.mkdir(parents=True, exist_ok=True)
+	source = sqlite3.connect(backup_path)
+	destination = sqlite3.connect(restore_path)
+	try:
+		source.backup(destination)
+		integrity = destination.execute("PRAGMA integrity_check").fetchone()
+		if integrity is None or str(integrity[0]).casefold() != "ok":
+			raise sqlite3.DatabaseError("restored database integrity check failed")
+		tables = [
+			str(row[0]) for row in source.execute(
+				"""SELECT name FROM sqlite_master
+				   WHERE type='table' AND name NOT LIKE 'sqlite_%'
+				   ORDER BY name"""
+			).fetchall()
+		]
+		source_counts = {
+			table: int(source.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+			for table in tables
+		}
+		restored_counts = {
+			table: int(destination.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+			for table in tables
+		}
+		if source_counts != restored_counts:
+			raise sqlite3.DatabaseError("restored database row counts do not match backup")
+	finally:
+		destination.close()
+		source.close()
+	return {
+		"integrity": "ok",
+		"sha256": actual_sha256,
+		"table_counts": restored_counts,
+		"restore_path": str(restore_path),
+	}
 
 
 def _cutoff_timestamp(now: datetime, retention_days: int) -> str:
@@ -771,6 +1019,64 @@ def _send_discord_here_announcement(
 			"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
 		},
 		method="POST",
+	)
+	with urlopen(request, timeout=15) as response:
+		response.read()
+
+
+def _send_scheduled_announcement(
+	bot_token: str,
+	platform: str,
+	guild_id: str,
+	channel_id: str,
+	body: str,
+	source: dict[str, object],
+) -> str | None:
+	if platform != "discord":
+		raise ValueError("scheduled Twitch announcements are not configured")
+	channels = _fetch_discord_guild_channels(guild_id, bot_token)
+	if channel_id not in {str(channel.get("id") or "").strip() for channel in channels}:
+		raise ValueError("announcement channel does not belong to the active installation")
+	token = bot_token.removeprefix("Bot ").strip()
+	allowed_mentions: dict[str, object] = {"parse": []}
+	if source.get("type") == "twitch_live":
+		allowed_mentions = {"parse": ["everyone"]}
+	elif source.get("type") in {
+		"member_welcome", "onboarding_checkpoint_reminder", "member_verification_resource",
+	} and str(source.get("user_id") or "").strip():
+		allowed_mentions = {"parse": [], "users": [str(source["user_id"]).strip()]}
+	request = Request(
+		f"https://discord.com/api/v10/channels/{channel_id}/messages",
+		data=json.dumps({
+			"content": body,
+			"allowed_mentions": allowed_mentions,
+		}).encode("utf-8"),
+		headers={
+			"Authorization": f"Bot {token}",
+			"Accept": "application/json",
+			"Content-Type": "application/json",
+			"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+		},
+		method="POST",
+	)
+	with urlopen(request, timeout=15) as response:
+		payload = json.loads(response.read().decode("utf-8") or "{}")
+	return str(payload.get("id") or "").strip() or None
+
+
+def _assign_discord_member_role(
+	bot_token: str, guild_id: str, user_id: str, role_id: str
+) -> None:
+	token = bot_token.removeprefix("Bot ").strip()
+	request = Request(
+		f"https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}/roles/{role_id}",
+		data=b"",
+		headers={
+			"Authorization": f"Bot {token}",
+			"Content-Length": "0",
+			"User-Agent": "qbot4k/1.0 (+https://example.invalid/qbot4k)",
+		},
+		method="PUT",
 	)
 	with urlopen(request, timeout=15) as response:
 		response.read()

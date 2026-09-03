@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
@@ -19,17 +20,390 @@ from src.discord import (
     build_discord_message_payload,
 )
 from src.intelligence.powerusers import score_delta_for_message
+from src.intelligence.abuse import configure_anti_abuse_policy
+from src.contexts import ActorAttribution, TenantContext
+from src.intelligence.community import create_community, register_installation
+from src.intelligence.onboarding import (
+    configure_welcome,
+    dispatch_newcomer_roles,
+    queue_due_checkpoint_reminders,
+    verify_onboarding_member,
+    save_onboarding_resource,
+)
 from src.twitch import TwitchConnector, parse_twitch_irc_message
 from tests.pipeline_support import ingest_and_analyze
+
+
+def _onboarding_verification_state(connection):
+    member = connection.execute(
+        """SELECT status,role_assignment_status,role_assignment_attempts
+           FROM community_onboarding_members
+           WHERE community_id=1 AND platform_user_id='member-1'"""
+    ).fetchone()
+    resource = connection.execute(
+        """SELECT body,target_installation_id,target_external_id,dedupe_key,source_json
+           FROM community_announcements
+           WHERE community_id=1
+             AND json_extract(source_json,'$.type')='member_verification_resource'"""
+    ).fetchone()
+    return member, resource
 
 
 class IngestionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
         self.database_path = Path(self.tempdir.name) / "ingestion.sqlite3"
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            for platform, external_id in (
+                ("discord", "guild-1"),
+                ("twitch", "sam_channel"),
+                ("twitch", "its_not_qwerty"),
+                ("twitch", "somewhere_else"),
+            ):
+                register_installation(
+                    connection,
+                    community_id=1,
+                    platform=platform,
+                    external_community_id=external_id,
+                    display_name=external_id,
+                    status="active",
+                )
+        finally:
+            connection.close()
 
     def tearDown(self) -> None:
         self.tempdir.cleanup()
+
+    def test_discord_member_role_events_use_cached_role_names(self) -> None:
+        connector = DiscordConnector(self.database_path)
+        connector._cache_guild_metadata("GUILD_CREATE", {
+            "id": "role-guild", "owner_id": "owner-1",
+            "roles": [
+                {"id": "role-1", "name": "Trusted Member", "permissions": "0"},
+                {"id": "role-2", "name": "Event Moderator", "permissions": "8"},
+            ],
+        })
+        decorated = connector._decorate_member_event({
+            "guild_id": "role-guild", "roles": ["role-1", "role-2", "unknown-role"],
+            "user": {"id": "member-1", "username": "Member"},
+        })
+        self.assertEqual(
+            decorated["resolved_role_names"], ["Trusted Member", "Event Moderator"]
+        )
+
+    def test_member_welcome_automation_is_disabled_by_default_and_tenant_scoped(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            second_community_id = create_community(
+                connection, workspace_id=1, name="Second", slug="second-onboarding"
+            )
+            first_installation_id = register_installation(
+                connection, community_id=1, platform="discord",
+                external_community_id="guild-one", display_name="Guild One",
+            )
+            second_installation_id = register_installation(
+                connection, community_id=second_community_id, platform="discord",
+                external_community_id="guild-two", display_name="Guild Two",
+            )
+            with connection:
+                operator_id = int(connection.execute(
+                    """INSERT INTO operator_accounts(discord_user_id,discord_username,role)
+                       VALUES ('operator-1','sam','admin')"""
+                ).lastrowid)
+            configure_welcome(
+                connection, community_id=second_community_id,
+                discord_installation_id=second_installation_id,
+                welcome_channel_id="welcome-two",
+                welcome_template="Welcome {mention}, also known as {username}!",
+                enabled=True, operator_id=operator_id,
+            )
+        finally:
+            connection.close()
+
+        connector = DiscordConnector(self.database_path)
+        first_result = connector.ingest_event("GUILD_MEMBER_ADD", {
+            "guild_id": "guild-one", "joined_at": "2026-08-26T10:00:00+00:00",
+            "user": {"id": "user-one", "username": "One"},
+        })
+        second_payload = {
+            "guild_id": "guild-two", "joined_at": "2026-08-26T10:01:00+00:00",
+            "user": {"id": "user-two", "username": "Two"},
+        }
+        second_result = connector.ingest_event("GUILD_MEMBER_ADD", second_payload)
+        duplicate_result = connector.ingest_event("GUILD_MEMBER_ADD", second_payload)
+        for index in range(3, 23):
+            connector.ingest_event("GUILD_MEMBER_ADD", {
+                "guild_id": "guild-two", "joined_at": f"2026-08-26T10:{index:02d}:00+00:00",
+                "user": {"id": f"user-{index}", "username": f"User{index}"},
+            })
+        unknown_result = connector.ingest_event("GUILD_MEMBER_ADD", {
+            "guild_id": "unknown-guild", "user": {"id": "unknown", "username": "Unknown"},
+        })
+
+        connection = connect_database(self.database_path)
+        try:
+            announcements = connection.execute(
+                """SELECT community_id,target_installation_id,target_external_id,body,status,dedupe_key
+                   FROM community_announcements ORDER BY id"""
+            ).fetchall()
+            observations = connection.execute(
+                """SELECT community_id,context_id,target_platform_account_id
+                   FROM observations WHERE event_type='member.joined' ORDER BY community_id"""
+            ).fetchall()
+            rate_limited_count = int(connection.execute(
+                """SELECT COUNT(*) FROM audit_log
+                   WHERE action_type='onboarding.welcome_rate_limited' AND entity_id=?""",
+                (second_community_id,),
+            ).fetchone()[0])
+        finally:
+            connection.close()
+
+        self.assertEqual(first_result.status, "persisted")
+        self.assertEqual(second_result.status, "persisted")
+        self.assertEqual(duplicate_result.status, "duplicate")
+        self.assertIsNone(unknown_result)
+        self.assertEqual(len(announcements), 20)
+        self.assertEqual(int(announcements[0]["community_id"]), second_community_id)
+        self.assertEqual(int(announcements[0]["target_installation_id"]), second_installation_id)
+        self.assertEqual(announcements[0]["target_external_id"], "welcome-two")
+        self.assertEqual(announcements[0]["body"], "Welcome <@user-two>, also known as Two!")
+        self.assertEqual(announcements[0]["status"], "scheduled")
+        self.assertTrue(str(announcements[0]["dedupe_key"]).startswith("member-welcome:"))
+        self.assertEqual(len(observations), 22)
+        self.assertEqual((int(observations[0]["community_id"]), observations[0]["context_id"]), (1, "guild-one"))
+        self.assertTrue(all(int(row["community_id"]) == second_community_id for row in observations[1:]))
+        self.assertEqual(rate_limited_count, 1)
+
+    def test_newcomer_role_and_verification_checkpoint_are_tenant_scoped(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            installation_id = register_installation(
+                connection, community_id=1, platform="discord",
+                external_community_id="checkpoint-guild", display_name="Checkpoint Guild",
+            )
+            with connection:
+                operator_id = int(connection.execute(
+                    """INSERT INTO operator_accounts(discord_user_id,discord_username,role)
+                       VALUES ('operator-1','sam','admin')"""
+                ).lastrowid)
+            configure_welcome(
+                connection, community_id=1, discord_installation_id=installation_id,
+                welcome_channel_id="welcome", welcome_template="Welcome {mention}",
+                enabled=False, newcomer_role_id="newcomer-role",
+                newcomer_role_enabled=True, operator_id=operator_id,
+                verification_resource_enabled=True,
+                verification_resource_url="https://example.test/guidelines",
+                verification_resource_template="Verified {mention}. Read {resource_url}",
+                verification_evidence_required=True,
+            )
+        finally:
+            connection.close()
+
+        connector = DiscordConnector(self.database_path)
+        result = connector.ingest_event("GUILD_MEMBER_ADD", {
+            "guild_id": "checkpoint-guild", "joined_at": "2026-08-26T12:00:00+00:00",
+            "user": {"id": "member-1", "username": "New Member"},
+        })
+        calls: list[tuple[str, str, str]] = []
+        connection = connect_database(self.database_path)
+        try:
+            assigned = dispatch_newcomer_roles(
+                connection, lambda guild, user, role: calls.append((guild, user, role))
+            )
+            with self.assertRaises(LookupError):
+                verify_onboarding_member(
+                    connection, community_id=2, platform_user_id="member-1", operator_id=operator_id
+                )
+            with self.assertRaisesRegex(ValueError, "evidence is required"):
+                verify_onboarding_member(
+                    connection, community_id=1, platform_user_id="member-1", operator_id=operator_id
+                )
+            verify_onboarding_member(
+                connection, community_id=1, platform_user_id="member-1", operator_id=operator_id,
+                evidence="Accepted rules in screening review",
+            )
+            row, resource = _onboarding_verification_state(connection)
+            evidence = connection.execute(
+                """SELECT verification_evidence FROM community_onboarding_members
+                   WHERE community_id=1 AND platform_user_id='member-1'"""
+            ).fetchone()[0]
+            actions = [str(item[0]) for item in connection.execute(
+                """SELECT action_type FROM audit_log
+                   WHERE entity_type='community' AND entity_id=1
+                     AND action_type LIKE 'onboarding.%' ORDER BY id"""
+            ).fetchall()]
+            verification_audit = connection.execute(
+                """SELECT payload_json FROM audit_log
+                   WHERE action_type='onboarding.member_verified' AND entity_id=1"""
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(result.status, "persisted")
+        self.assertEqual(assigned, 1)
+        self.assertEqual(calls, [("checkpoint-guild", "member-1", "newcomer-role")])
+        self.assertEqual(tuple(row), ("verified", "assigned", 1))
+        self.assertEqual(evidence, "Accepted rules in screening review")
+        self.assertEqual(
+            json.loads(verification_audit)["evidence"],
+            "Accepted rules in screening review",
+        )
+        self.assertEqual(resource["body"], "Verified <@member-1>. Read https://example.test/guidelines")
+        self.assertEqual((int(resource["target_installation_id"]), resource["target_external_id"]), (installation_id, "welcome"))
+        self.assertTrue(str(resource["dedupe_key"]).startswith("member-verification:member-1:"))
+        self.assertEqual(json.loads(resource["source_json"])["user_id"], "member-1")
+        self.assertEqual(
+            actions,
+            [
+                "onboarding.welcome_configured",
+                "onboarding.newcomer_role_assigned",
+                "onboarding.member_verified",
+            ],
+        )
+
+    def test_verification_resource_catalog_delivers_enabled_items_in_order(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            installation_id = register_installation(
+                connection, community_id=1, platform="discord",
+                external_community_id="catalog-guild", display_name="Catalog Guild",
+            )
+            with connection:
+                operator_id = int(connection.execute(
+                    "INSERT INTO operator_accounts(discord_user_id,discord_username,role) VALUES ('catalog-operator','sam','admin')"
+                ).lastrowid)
+            configure_welcome(
+                connection, community_id=1, discord_installation_id=installation_id,
+                welcome_channel_id="welcome", welcome_template="Welcome {mention}",
+                enabled=False, operator_id=operator_id,
+            )
+            save_onboarding_resource(
+                connection, community_id=1, operator_id=operator_id, title="FAQ",
+                resource_url="https://example.test/faq",
+                message_template="{mention} read {title}: {resource_url}", sort_order=20,
+            )
+            save_onboarding_resource(
+                connection, community_id=1, operator_id=operator_id, title="Rules",
+                resource_url="https://example.test/rules",
+                message_template="{mention} read {title}: {resource_url}", sort_order=10,
+            )
+            save_onboarding_resource(
+                connection, community_id=1, operator_id=operator_id, title="Archive",
+                resource_url="https://example.test/archive",
+                message_template="{mention} read {title}: {resource_url}", enabled=False,
+                sort_order=0,
+            )
+        finally:
+            connection.close()
+
+        connector = DiscordConnector(self.database_path)
+        connector.ingest_event("GUILD_MEMBER_ADD", {
+            "guild_id": "catalog-guild", "joined_at": "2026-08-26T12:00:00+00:00",
+            "user": {"id": "catalog-member", "username": "Catalog Member"},
+        })
+        connection = connect_database(self.database_path)
+        try:
+            verify_onboarding_member(
+                connection, community_id=1, platform_user_id="catalog-member",
+                operator_id=operator_id,
+            )
+            resources = connection.execute(
+                """SELECT body,source_json FROM community_announcements
+                   WHERE json_extract(source_json,'$.type')='member_verification_catalog_resource'
+                   ORDER BY id"""
+            ).fetchall()
+            audit_actions = [row[0] for row in connection.execute(
+                """SELECT action_type FROM audit_log
+                   WHERE entity_type='onboarding_resource' ORDER BY id"""
+            ).fetchall()]
+        finally:
+            connection.close()
+
+        self.assertEqual(
+            [row["body"] for row in resources],
+            [
+                "<@catalog-member> read Rules: https://example.test/rules",
+                "<@catalog-member> read FAQ: https://example.test/faq",
+            ],
+        )
+        self.assertEqual(len(audit_actions), 3)
+        self.assertTrue(all(action == "onboarding.resource_created" for action in audit_actions))
+
+    def test_checkpoint_reminders_queue_once_for_overdue_unverified_members(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            initialize_database(connection)
+            installation_id = register_installation(
+                connection, community_id=1, platform="discord",
+                external_community_id="reminder-guild", display_name="Reminder Guild",
+            )
+            with connection:
+                operator_id = int(connection.execute(
+                    """INSERT INTO operator_accounts(discord_user_id,discord_username,role)
+                       VALUES ('operator-1','sam','admin')"""
+                ).lastrowid)
+            configure_welcome(
+                connection, community_id=1, discord_installation_id=installation_id,
+                welcome_channel_id="checkpoint-channel", welcome_template="Welcome {mention}",
+                enabled=False, operator_id=operator_id, checkpoint_due_hours=2,
+                checkpoint_reminder_enabled=True,
+                checkpoint_reminder_template="Verify now, {mention} ({username})",
+            )
+        finally:
+            connection.close()
+
+        connector = DiscordConnector(self.database_path)
+        for user_id, username in (
+            ("due-member", "Due"), ("verified-member", "Verified"),
+            ("departed-member", "Departed"),
+        ):
+            connector.ingest_event("GUILD_MEMBER_ADD", {
+                "guild_id": "reminder-guild", "joined_at": "2026-08-26T10:00:00+00:00",
+                "user": {"id": user_id, "username": username},
+            })
+        connector.ingest_event("GUILD_MEMBER_REMOVE", {
+            "guild_id": "reminder-guild", "user": {"id": "departed-member", "username": "Departed"},
+        })
+        connection = connect_database(self.database_path)
+        try:
+            verify_onboarding_member(
+                connection, community_id=1, platform_user_id="verified-member", operator_id=operator_id
+            )
+            first_count = queue_due_checkpoint_reminders(
+                connection, now=datetime(2026, 8, 26, 13, tzinfo=timezone.utc)
+            )
+            second_count = queue_due_checkpoint_reminders(
+                connection, now=datetime(2026, 8, 26, 14, tzinfo=timezone.utc)
+            )
+            rows = connection.execute(
+                """SELECT body,target_external_id,source_json FROM community_announcements
+                   WHERE json_extract(source_json,'$.type')='onboarding_checkpoint_reminder'"""
+            ).fetchall()
+            due_at = connection.execute(
+                """SELECT checkpoint_due_at,reminder_sent_at FROM community_onboarding_members
+                   WHERE community_id=1 AND platform_user_id='due-member'"""
+            ).fetchone()
+            departed = connection.execute(
+                """SELECT status FROM community_onboarding_members
+                   WHERE community_id=1 AND platform_user_id='departed-member'"""
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 0)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["body"], "Verify now, <@due-member> (Due)")
+        self.assertEqual(rows[0]["target_external_id"], "checkpoint-channel")
+        self.assertEqual(json.loads(rows[0]["source_json"])["user_id"], "due-member")
+        self.assertEqual(due_at["checkpoint_due_at"], "2026-08-26T12:00:00+00:00")
+        self.assertIsNotNone(due_at["reminder_sent_at"])
+        self.assertEqual(departed, "departed")
 
     def test_discord_message_ingestion_persists_account_and_message(self) -> None:
         connector = DiscordConnector(self.database_path)
@@ -861,6 +1235,8 @@ class IngestionTests(unittest.TestCase):
                 connection.execute(
                     """
                     INSERT INTO moderation_actions (
+                        community_id,
+                        installation_id,
                         platform,
                         message_id,
                         target_platform_account_id,
@@ -869,7 +1245,15 @@ class IngestionTests(unittest.TestCase):
                         actor_id,
                         reason,
                         status
-                    ) VALUES ('discord', ?, (SELECT id FROM platform_accounts WHERE platform = 'discord' AND platform_user_id = 'user-egregious-mod'), 'timeout', 'system', NULL, 'egregious_term', 'pending')
+                    ) VALUES (
+                        1,
+                        (SELECT id FROM community_installations
+                         WHERE platform='discord' AND external_community_id='guild-1'),
+                        'discord', ?,
+                        (SELECT id FROM platform_accounts
+                         WHERE platform='discord' AND platform_user_id='user-egregious-mod'),
+                        'timeout', 'system', NULL, 'egregious_term', 'pending'
+                    )
                     """,
                     (result.message_id,),
                 )
@@ -1073,12 +1457,145 @@ class IngestionTests(unittest.TestCase):
 
         self.assertEqual(count, 0)
 
+    def test_discord_bot_message_policy_is_community_scoped(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            with connection:
+                connection.execute(
+                    """UPDATE community_policy_settings SET allow_bot_messages=1
+                       WHERE community_id=1"""
+                )
+        finally:
+            connection.close()
+
+        result = ingest_and_analyze(DiscordConnector(self.database_path), {
+            "id": "discord-bot-policy-1",
+            "timestamp": "2026-08-06T05:00:00Z",
+            "channel_id": "channel-1",
+            "guild_id": "guild-1",
+            "content": "persisted policy bot post",
+            "author": {"id": "bot-2", "username": "policy-bot", "bot": True},
+        })
+
+        self.assertEqual(result.status, "persisted")
+
+    def test_anti_abuse_message_controls_support_shadow_and_enforce_modes(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            configure_anti_abuse_policy(
+                connection, tenant=TenantContext(1),
+                actor=ActorAttribution("operator", 1), enabled=True,
+                enforcement_mode="shadow", message_burst_limit=2,
+                message_burst_window_seconds=30, mention_limit=2,
+                join_raid_limit=25, join_raid_window_seconds=60,
+            )
+        finally:
+            connection.close()
+
+        connector = DiscordConnector(self.database_path)
+        for index in range(2):
+            ingest_and_analyze(connector, {
+                "id": f"flood-message-{index}",
+                "timestamp": f"2026-08-06T05:00:0{index}Z",
+                "channel_id": "channel-1", "guild_id": "guild-1",
+                "content": f"rapid message {index}",
+                "author": {"id": "flood-user", "username": "flood-user", "bot": False},
+            })
+
+        connection = connect_database(self.database_path)
+        try:
+            flood = connection.execute(
+                """SELECT community_id FROM intelligence_alerts
+                   WHERE dedupe_key LIKE 'anti-abuse:1:message_flood:%'"""
+            ).fetchone()
+            flood_reviews = connection.execute(
+                "SELECT COUNT(*) FROM review_queue WHERE queue_reason_code='message_flood'"
+            ).fetchone()[0]
+            flood_actions = connection.execute(
+                "SELECT COUNT(*) FROM moderation_actions WHERE reason='message_flood'"
+            ).fetchone()[0]
+            configure_anti_abuse_policy(
+                connection, tenant=TenantContext(1),
+                actor=ActorAttribution("operator", 1), enabled=True,
+                enforcement_mode="enforce", message_burst_limit=20,
+                message_burst_window_seconds=30, mention_limit=2,
+                join_raid_limit=25, join_raid_window_seconds=60,
+            )
+        finally:
+            connection.close()
+        self.assertIsNotNone(flood)
+        self.assertEqual(flood_reviews, 1)
+        self.assertEqual(flood_actions, 0)
+
+        ingest_and_analyze(connector, {
+            "id": "mention-spam-1", "timestamp": "2026-08-06T05:01:00Z",
+            "channel_id": "channel-1", "guild_id": "guild-1",
+            "content": "attention <@1> <@2>",
+            "mentions": [{"id": "1"}, {"id": "2"}],
+            "author": {"id": "mention-user", "username": "mention-user", "bot": False},
+        })
+        connection = connect_database(self.database_path)
+        try:
+            action = connection.execute(
+                """SELECT community_id,action_type,actor_type,status
+                   FROM moderation_actions WHERE reason='mention_spam'"""
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(tuple(action), (1, "timeout", "system", "pending"))
+
+    def test_join_raid_policy_is_tenant_scoped_and_deduplicated(self) -> None:
+        connection = connect_database(self.database_path)
+        try:
+            configure_anti_abuse_policy(
+                connection, tenant=TenantContext(1),
+                actor=ActorAttribution("operator", 1), enabled=True,
+                enforcement_mode="shadow", message_burst_limit=12,
+                message_burst_window_seconds=10, mention_limit=8,
+                join_raid_limit=2, join_raid_window_seconds=60,
+            )
+        finally:
+            connection.close()
+
+        connector = DiscordConnector(self.database_path)
+        for index in range(3):
+            result = connector.ingest_event("GUILD_MEMBER_ADD", {
+                "guild_id": "guild-1", "user": {"id": f"raid-user-{index}", "username": f"Raid{index}"},
+                "joined_at": f"2026-08-06T05:02:0{index}Z",
+            })
+            self.assertIsNotNone(result)
+
+        connection = connect_database(self.database_path)
+        try:
+            alerts = connection.execute(
+                """SELECT community_id,alert_type,severity FROM intelligence_alerts
+                   WHERE dedupe_key LIKE 'anti-abuse:1:join_raid:%'"""
+            ).fetchall()
+            audit_count = connection.execute(
+                """SELECT COUNT(*) FROM audit_log
+                   WHERE action_type='anti_abuse.detected' AND entity_id=1"""
+            ).fetchone()[0]
+            policy_audit = connection.execute(
+                """SELECT actor_id FROM audit_log
+                   WHERE action_type='anti_abuse.policy_updated' AND entity_id=1"""
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual([tuple(row) for row in alerts], [(1, "anti_abuse", "critical")])
+        self.assertEqual(audit_count, 1)
+        self.assertEqual(policy_audit[0], 1)
+
     def test_moderation_rules_create_review_items_and_actions(self) -> None:
         connection = connect_database(self.database_path)
         try:
             initialize_database(connection)
+            register_installation(
+                connection, community_id=1, platform="discord",
+                external_community_id="guild-1", display_name="Guild One",
+            )
             upsert_moderation_rule(
                 connection,
+                community_id=1,
                 name="blacklisted_term",
                 rule_type="exact_term",
                 pattern="spoiler",
@@ -1086,6 +1603,7 @@ class IngestionTests(unittest.TestCase):
             )
             upsert_moderation_rule(
                 connection,
+                community_id=1,
                 name="link_block",
                 rule_type="link_restriction",
                 pattern="",
@@ -1142,8 +1660,13 @@ class IngestionTests(unittest.TestCase):
         connection = connect_database(self.database_path)
         try:
             initialize_database(connection)
+            register_installation(
+                connection, community_id=1, platform="discord",
+                external_community_id="guild-1", display_name="Guild One",
+            )
             upsert_moderation_rule(
                 connection,
+                community_id=1,
                 name="link_block",
                 rule_type="link_restriction",
                 pattern="",

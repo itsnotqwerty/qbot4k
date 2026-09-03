@@ -44,6 +44,18 @@ To install:
 sudo ./install.sh
 ```
 
+For a checked-out application directory, `deploy/install.py` provides a
+Python-based, rerunnable systemd and nginx deployment with dry-run and automatic
+HTTP/HTTPS template selection:
+
+```bash
+python deploy/install.py --env .env.production --domain intelligence.example.com --http-only --dry-run
+sudo python3 deploy/install.py --env .env.production --domain intelligence.example.com --http-only
+```
+
+See `deploy/README.md` for TLS bootstrap, custom service identity, and ingress
+options. This path uses a Python virtual environment and never invokes Deno.
+
 To run tests:
 
 ```bash
@@ -52,7 +64,7 @@ python -m unittest discover -v
 python -m pytest -q
 ```
 
-The process applies additive, idempotent SQLite migrations at startup. Back up the database before deploying a new build. See `docs/live-operations.md` for the command-center workflow and Twitch permissions, `docs/professional-platform.md` for the platform architecture, `docs/analyst-mvp-readiness.md` for the bounded release gate, and `docs/operations.md` for deployment and recovery guidance. Templates for systemd, a narrowly scoped restart authorization, and a TLS reverse proxy are in `deploy/`.
+The process applies additive, idempotent SQLite migrations at startup. Back up the database before deploying a new build. See `docs/live-operations.md` for the command-center workflow and Twitch permissions, `docs/professional-platform.md` for the platform architecture, `docs/multi-tenant-platform-gameplan.md` for the multi-tenant community platform roadmap, `docs/analyst-mvp-readiness.md` for the bounded release gate, and `docs/operations.md` for deployment and recovery guidance. Python deployment tooling, systemd templates, a narrowly scoped restart authorization, and reverse-proxy templates are in `deploy/`.
 
 ## API authentication
 

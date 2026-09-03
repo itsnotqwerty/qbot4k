@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ..contexts import TenantContext
 from ..db import get_observation, normalized_message_from_observation
 from .message_analysis import persist_normalized_message
 from collections.abc import Callable
@@ -43,6 +44,7 @@ def analyze_message_created(
     observation = get_observation(
         connection,
         job.observation_id,
+        tenant=TenantContext(job.community_id),
     )
 
     if observation is None:

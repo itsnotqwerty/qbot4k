@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
@@ -22,10 +23,27 @@ from .db import (
 	normalized_message_from_observation,
 	collect_observation
 )
-from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
+from .commands import (
+	CommandContext,
+	CommandRegistry,
+	build_default_command_registry,
+	render_command_reply,
+	require_command_surface,
+)
+from .contexts import TenantContext
 from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
 from .server_boosts import is_server_boost_confirmation
-from .intelligence.events import ingest_event, observation_from_discord_event
+from .intelligence.events import observation_from_discord_event
+from .intelligence.community import (
+	platform_capabilities,
+	require_installation_surface,
+	resolve_tenant_context,
+)
+from .intelligence.onboarding import mark_onboarding_member_departed, queue_member_welcome
+from .intelligence.abuse import apply_join_raid_policy
+
+
+CAPABILITIES = platform_capabilities("discord")
 
 
 class DiscordPayloadError(ValueError):
@@ -295,13 +313,11 @@ class DiscordConnector:
 		database_path: Path,
 		*,
 		guild_ids: tuple[str, ...] = (),
-		allow_bot_messages: bool = False,
 		command_registry: CommandRegistry | None = None,
 		bot_token: str | None = None,
 	) -> None:
 		self.database_path = Path(database_path)
 		self.guild_ids = tuple(guild_id.strip() for guild_id in guild_ids if guild_id.strip())
-		self.allow_bot_messages = allow_bot_messages
 		self._bot_token = bot_token.strip() if bot_token else ""
 		self._command_registry = command_registry or build_default_command_registry()
 		self._last_status = "idle"
@@ -347,17 +363,36 @@ class DiscordConnector:
 
 	def ingest_message(self, payload: Mapping[str, object]) -> CollectionResult:
 		normalized = normalize_discord_message(payload)
-		if (
-			normalized.metadata.get("author_is_bot")
-			and not self.allow_bot_messages
-			and not is_server_boost_confirmation(normalized)
-		):
-			return CollectionResult(status="ignored", platform="discord", reason="bot_message")
-		observation = observation_from_message(normalized)
-
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
+			guild_id = str(normalized.metadata.get("guild_id") or "").strip()
+			if not guild_id:
+				raise ValueError("Discord message requires guild_id tenant context")
+			tenant = resolve_tenant_context(
+				connection, platform="discord", external_community_id=guild_id
+			)
+			policy = connection.execute(
+				"SELECT allow_bot_messages FROM community_policy_settings WHERE community_id=?",
+				(tenant.community_id,),
+			).fetchone()
+			if policy is None:
+				raise ValueError(f"Community {tenant.community_id} has no policy settings")
+			if (
+				normalized.metadata.get("author_is_bot")
+				and not bool(policy[0])
+				and not is_server_boost_confirmation(normalized)
+			):
+				return CollectionResult(status="ignored", platform="discord", reason="bot_message")
+			normalized = replace(
+				normalized,
+				metadata={
+					**dict(normalized.metadata),
+					"community_id": tenant.community_id,
+					"installation_id": tenant.installation_id,
+				},
+			)
+			observation = observation_from_message(normalized)
 			result = collect_observation(connection, observation)
 			self._last_status = "ready"
 			return result
@@ -365,12 +400,55 @@ class DiscordConnector:
 			connection.close()
 
 	def ingest_event(self, gateway_event: str, payload: Mapping[str, object]) -> CollectionResult | None:
-		observation = observation_from_discord_event(gateway_event, payload)
-		if observation is None:
+		guild_id = str(payload.get("guild_id") or "").strip()
+		if not guild_id:
 			return None
-		result = ingest_event(self.database_path, observation)
-		self._last_status = "ready"
-		return result
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			try:
+				tenant = resolve_tenant_context(
+					connection, platform="discord", external_community_id=guild_id
+				)
+			except LookupError:
+				return None
+			observation = observation_from_discord_event(
+				gateway_event, payload, community_id=tenant.community_id
+			)
+			if observation is None:
+				return None
+			observation = replace(observation, installation_id=tenant.installation_id)
+			result = collect_observation(connection, observation)
+			if observation.event_type == "member.joined" and result.status == "persisted":
+				with connection:
+					apply_join_raid_policy(
+						connection, community_id=tenant.community_id,
+						observation_id=int(result.observation_id), occurred_at=observation.occurred_at,
+					)
+				user = payload.get("user") if isinstance(payload.get("user"), Mapping) else {}
+				user_id = str(user.get("id") or "").strip()
+				if user_id:
+					queue_member_welcome(
+						connection, community_id=tenant.community_id, guild_id=guild_id,
+						user_id=user_id,
+						username=str(user.get("username") or user.get("global_name") or user_id),
+						event_id=str(observation.external_event_id or ""),
+						occurred_at=observation.occurred_at,
+					)
+			elif observation.event_type == "member.left" and result.status == "persisted":
+				user = payload.get("user") if isinstance(payload.get("user"), Mapping) else {}
+				user_id = str(user.get("id") or "").strip()
+				if user_id:
+					mark_onboarding_member_departed(
+						connection, community_id=tenant.community_id, platform_user_id=user_id
+					)
+			self._last_status = "ready"
+			return CollectionResult(
+				status=result.status, platform="discord", observation_id=result.observation_id,
+				analysis_job_id=result.analysis_job_id,
+			)
+		finally:
+			connection.close()
 
 	def execute_pending_moderation_actions(
 		self,
@@ -379,7 +457,7 @@ class DiscordConnector:
 	) -> None:
 		row = connection.execute(
 			"""
-			SELECT observation_id, platform_account_id
+			SELECT observation_id, platform_account_id, community_id
 			FROM messages
 			WHERE id = ? AND platform = 'discord'
 			""",
@@ -392,7 +470,9 @@ class DiscordConnector:
 				f"Discord message {message_id} has no source observation"
 			)
 
-		observation = get_observation(connection, int(row[0]))
+		observation = get_observation(
+			connection, int(row[0]), tenant=TenantContext(int(row[2]))
+		)
 		if observation is None:
 			raise ValueError(
 				f"Discord observation {int(row[0])} was not found"
@@ -434,11 +514,19 @@ class DiscordConnector:
 		if normalization_result.message_id is None:
 			return
 
-		pending_actions = list_pending_moderation_actions_for_message(connection, normalization_result.message_id)
+		guild_id = str(normalized.metadata.get("guild_id") or "").strip()
+		tenant = resolve_tenant_context(
+			connection, platform="discord", external_community_id=guild_id
+		)
+		pending_actions = list_pending_moderation_actions_for_message(
+			connection, normalization_result.message_id, tenant=tenant
+		)
 		if not pending_actions:
 			return
 
-		guild_id = str(normalized.metadata.get("guild_id") or "").strip()
+		require_installation_surface(
+			connection, tenant=tenant, surface="provider:moderation"
+		)
 		platform_message_id = normalized.platform_message_id or str(normalization_result.message_id)
 		for action in pending_actions:
 			action_id = int(action[0])
@@ -456,7 +544,7 @@ class DiscordConnector:
 							normalization_result.message_id,
 							reason,
 						)
-						mark_moderation_action_completed(connection, action_id)
+						mark_moderation_action_completed(connection, action_id, tenant=tenant)
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
@@ -474,7 +562,7 @@ class DiscordConnector:
 							reason=reason,
 							duration_seconds=duration_seconds,
 						)
-						mark_moderation_action_completed(connection, action_id)
+						mark_moderation_action_completed(connection, action_id, tenant=tenant)
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
@@ -505,7 +593,7 @@ class DiscordConnector:
 							user_id=normalized.platform_user_id,
 							reason=reason,
 						)
-						mark_moderation_action_completed(connection, action_id)
+						mark_moderation_action_completed(connection, action_id, tenant=tenant)
 						self._log_moderation_event_to_modlogs(
 							guild_id=guild_id,
 							normalized=normalized,
@@ -542,7 +630,7 @@ class DiscordConnector:
 						reason=reason,
 						outcome="recorded",
 					)
-					mark_moderation_action_completed(connection, action_id)
+					mark_moderation_action_completed(connection, action_id, tenant=tenant)
 				else:
 					self._logger.warning(
 						"discord moderation action not executed for unsupported type=%s message=%s",
@@ -676,6 +764,10 @@ class DiscordConnector:
 	) -> None:
 		if not self._bot_token:
 			return
+		guild_id = str(normalized.metadata.get("guild_id") or "").strip()
+		tenant = resolve_tenant_context(
+			connection, platform="discord", external_community_id=guild_id
+		)
 
 		context = CommandContext(
 			platform="discord",
@@ -687,8 +779,12 @@ class DiscordConnector:
 			guild_id=str(normalized.metadata.get("guild_id")) if normalized.metadata.get("guild_id") else None,
 			message_id=normalized.platform_message_id,
 			content=normalized.content_raw,
+			community_id=tenant.community_id,
 		)
 		try:
+			parsed = self._command_registry.parse_command(normalized.content_raw)
+			if parsed is not None:
+				require_command_surface(context, parsed[0])
 			response = self._command_registry.dispatch(normalized.content_raw, context)
 		except Exception as exc:
 			self._logger.warning("discord command dispatch failed: %s", exc)
@@ -942,7 +1038,12 @@ class DiscordConnector:
 					continue
 
 				if event_type != "MESSAGE_CREATE":
-					result = self.ingest_event(str(event_type or ""), data)
+					event_payload = (
+						self._decorate_member_event(data)
+						if event_type in {"GUILD_MEMBER_ADD", "GUILD_MEMBER_UPDATE"}
+						else data
+					)
+					result = self.ingest_event(str(event_type or ""), event_payload)
 					if result is not None:
 						self._logger.info("ingested discord event type=%s status=%s", event_type, result.status)
 					continue
@@ -1111,6 +1212,19 @@ class DiscordConnector:
 		)
 		return payload
 
+	def _decorate_member_event(self, data: Mapping[str, object]) -> dict[str, object]:
+		payload = dict(data)
+		guild_id = str(data.get("guild_id") or "").strip()
+		role_ids = data.get("roles")
+		if not isinstance(role_ids, (list, tuple)):
+			return payload
+		payload["resolved_role_names"] = [
+			role[0]
+			for role_id in role_ids
+			if (role := self._guild_roles.get(guild_id, {}).get(str(role_id))) is not None
+		]
+		return payload
+
 	@staticmethod
 	def _close_code(data: object) -> int | None:
 		if not isinstance(data, (bytes, bytearray)) or len(data) < 2:
@@ -1141,7 +1255,7 @@ class DiscordConnector:
 			name="discord",
 			status=self._last_status,
 			details={
-				"allow_bot_messages": self.allow_bot_messages,
+				"allow_bot_messages": "per_community",
 				"guild_ids": list(self.guild_ids),
 			},
 		)

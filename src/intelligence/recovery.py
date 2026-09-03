@@ -101,14 +101,16 @@ def replay_dead_letter(connection: sqlite3.Connection, dead_letter_id: int) -> i
     if row[0] is None or row[2] is None:
         raise ValueError("dead letter has no replayable observation")
     key = f"dead-letter:{int(dead_letter_id)}:{datetime.now(timezone.utc).isoformat()}"
+    from ..db import enqueue_processing_job
     with connection:
-        cursor = connection.execute(
-            """INSERT INTO processing_jobs(stage, job_type, observation_id, idempotency_key)
-               VALUES (?, ?, ?, ?)""",
-            (str(row[1]), str(row[2]), int(row[0]), key),
+        job_id = enqueue_processing_job(
+            connection, stage=str(row[1]), job_type=str(row[2]),
+            observation_id=int(row[0]), idempotency_key=key,
         )
+        if job_id is None:
+            raise ValueError("dead letter replay job already exists")
         connection.execute(
             "UPDATE dead_letter_events SET status='replayed', replayed_at=CURRENT_TIMESTAMP WHERE id=?",
             (int(dead_letter_id),),
         )
-    return int(cursor.lastrowid)
+    return int(job_id)

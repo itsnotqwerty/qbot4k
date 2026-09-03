@@ -395,10 +395,11 @@ def enforce_score_floor_ban(
 ) -> None:
 	platform_accounts = connection.execute(
 		"""
-		SELECT id, platform, username
-		FROM platform_accounts
-		WHERE user_id = ?
-		ORDER BY id
+		SELECT DISTINCT messages.community_id, accounts.id, accounts.platform
+		FROM platform_accounts AS accounts
+		INNER JOIN messages ON messages.platform_account_id=accounts.id
+		WHERE COALESCE(messages.user_id, accounts.user_id) = ?
+		ORDER BY messages.community_id, accounts.id
 		""",
 		(user_id,),
 	).fetchall()
@@ -413,9 +414,15 @@ def enforce_score_floor_ban(
 	).fetchone()[0]
 
 	for account in platform_accounts:
+		from ..contexts import TenantContext
+		from .quotas import consume_tenant_quota
+		consume_tenant_quota(
+			connection, tenant=TenantContext(int(account[0])), quota_type="moderation",
+		)
 		connection.execute(
 			"""
 			INSERT INTO moderation_actions (
+				community_id,
 				platform,
 				message_id,
 				target_platform_account_id,
@@ -425,11 +432,12 @@ def enforce_score_floor_ban(
 				actor_id,
 				reason,
 				status
-			) VALUES (?, NULL, ?, ?, 'ban', 'system', NULL, ?, 'completed')
+			) VALUES (?, ?, NULL, ?, ?, 'ban', 'system', NULL, ?, 'completed')
 			""",
 			(
-				str(account[1]),
 				int(account[0]),
+				str(account[2]),
+				int(account[1]),
 				user_id,
 				f"social_score_floor_reached:{floor_score}",
 			),

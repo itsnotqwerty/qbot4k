@@ -96,9 +96,9 @@ class SocialScoringTests(unittest.TestCase):
             connection.execute(
                 """
                 INSERT INTO intelligence_alerts (
-                    user_id, alert_type, severity, title, summary, confidence,
+                    community_id, user_id, alert_type, severity, title, summary, confidence,
                     status, disposition, dedupe_key
-                ) VALUES (?, 'operator_test', 'high', 'Test', 'Test', 1.0,
+                ) VALUES (1, ?, 'operator_test', 'high', 'Test', 'Test', 1.0,
                           'open', NULL, 'operator-test-open')
                 """,
                 (user_id,),

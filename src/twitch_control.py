@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .intelligence.community import require_installation_surface, resolve_tenant_context
 from .twitch_auth import TwitchTokenManager
 
 
@@ -81,6 +82,14 @@ class TwitchControlPlane:
         method: str,
         payload: Mapping[str, object],
     ) -> dict[str, object]:
+        tenant = resolve_tenant_context(
+            connection, platform="twitch", external_community_id=broadcaster.strip()
+        )
+        if tenant.community_id != int(community_id):
+            raise PermissionError("Twitch installation belongs to another community")
+        require_installation_surface(
+            connection, tenant=tenant, surface="provider:live_control"
+        )
         validation = self.token_manager.validate_token()
         if not validation.user_id:
             raise RuntimeError("Twitch token validation omitted moderator user_id")

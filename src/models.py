@@ -6,6 +6,8 @@ from typing import Mapping
 import json
 import sqlite3
 
+from .contexts import TenantContext
+
 
 def normalize_message_content(content: str) -> str:
     collapsed = " ".join(content.split())
@@ -27,6 +29,10 @@ def coerce_timestamp(raw_value: str | datetime | None) -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def observation_from_message(message: NormalizedMessage) -> Observation:
+    tenant = TenantContext.require(
+        message.metadata.get("community_id"),
+        installation_id=message.metadata.get("installation_id"),
+    )
     return Observation(
         platform=message.platform,
         event_type="message.created",
@@ -42,7 +48,8 @@ def observation_from_message(message: NormalizedMessage) -> Observation:
             "role_names": list(message.role_names),
             "is_moderator": message.is_moderator,
         },
-        community_id=int(message.metadata.get("community_id") or 1),
+        community_id=tenant.community_id,
+        installation_id=tenant.installation_id,
         raw_payload=dict(message.metadata),
     )
 
@@ -69,6 +76,8 @@ class Observation:
     platform: str
     event_type: str
     occurred_at: str
+    community_id: int
+    installation_id: int | None = None
 
     external_event_id: str | None = None
     actor_platform_user_id: str | None = None
@@ -80,7 +89,6 @@ class Observation:
 
     attributes: Mapping[str, object] = field(default_factory=dict)
     raw_payload: Mapping[str, object] = field(default_factory=dict)
-    community_id: int = 1
     schema_version: int = 1
 
 @dataclass(frozen=True)
@@ -124,6 +132,7 @@ class CollectionResult:
 @dataclass(frozen=True)
 class ProcessingJob:
     id: int
+    community_id: int
     stage: str
     job_type: str
     observation_id: int | None
@@ -145,6 +154,7 @@ class ProcessingJob:
 
         return cls(
             id=int(row["id"]),
+            community_id=TenantContext.require(row["community_id"]).community_id,
             stage=str(row["stage"]),
             job_type=str(row["job_type"]),
             observation_id=(

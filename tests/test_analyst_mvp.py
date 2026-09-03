@@ -1,18 +1,30 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from src.dashboard.moderation import resolve_review, save_moderation_rule
+from src.contexts import ActorAttribution, TenantContext
+from src.dashboard.moderation import (
+    add_moderation_rule_exemption,
+    create_moderation_rule_draft,
+    preview_moderation_rule_version,
+    publish_moderation_rule_version,
+    resolve_review,
+    rollback_moderation_rule,
+    save_moderation_rule,
+)
 from src.db import (
     connect_database,
     database_health,
     initialize_database,
     operational_readiness_snapshot,
     record_operational_metric,
+    load_enabled_moderation_rules,
 )
+from src.intelligence.community import create_community
 
 
 class AnalystMVPTests(unittest.TestCase):
@@ -33,9 +45,9 @@ class AnalystMVPTests(unittest.TestCase):
                    VALUES ('discord','subject-1','subject')"""
             ).lastrowid)
             message_id = int(self.connection.execute(
-                """INSERT INTO messages(platform,platform_message_id,platform_account_id,channel_id,
+                     """INSERT INTO messages(community_id,platform,platform_message_id,platform_account_id,channel_id,
                                           content_raw,content_normalized,sent_at)
-                   VALUES ('discord','review-1',?,'channel-1','suspicious text','suspicious text',
+                         VALUES (1,'discord','review-1',?,'channel-1','suspicious text','suspicious text',
                            '2026-08-11T12:00:00+00:00')""",
                 (account_id,),
             ).lastrowid)
@@ -52,7 +64,8 @@ class AnalystMVPTests(unittest.TestCase):
                 self.connection,
                 review_id,
                 resolution="confirmed",
-                operator_id=42,
+                tenant=TenantContext(1),
+                actor=ActorAttribution("operator", 42),
                 note="corroborated evidence",
                 action_type="timeout",
                 duration_seconds=999999999,
@@ -91,6 +104,7 @@ class AnalystMVPTests(unittest.TestCase):
                 enforcement_mode="review",
                 action_duration_seconds=900,
                 operator_id=7,
+                community_id=1,
             )
         rule = self.connection.execute(
             "SELECT name,rule_type,severity,enforcement_mode,action_duration_seconds FROM moderation_rules WHERE id=?",
@@ -112,7 +126,102 @@ class AnalystMVPTests(unittest.TestCase):
                 enforcement_mode="review",
                 action_duration_seconds=60,
                 operator_id=7,
+                community_id=1,
             )
+
+    def test_rule_lifecycle_is_versioned_scoped_approved_and_reversible(self) -> None:
+        with self.connection:
+            self.connection.execute(
+                """INSERT INTO operator_accounts(id,discord_user_id,discord_username,role)
+                   VALUES (7,'rule-author','author','admin'),(8,'rule-approver','approver','admin')"""
+            )
+        other_community_id = create_community(
+            self.connection, workspace_id=1, name="Other rules", slug="other-rules",
+        )
+        tenant = TenantContext(1)
+        author = ActorAttribution("operator", 7)
+        approver = ActorAttribution("operator", 8)
+        config = {
+            "name": "Critical Discord phrase", "rule_type": "exact_term",
+            "pattern": "blocked", "severity": "critical",
+            "auto_enforce_action": "ban", "action_duration_seconds": 600,
+            "platform_scope": ["discord"],
+        }
+        version_one = create_moderation_rule_draft(
+            self.connection, tenant=tenant, actor=author, config=config,
+        )
+        impact = preview_moderation_rule_version(
+            self.connection, tenant=tenant, version_id=version_one,
+            samples=["allowed", "this is blocked"],
+        )
+        self.assertEqual(impact, {
+            "sample_count": 2, "match_count": 1, "matched_indexes": [1],
+        })
+        with self.assertRaisesRegex(PermissionError, "different operator"):
+            publish_moderation_rule_version(
+                self.connection, tenant=tenant, actor=author,
+                version_id=version_one, lifecycle_state="enforce",
+            )
+        rule_id = publish_moderation_rule_version(
+            self.connection, tenant=tenant, actor=approver,
+            version_id=version_one, lifecycle_state="enforce",
+        )
+        self.assertEqual(
+            [rule.id for rule in load_enabled_moderation_rules(
+                self.connection, community_id=1, platform="discord",
+            ) if rule.id == rule_id],
+            [rule_id],
+        )
+        self.assertNotIn(rule_id, [rule.id for rule in load_enabled_moderation_rules(
+            self.connection, community_id=1, platform="twitch",
+        )])
+        add_moderation_rule_exemption(
+            self.connection, tenant=tenant, actor=author, rule_id=rule_id,
+            exemption_type="channel", exemption_value="trusted-channel",
+            reason="Trusted staff channel",
+        )
+        self.assertNotIn(rule_id, [rule.id for rule in load_enabled_moderation_rules(
+            self.connection, community_id=1, platform="discord",
+            channel_id="trusted-channel",
+        )])
+        with self.assertRaisesRegex(LookupError, "not found"):
+            preview_moderation_rule_version(
+                self.connection, tenant=TenantContext(other_community_id),
+                version_id=version_one, samples=["blocked"],
+            )
+
+        changed_config = {**config, "pattern": "replacement", "severity": "high",
+                          "auto_enforce_action": "timeout"}
+        version_two = create_moderation_rule_draft(
+            self.connection, tenant=tenant, actor=author, config=changed_config,
+        )
+        publish_moderation_rule_version(
+            self.connection, tenant=tenant, actor=author,
+            version_id=version_two, lifecycle_state="shadow",
+        )
+        rollback_id = rollback_moderation_rule(
+            self.connection, tenant=tenant, actor=author, version_id=version_one,
+        )
+        versions = self.connection.execute(
+            """SELECT version_number,lifecycle_state,impact_json
+               FROM moderation_rule_versions WHERE moderation_rule_id=? ORDER BY version_number""",
+            (rule_id,),
+        ).fetchall()
+        self.assertEqual([row[0] for row in versions], [1, 2, 3])
+        self.assertEqual(versions[2][1], "enforce")
+        self.assertEqual(json.loads(versions[2][2]), {"rollback_of": version_one})
+        self.assertEqual(self.connection.execute(
+            "SELECT pattern FROM moderation_rules WHERE id=?", (rule_id,),
+        ).fetchone()[0], "blocked")
+        self.assertEqual(rollback_id, self.connection.execute(
+            "SELECT id FROM moderation_rule_versions WHERE moderation_rule_id=? AND version_number=3",
+            (rule_id,),
+        ).fetchone()[0])
+        self.assertEqual(self.connection.execute(
+            """SELECT COUNT(*) FROM audit_log WHERE action_type IN (
+                   'moderation.rule_drafted','moderation.rule_published',
+                   'moderation.rule_exemption_added','moderation.rule_rolled_back')"""
+        ).fetchone()[0], 6)
 
     def test_operational_snapshot_and_database_integrity_are_observable(self) -> None:
         with self.connection:

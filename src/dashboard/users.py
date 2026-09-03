@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 
 @dataclass(frozen=True)
@@ -52,9 +55,18 @@ class UserModerationAction:
 	created_at: str
 
 
+@dataclass(frozen=True)
+class UserLifecycleEvent:
+	occurred_at: str
+	event_type: str
+	summary: str
+	detail: str | None = None
+
+
 def search_users(
 	connection: sqlite3.Connection,
 	*,
+	community_id: int,
 	query: str = "",
 	sort_by: str = "score",
 	sort_dir: str = "desc",
@@ -96,11 +108,10 @@ def search_users(
 				users.primary_display_name,
 				users.current_reputation_score,
 				users.candidate_flag,
-				COUNT(DISTINCT platform_accounts.id) AS account_count,
+				COUNT(DISTINCT messages.platform_account_id) AS account_count,
 				COUNT(DISTINCT messages.id) AS message_count
 			FROM users
-			LEFT JOIN platform_accounts ON platform_accounts.user_id = users.id
-			LEFT JOIN messages ON messages.user_id = users.id
+			INNER JOIN messages ON messages.user_id = users.id AND messages.community_id = ?
 			WHERE users.primary_display_name LIKE ?
 			GROUP BY users.id
 
@@ -114,7 +125,8 @@ def search_users(
 				1 AS account_count,
 				COUNT(DISTINCT messages.id) AS message_count
 			FROM platform_accounts
-			LEFT JOIN messages ON messages.platform_account_id = platform_accounts.id AND messages.user_id IS NULL
+			INNER JOIN messages ON messages.platform_account_id = platform_accounts.id
+				AND messages.user_id IS NULL AND messages.community_id = ?
 			WHERE platform_accounts.user_id IS NULL
 				AND platform_accounts.detached_from_user_id IS NULL
 				AND platform_accounts.username LIKE ?
@@ -123,7 +135,7 @@ def search_users(
 		ORDER BY {order_column} {order_direction}, results.current_reputation_score DESC, results.primary_display_name COLLATE NOCASE ASC
 		LIMIT ? OFFSET ?
 		""",
-		(like_pattern, like_pattern, limit, offset),
+		(int(community_id), like_pattern, int(community_id), like_pattern, limit, offset),
 	).fetchall()
 	return [
 		UserListItem(
@@ -142,6 +154,7 @@ def list_recent_user_messages(
 	connection: sqlite3.Connection,
 	user_id: int,
 	*,
+	community_id: int,
 	limit: int = 25,
 ) -> list[UserRecentMessage]:
 	if user_id >= 0:
@@ -164,10 +177,11 @@ def list_recent_user_messages(
 				AND messages.platform = 'discord'
 			)
 			WHERE COALESCE(messages.user_id, platform_accounts.user_id) = ?
+			  AND messages.community_id = ?
 			ORDER BY messages.sent_at DESC, messages.id DESC
 			LIMIT ?
 			""",
-			(user_id, limit),
+			(user_id, int(community_id), limit),
 		).fetchall()
 	else:
 		platform_account_id = -user_id
@@ -189,11 +203,11 @@ def list_recent_user_messages(
 				discord_channels.channel_id = messages.channel_id
 				AND messages.platform = 'discord'
 			)
-			WHERE platform_accounts.id = ?
+			WHERE platform_accounts.id = ? AND messages.community_id = ?
 			ORDER BY messages.sent_at DESC, messages.id DESC
 			LIMIT ?
 			""",
-			(platform_account_id, limit),
+			(platform_account_id, int(community_id), limit),
 		).fetchall()
 
 	message_ids = tuple(int(row[0]) for row in rows)
@@ -230,26 +244,34 @@ def list_recent_user_messages(
 	]
 
 
-def list_user_platform_accounts(connection: sqlite3.Connection, user_id: int) -> list[UserPlatformAccount]:
+def list_user_platform_accounts(
+	connection: sqlite3.Connection, user_id: int, *, community_id: int
+) -> list[UserPlatformAccount]:
 	if user_id >= 0:
 		rows = connection.execute(
 			"""
 			SELECT id, platform, platform_user_id, username
 			FROM platform_accounts
-			WHERE user_id = ?
+			WHERE user_id = ? AND EXISTS (
+				SELECT 1 FROM messages WHERE messages.platform_account_id=platform_accounts.id
+				AND messages.community_id=?
+			)
 			ORDER BY platform, username, id
 			""",
-			(user_id,),
+			(user_id, int(community_id)),
 		).fetchall()
 	else:
 		rows = connection.execute(
 			"""
 			SELECT id, platform, platform_user_id, username
 			FROM platform_accounts
-			WHERE id = ?
+			WHERE id = ? AND EXISTS (
+				SELECT 1 FROM messages WHERE messages.platform_account_id=platform_accounts.id
+				AND messages.community_id=?
+			)
 			ORDER BY id
 			""",
-			(-user_id,),
+			(-user_id, int(community_id)),
 		).fetchall()
 
 	return [
@@ -263,7 +285,9 @@ def list_user_platform_accounts(connection: sqlite3.Connection, user_id: int) ->
 	]
 
 
-def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> UserModerationStatus:
+def get_user_moderation_status(
+	connection: sqlite3.Connection, user_id: int, *, community_id: int
+) -> UserModerationStatus:
 	if user_id >= 0:
 		open_reviews = int(
 			connection.execute(
@@ -274,8 +298,9 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 				INNER JOIN platform_accounts ON platform_accounts.id = messages.platform_account_id
 				WHERE review_queue.status = 'open'
 				  AND COALESCE(messages.user_id, platform_accounts.user_id) = ?
+				  AND messages.community_id = ?
 				""",
-				(user_id,),
+				(user_id, int(community_id)),
 			).fetchone()[0]
 		)
 		counts = connection.execute(
@@ -288,8 +313,9 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 			INNER JOIN platform_accounts
 				ON platform_accounts.id = moderation_actions.target_platform_account_id
 			WHERE COALESCE(moderation_actions.user_id, platform_accounts.user_id) = ?
+			  AND moderation_actions.community_id = ?
 			""",
-			(user_id,),
+			(user_id, int(community_id)),
 		).fetchone()
 		return UserModerationStatus(
 			open_reviews=open_reviews,
@@ -298,7 +324,7 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 			recent_actions=int(counts[2] or 0),
 		)
 
-	account_ids = _resolve_platform_account_ids(connection, user_id)
+	account_ids = _resolve_platform_account_ids(connection, user_id, community_id=community_id)
 	if not account_ids:
 		return UserModerationStatus(open_reviews=0, pending_actions=0, completed_actions=0, recent_actions=0)
 
@@ -313,8 +339,9 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 			INNER JOIN messages ON messages.id = review_queue.message_id
 			WHERE review_queue.status = 'open'
 			  AND messages.platform_account_id IN ({placeholders})
+			  AND messages.community_id = ?
 			""",
-			bindings,
+			(*bindings, int(community_id)),
 		).fetchone()[0]
 	)
 	pending_actions = int(
@@ -324,8 +351,9 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 			FROM moderation_actions
 			WHERE status = 'pending'
 			  AND target_platform_account_id IN ({placeholders})
+			  AND community_id = ?
 			""",
-			bindings,
+			(*bindings, int(community_id)),
 		).fetchone()[0]
 	)
 	completed_actions = int(
@@ -335,8 +363,9 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 			FROM moderation_actions
 			WHERE status = 'completed'
 			  AND target_platform_account_id IN ({placeholders})
+			  AND community_id = ?
 			""",
-			bindings,
+			(*bindings, int(community_id)),
 		).fetchone()[0]
 	)
 	recent_actions = int(
@@ -345,8 +374,9 @@ def get_user_moderation_status(connection: sqlite3.Connection, user_id: int) -> 
 			SELECT COUNT(*)
 			FROM moderation_actions
 			WHERE target_platform_account_id IN ({placeholders})
+			  AND community_id = ?
 			""",
-			bindings,
+			(*bindings, int(community_id)),
 		).fetchone()[0]
 	)
 
@@ -362,6 +392,7 @@ def list_recent_user_moderation_actions(
 	connection: sqlite3.Connection,
 	user_id: int,
 	*,
+	community_id: int,
 	limit: int = 10,
 ) -> list[UserModerationAction]:
 	if user_id >= 0:
@@ -379,14 +410,15 @@ def list_recent_user_moderation_actions(
 			INNER JOIN platform_accounts
 				ON platform_accounts.id = moderation_actions.target_platform_account_id
 			WHERE COALESCE(moderation_actions.user_id, platform_accounts.user_id) = ?
+			  AND moderation_actions.community_id = ?
 			ORDER BY moderation_actions.created_at DESC, moderation_actions.id DESC
 			LIMIT ?
 			""",
-			(user_id, limit),
+			(user_id, int(community_id), limit),
 		).fetchall()
 		return [_moderation_action_from_row(row) for row in rows]
 
-	account_ids = _resolve_platform_account_ids(connection, user_id)
+	account_ids = _resolve_platform_account_ids(connection, user_id, community_id=community_id)
 	if not account_ids:
 		return []
 
@@ -405,13 +437,109 @@ def list_recent_user_moderation_actions(
 		FROM moderation_actions
 		INNER JOIN platform_accounts ON platform_accounts.id = moderation_actions.target_platform_account_id
 		WHERE moderation_actions.target_platform_account_id IN ({placeholders})
+		  AND moderation_actions.community_id = ?
 		ORDER BY moderation_actions.created_at DESC, moderation_actions.id DESC
 		LIMIT ?
 		""",
-		(*bindings, limit),
+		(*bindings, int(community_id), limit),
 	).fetchall()
 
 	return [_moderation_action_from_row(row) for row in rows]
+
+
+def list_user_lifecycle_events(
+	connection: sqlite3.Connection,
+	user_id: int,
+	*,
+	community_id: int,
+	limit: int = 50,
+	event_types: Iterable[str] = (),
+) -> list[UserLifecycleEvent]:
+	account_ids = _resolve_platform_account_ids(connection, user_id, community_id=community_id)
+	if not account_ids:
+		return []
+	placeholders = ",".join("?" for _ in account_ids)
+	events: list[UserLifecycleEvent] = []
+	observation_rows = connection.execute(
+		f"""SELECT event_type,occurred_at,attributes_json
+		    FROM observations
+		    WHERE community_id=? AND target_platform_account_id IN ({placeholders})
+		      AND event_type IN (
+		          'member.joined','member.left','member.roles_changed',
+		          'moderation.ban_added','moderation.ban_removed'
+		      )""",
+		(int(community_id), *account_ids),
+	).fetchall()
+	labels = {
+		"member.joined": "Joined community",
+		"member.left": "Left community",
+		"member.roles_changed": "Discord roles changed",
+		"moderation.ban_added": "Discord ban added",
+		"moderation.ban_removed": "Discord ban removed",
+	}
+	for row in observation_rows:
+		detail = None
+		if str(row[0]) == "member.roles_changed":
+			try:
+				attributes = json.loads(str(row[2] or "{}"))
+			except json.JSONDecodeError:
+				attributes = {}
+			roles = attributes.get("roles") if isinstance(attributes, dict) else None
+			role_names = (
+				attributes.get("resolved_role_names") if isinstance(attributes, dict) else None
+			)
+			if isinstance(role_names, list) and role_names:
+				detail = "Roles: " + ", ".join(str(role) for role in role_names)
+			elif isinstance(roles, list):
+				detail = "Role IDs: " + (", ".join(str(role) for role in roles) or "none")
+		events.append(UserLifecycleEvent(str(row[1]), str(row[0]), labels[str(row[0])], detail))
+
+	if user_id >= 0:
+		for row in connection.execute(
+			"""SELECT created_at,body FROM user_notes
+			   WHERE community_id=? AND user_id=?""",
+			(int(community_id), int(user_id)),
+		).fetchall():
+			events.append(UserLifecycleEvent(str(row[0]), "note", "Operator note", str(row[1])))
+
+	for row in connection.execute(
+		f"""SELECT created_at,action_type,status,reason FROM moderation_actions
+		    WHERE community_id=? AND target_platform_account_id IN ({placeholders})""",
+		(int(community_id), *account_ids),
+	).fetchall():
+		detail_parts = [str(row[2])]
+		if row[3]:
+			detail_parts.append(str(row[3]))
+		events.append(UserLifecycleEvent(
+			str(row[0]), "moderation", f"Moderation: {row[1]}", " · ".join(detail_parts)
+		))
+
+	for row in connection.execute(
+		f"""SELECT verified_at,verification_evidence FROM community_onboarding_members
+		    WHERE community_id=? AND verified_at IS NOT NULL
+		      AND platform_user_id IN (
+		          SELECT platform_user_id FROM platform_accounts WHERE id IN ({placeholders})
+		      )""",
+		(int(community_id), *account_ids),
+	).fetchall():
+		events.append(UserLifecycleEvent(
+			str(row[0]), "verification", "Verification completed",
+			str(row[1]) if row[1] else None,
+		))
+
+	normalized_types = {str(event_type).strip() for event_type in event_types if str(event_type).strip()}
+	if normalized_types:
+		events = [event for event in events if event.event_type in normalized_types]
+	events.sort(key=lambda event: _lifecycle_timestamp(event.occurred_at), reverse=True)
+	return events[:max(1, min(int(limit), 200))]
+
+
+def _lifecycle_timestamp(value: str) -> datetime:
+	try:
+		parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+	except ValueError:
+		return datetime.min.replace(tzinfo=UTC)
+	return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
 
 
 def _moderation_action_from_row(row: sqlite3.Row | tuple[object, ...]) -> UserModerationAction:
@@ -426,15 +554,29 @@ def _moderation_action_from_row(row: sqlite3.Row | tuple[object, ...]) -> UserMo
 	)
 
 
-def _resolve_platform_account_ids(connection: sqlite3.Connection, user_id: int) -> list[int]:
+def user_is_visible(
+	connection: sqlite3.Connection, user_id: int, *, community_id: int
+) -> bool:
+	return bool(_resolve_platform_account_ids(connection, user_id, community_id=community_id))
+
+
+def _resolve_platform_account_ids(
+	connection: sqlite3.Connection, user_id: int, *, community_id: int
+) -> list[int]:
 	if user_id >= 0:
 		rows = connection.execute(
-			"SELECT id FROM platform_accounts WHERE user_id = ?",
-			(user_id,),
+			"""SELECT id FROM platform_accounts WHERE user_id = ? AND EXISTS (
+			       SELECT 1 FROM messages WHERE messages.platform_account_id=platform_accounts.id
+			       AND messages.community_id=?
+			   )""",
+			(user_id, int(community_id)),
 		).fetchall()
 	else:
 		rows = connection.execute(
-			"SELECT id FROM platform_accounts WHERE id = ?",
-			(-user_id,),
+			"""SELECT id FROM platform_accounts WHERE id = ? AND EXISTS (
+			       SELECT 1 FROM messages WHERE messages.platform_account_id=platform_accounts.id
+			       AND messages.community_id=?
+			   )""",
+			(-user_id, int(community_id)),
 		).fetchall()
 	return [int(row[0]) for row in rows]

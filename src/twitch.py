@@ -5,6 +5,8 @@ import json
 import socket
 import ssl
 import threading
+import re
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
@@ -12,7 +14,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from .commands import CommandContext, CommandRegistry, build_default_command_registry, render_command_reply
+from .commands import (
+	CommandContext,
+	CommandRegistry,
+	build_default_command_registry,
+	render_command_reply,
+	require_command_surface,
+)
 from .db import (
 	connect_database,
 	initialize_database,
@@ -24,14 +32,22 @@ from .db import (
 	collect_observation
 )
 from .intelligence.events import ingest_event, observation_from_twitch_irc_event
+from .intelligence.community import (
+	platform_capabilities,
+	require_installation_surface,
+	resolve_tenant_context,
+)
 from .moderation import contains_streamboo_viewer_spam
-from .models import ConnectorHealth, IngestionResult, NormalizedMessage, CollectionResult, coerce_timestamp, observation_from_message
+from .models import ConnectorHealth, IngestionResult, NormalizedMessage, Observation, CollectionResult, coerce_timestamp, observation_from_message
 from .twitch_auth import (
 	TwitchAuthError,
 	TwitchReauthorizationRequired,
 	TwitchTemporaryAuthError as TokenTemporaryAuthError,
 	TwitchTokenManager,
 )
+
+
+CAPABILITIES = platform_capabilities("twitch")
 
 
 class TwitchPayloadError(ValueError):
@@ -187,11 +203,23 @@ class TwitchConnector:
 
 	def ingest_message(self, payload: Mapping[str, object]) -> CollectionResult:
 		normalized = normalize_twitch_message(payload)
-		observation = observation_from_message(normalized)
-
 		connection = connect_database(self.database_path)
 		try:
 			initialize_database(connection)
+			tenant = resolve_tenant_context(
+				connection,
+				platform="twitch",
+				external_community_id=str(normalized.guild_or_channel_context or ""),
+			)
+			normalized = replace(
+				normalized,
+				metadata={
+					**dict(normalized.metadata),
+					"community_id": tenant.community_id,
+					"installation_id": tenant.installation_id,
+				},
+			)
+			observation = observation_from_message(normalized)
 			result = collect_observation(connection, observation)
 			self._last_status = "ready"
 			return result
@@ -199,10 +227,29 @@ class TwitchConnector:
 			connection.close()
 
 	def ingest_event(self, raw_line: str) -> CollectionResult | None:
-		observation = observation_from_twitch_irc_event(raw_line)
+		channel_match = re.search(
+			r"(?:JOIN|PART|CLEARCHAT|CLEARMSG|USERNOTICE) #([^\s:]+)", raw_line
+		)
+		channel = channel_match.group(1).strip() if channel_match else ""
+		if not channel:
+			return None
+		connection = connect_database(self.database_path)
+		try:
+			initialize_database(connection)
+			tenant = resolve_tenant_context(
+				connection, platform="twitch", external_community_id=channel
+			)
+		finally:
+			connection.close()
+		observation = observation_from_twitch_irc_event(
+			raw_line, community_id=tenant.community_id
+		)
 		if observation is None:
 			return None
-		return ingest_event(self.database_path, observation)
+		return ingest_event(
+			self.database_path,
+			Observation(**{**observation.__dict__, "installation_id": tenant.installation_id}),
+		)
 
 	def configured_channels(self) -> tuple[str, ...]:
 		connection = connect_database(self.database_path)
@@ -434,10 +481,17 @@ class TwitchConnector:
 		).fetchone()
 		if message is None:
 			raise ValueError(f"Twitch message {message_id} was not found")
+		tenant = resolve_tenant_context(
+			connection, platform="twitch", external_community_id=str(message[0])
+		)
+		require_installation_surface(
+			connection, tenant=tenant, surface="provider:moderation"
+		)
 
 		pending_actions = list_pending_moderation_actions_for_message(
 			connection,
 			message_id,
+			tenant=tenant,
 		)
 		for action in pending_actions:
 			action_id = int(action[0])
@@ -462,6 +516,7 @@ class TwitchConnector:
 			mark_moderation_action_completed(
 				connection,
 				action_id,
+				tenant=tenant,
 				provider_status=provider_status,
 				provider_response=response_payload,
 			)
@@ -605,6 +660,10 @@ class TwitchConnector:
 		connection: object,
 		normalized: NormalizedMessage,
 	) -> object | None:
+		tenant = resolve_tenant_context(
+			connection, platform="twitch",
+			external_community_id=str(normalized.guild_or_channel_context or ""),
+		)
 		context = CommandContext(
 			platform="twitch",
 			database_path=self.database_path,
@@ -615,8 +674,12 @@ class TwitchConnector:
 			guild_id=None,
 			message_id=normalized.platform_message_id,
 			content=normalized.content_raw,
+			community_id=tenant.community_id,
 		)
 		try:
+			parsed = self._command_registry.parse_command(normalized.content_raw)
+			if parsed is not None:
+				require_command_surface(context, parsed[0])
 			return self._command_registry.dispatch(normalized.content_raw, context)
 		except Exception as exc:
 			self._logger.warning("twitch command dispatch failed: %s", exc)

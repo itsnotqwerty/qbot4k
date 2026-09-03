@@ -353,6 +353,8 @@ def _merge_canonical_users(
 def get_canonical_user_profile(
 	connection: sqlite3.Connection,
 	user_id: int,
+	*,
+	community_id: int | None = None,
 ) -> CanonicalUserProfile:
 	user = connection.execute(
 		"""
@@ -366,23 +368,35 @@ def get_canonical_user_profile(
 	if user is None:
 		raise ValueError("canonical user not found")
 
+	account_scope = "" if community_id is None else """
+		AND EXISTS (
+			SELECT 1 FROM messages
+			WHERE messages.platform_account_id = platform_accounts.id
+			  AND messages.community_id = ?
+		)
+	"""
+	account_parameters: tuple[object, ...] = (user_id,) if community_id is None else (user_id, community_id)
 	accounts = connection.execute(
-		"""
+		f"""
 		SELECT platform, platform_user_id, username, guild_or_channel_context
 		FROM platform_accounts
 		WHERE user_id = ?
+		{account_scope}
 		ORDER BY platform, platform_user_id
 		""",
-		(user_id,),
+		account_parameters,
 	).fetchall()
+	note_scope = "" if community_id is None else " AND community_id = ?"
+	note_parameters: tuple[object, ...] = (user_id,) if community_id is None else (user_id, community_id)
 	notes = connection.execute(
-		"""
+		f"""
 		SELECT id, operator_id, body, created_at
 		FROM user_notes
 		WHERE user_id = ?
+		{note_scope}
 		ORDER BY created_at, id
 		""",
-		(user_id,),
+		note_parameters,
 	).fetchall()
 
 	return CanonicalUserProfile(
@@ -434,6 +448,7 @@ def add_user_note(
 	user_id: int,
 	operator_id: int,
 	body: str,
+	community_id: int,
 ) -> int:
 	clean_body = body.strip()
 	if not clean_body:
@@ -451,11 +466,12 @@ def add_user_note(
 			"""
 			INSERT INTO user_notes (
 				user_id,
+				community_id,
 				operator_id,
 				body
-			) VALUES (?, ?, ?)
+			) VALUES (?, ?, ?, ?)
 			""",
-			(user_id, operator_id, clean_body),
+			(user_id, community_id, operator_id, clean_body),
 		)
 		row = connection.execute(
 			"SELECT id FROM user_notes WHERE rowid = last_insert_rowid()"
@@ -475,10 +491,10 @@ def add_user_note(
 				'user_note_create',
 				'user',
 				?,
-				json_object('body', ?)
+				json_object('body', ?, 'community_id', ?)
 			)
 			""",
-			(operator_id, user_id, clean_body),
+			(operator_id, user_id, clean_body, community_id),
 		)
 
 	if row is None:
@@ -490,14 +506,19 @@ def add_user_note(
 def list_user_notes(
 	connection: sqlite3.Connection,
 	user_id: int,
+	*,
+	community_id: int | None = None,
 ) -> list[sqlite3.Row]:
+	note_scope = "" if community_id is None else " AND community_id = ?"
+	parameters: tuple[object, ...] = (user_id,) if community_id is None else (user_id, community_id)
 	rows = connection.execute(
-		"""
+		f"""
 		SELECT id, operator_id, body, created_at
 		FROM user_notes
 		WHERE user_id = ?
+		{note_scope}
 		ORDER BY created_at, id
 		""",
-		(user_id,),
+		parameters,
 	).fetchall()
 	return list(rows)

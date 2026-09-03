@@ -14,15 +14,34 @@ class OverviewSnapshot:
 	top_platforms: tuple[tuple[str, int], ...]
 
 
-def load_overview_snapshot(connection: sqlite3.Connection) -> OverviewSnapshot:
-	messages_total = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+def load_overview_snapshot(
+	connection: sqlite3.Connection,
+	*,
+	community_id: int,
+) -> OverviewSnapshot:
+	messages_total = connection.execute(
+		"SELECT COUNT(*) FROM messages WHERE community_id = ?", (community_id,)
+	).fetchone()[0]
 	open_reviews = connection.execute(
-		"SELECT COUNT(*) FROM review_queue WHERE status = 'open'"
+		"""SELECT COUNT(*) FROM review_queue
+		   INNER JOIN messages ON messages.id = review_queue.message_id
+		   WHERE review_queue.status = 'open' AND messages.community_id = ?""",
+		(community_id,),
 	).fetchone()[0]
 	pending_actions = connection.execute(
-		"SELECT COUNT(*) FROM moderation_actions WHERE status = 'pending'"
+		"""SELECT COUNT(*) FROM moderation_actions
+		   WHERE status = 'pending' AND community_id = ?""",
+		(community_id,),
 	).fetchone()[0]
-	derived_signals = connection.execute("SELECT COUNT(*) FROM derived_signals").fetchone()[0]
+	derived_signals = connection.execute(
+		"""SELECT COUNT(*) FROM derived_signals
+		   WHERE EXISTS (
+		       SELECT 1 FROM messages
+		       WHERE messages.user_id = derived_signals.user_id
+		         AND messages.community_id = ?
+		   )""",
+		(community_id,),
+	).fetchone()[0]
 	top_channels = connection.execute(
 		"""
 		SELECT
@@ -35,18 +54,22 @@ def load_overview_snapshot(connection: sqlite3.Connection) -> OverviewSnapshot:
 			discord_channels.channel_id = messages.channel_id
 			AND messages.platform = 'discord'
 		)
+		WHERE messages.community_id = ?
 		GROUP BY messages.platform, messages.channel_id, discord_channels.channel_name
 		ORDER BY count DESC, messages.channel_id
 		LIMIT 5
-		"""
+		""",
+		(community_id,),
 	).fetchall()
 	top_platforms = connection.execute(
 		"""
 		SELECT platform, COUNT(*) AS count
 		FROM messages
+		WHERE community_id = ?
 		GROUP BY platform
 		ORDER BY count DESC, platform
-		"""
+		""",
+		(community_id,),
 	).fetchall()
 	return OverviewSnapshot(
 		messages_total=int(messages_total),

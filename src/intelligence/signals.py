@@ -227,20 +227,27 @@ def refresh_all_derived_signals(connection: sqlite3.Connection) -> int:
 def list_user_derived_signals(
     connection: sqlite3.Connection,
     user_id: int,
+    *,
+    community_id: int | None = None,
 ) -> list[DerivedSignal]:
+    signals_table = (
+        "derived_signals" if community_id is None else "community_derived_signal_windows"
+    )
+    tenant_scope = "" if community_id is None else " AND community_id=? AND window_name='24h'"
     rows = connection.execute(
-        """
+        f"""
         SELECT signal_key, value_real, confidence, evidence_count,
                window_start, window_end, value_json, analyzer_version, calculated_at
-        FROM derived_signals
-        WHERE user_id = ? AND analyzer_version = ?
+        FROM {signals_table}
+        WHERE user_id = ? AND analyzer_version = ?{tenant_scope}
         ORDER BY CASE signal_key
             WHEN 'risk.composite' THEN 0
             WHEN 'activity.message_count' THEN 1
             ELSE 2
         END, signal_key
         """,
-        (user_id, SIGNAL_ANALYZER_VERSION),
+        (user_id, SIGNAL_ANALYZER_VERSION) if community_id is None
+        else (user_id, SIGNAL_ANALYZER_VERSION, community_id),
     ).fetchall()
     return [_from_row(user_id, row) for row in rows]
 
@@ -252,6 +259,7 @@ def list_signal_overview(
     sort_by: str = "default",
     sort_dir: str = "desc",
     limit: int = 100,
+    community_id: int | None = None,
 ) -> list[tuple[str, DerivedSignal]]:
     selected_keys = tuple(dict.fromkeys(key for key in signal_keys if key in SIGNAL_LABELS))
     normalized_sort = sort_by.strip().casefold()
@@ -261,35 +269,44 @@ def list_signal_overview(
     if normalized_direction not in {"asc", "desc"}:
         normalized_direction = "desc"
     direction_sql = "ASC" if normalized_direction == "asc" else "DESC"
+    signals_table = (
+        "derived_signals" if community_id is None else "community_derived_signal_windows"
+    )
     order_sql = {
-        "default": "CASE derived_signals.signal_key WHEN 'risk.composite' THEN 0 ELSE 1 END ASC, derived_signals.value_real DESC",
-        "signal": f"derived_signals.signal_key {direction_sql}",
-        "value": f"derived_signals.value_real {direction_sql}",
-        "confidence": f"derived_signals.confidence {direction_sql}",
-        "evidence": f"derived_signals.evidence_count {direction_sql}",
-        "timestamp": f"derived_signals.calculated_at {direction_sql}",
+        "default": f"CASE {signals_table}.signal_key WHEN 'risk.composite' THEN 0 ELSE 1 END ASC, {signals_table}.value_real DESC",
+        "signal": f"{signals_table}.signal_key {direction_sql}",
+        "value": f"{signals_table}.value_real {direction_sql}",
+        "confidence": f"{signals_table}.confidence {direction_sql}",
+        "evidence": f"{signals_table}.evidence_count {direction_sql}",
+        "timestamp": f"{signals_table}.calculated_at {direction_sql}",
     }[normalized_sort]
-    conditions = ["derived_signals.analyzer_version = ?"]
+    conditions = [f"{signals_table}.analyzer_version = ?"]
     bindings: list[object] = [SIGNAL_ANALYZER_VERSION]
+    if community_id is not None:
+        conditions.extend([
+            f"{signals_table}.community_id = ?",
+            f"{signals_table}.window_name = '24h'",
+        ])
+        bindings.append(community_id)
     if selected_keys:
-        conditions.append(f"derived_signals.signal_key IN ({','.join('?' for _ in selected_keys)})")
+        conditions.append(f"{signals_table}.signal_key IN ({','.join('?' for _ in selected_keys)})")
         bindings.extend(selected_keys)
     where_sql = "WHERE " + " AND ".join(conditions)
     bindings.append(max(1, min(limit, 500)))
     rows = connection.execute(
         f"""
-        SELECT users.primary_display_name, derived_signals.user_id,
-               derived_signals.signal_key, derived_signals.value_real,
-               derived_signals.confidence, derived_signals.evidence_count,
-               derived_signals.window_start, derived_signals.window_end,
-               derived_signals.value_json, derived_signals.analyzer_version,
-               derived_signals.calculated_at
-        FROM derived_signals
-        INNER JOIN users ON users.id = derived_signals.user_id
+         SELECT users.primary_display_name, {signals_table}.user_id,
+             {signals_table}.signal_key, {signals_table}.value_real,
+             {signals_table}.confidence, {signals_table}.evidence_count,
+             {signals_table}.window_start, {signals_table}.window_end,
+             {signals_table}.value_json, {signals_table}.analyzer_version,
+             {signals_table}.calculated_at
+         FROM {signals_table}
+         INNER JOIN users ON users.id = {signals_table}.user_id
         {where_sql}
         ORDER BY {order_sql},
             users.primary_display_name COLLATE NOCASE,
-            derived_signals.signal_key
+            {signals_table}.signal_key
         LIMIT ?
         """,
         tuple(bindings),

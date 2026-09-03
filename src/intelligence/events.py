@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping
 
+from ..contexts import TenantContext
 from ..db import collect_observation, connect_database, get_observation, initialize_database
 from ..models import CollectionResult, Observation, coerce_timestamp, normalize_message_content
 from .content import analyze_observation_content, emit_content_alert
@@ -37,7 +38,9 @@ _DISCORD_EVENTS = {
 }
 
 
-def observation_from_discord_event(gateway_event: str, data: Mapping[str, object]) -> Observation | None:
+def observation_from_discord_event(
+    gateway_event: str, data: Mapping[str, object], *, community_id: int
+) -> Observation | None:
     event_type = _DISCORD_EVENTS.get(gateway_event.strip().upper())
     if event_type is None:
         return None
@@ -58,17 +61,21 @@ def observation_from_discord_event(gateway_event: str, data: Mapping[str, object
     external_id = ":".join(event_id_parts)
     attributes = dict(data)
     text = str(data.get("content") or "") or None
+    occurred_value = data.get("joined_at") if event_type == "member.joined" else data.get("timestamp")
     return Observation(
         platform="discord", event_type=event_type, external_event_id=external_id,
         actor_platform_user_id=actor_id, actor_username=actor_name,
         target_platform_user_id=target_id, container_id=str(data.get("channel_id") or "") or None,
         context_id=str(data.get("guild_id") or data.get("channel_id") or "") or None,
-        text=text, occurred_at=coerce_timestamp(data.get("timestamp") if isinstance(data.get("timestamp"), (str, datetime)) else None),
+        text=text, occurred_at=coerce_timestamp(occurred_value if isinstance(occurred_value, (str, datetime)) else None),
         attributes={"gateway_event": gateway_event, **_json_safe(attributes)},
+        community_id=community_id,
     )
 
 
-def observation_from_twitch_irc_event(raw_line: str) -> Observation | None:
+def observation_from_twitch_irc_event(
+    raw_line: str, *, community_id: int
+) -> Observation | None:
     line = raw_line.strip()
     if not line or " PRIVMSG " in line:
         return None
@@ -101,11 +108,13 @@ def observation_from_twitch_irc_event(raw_line: str) -> Observation | None:
         target_platform_user_id=target_id, container_id=channel, context_id=channel,
         text=tags.get("system-msg") or None,
         occurred_at=_millisecond_timestamp(tags.get("tmi-sent-ts")), attributes={"irc_tags": tags},
+        community_id=community_id,
     )
 
 
 def collect_external_feed_item(
     connection: sqlite3.Connection, *, source_key: str, external_event_id: str,
+    community_id: int,
     text: str, occurred_at: str | datetime | None = None, display_name: str | None = None,
     source_type: str = "api", actor_id: str | None = None, context_id: str | None = None,
     attributes: Mapping[str, object] | None = None, trust_weight: float = 0.5,
@@ -123,6 +132,7 @@ def collect_external_feed_item(
         platform=f"external:{key}", event_type="external.item", external_event_id=external_event_id.strip(),
         actor_platform_user_id=actor_id, actor_username=actor_id, context_id=context_id or key,
         text=text, occurred_at=coerce_timestamp(occurred_at), attributes=dict(attributes or {}),
+        community_id=int(community_id),
     ))
     connection.execute("UPDATE external_feed_sources SET last_observed_at=? WHERE source_key=?", (coerce_timestamp(occurred_at), key))
     connection.commit()
@@ -136,12 +146,17 @@ class GenericEventAnalysisPipeline:
     def analyze_event(self, connection: sqlite3.Connection, job) -> None:
         if job.observation_id is None:
             raise ValueError("event analysis requires an observation")
-        observation = get_observation(connection, int(job.observation_id))
+        observation = get_observation(
+            connection, int(job.observation_id), tenant=TenantContext(job.community_id)
+        )
         if observation is None or str(observation["event_type"]) not in SUPPORTED_EVENT_TYPES:
             raise ValueError("unsupported or missing event observation")
         with connection:
             _ensure_event_users(connection, observation)
-            content = analyze_observation_content(connection, int(job.observation_id))
+            tenant = TenantContext(job.community_id)
+            content = analyze_observation_content(
+                connection, int(job.observation_id), tenant=tenant
+            )
             emit_content_alert(connection, int(job.observation_id), content)
             _project_event_state(connection, observation)
             _upsert_event_relationship(connection, observation)
@@ -194,6 +209,7 @@ def _upsert_event_relationship(connection: sqlite3.Connection, observation: sqli
     if users is None or users[0] is None or users[1] is None or users[0] == users[1]:
         return
     relationship = str(observation["event_type"])
+    tenant = TenantContext.require(observation["community_id"])
     context = str(observation["context_id"] or observation["container_id"] or "")
     occurred = str(observation["occurred_at"])
     connection.execute(
@@ -203,13 +219,13 @@ def _upsert_event_relationship(connection: sqlite3.Connection, observation: sqli
            ON CONFLICT(community_id, source_user_id, target_user_id, relationship_type, context_key) DO UPDATE SET
              strength=entity_relationships.strength+1, evidence_count=entity_relationships.evidence_count+1,
              last_observed_at=excluded.last_observed_at, evidence_json=excluded.evidence_json""",
-        (int(observation["community_id"] or 1), int(users[0]), int(users[1]), relationship, context, occurred, occurred,
+        (tenant.community_id, int(users[0]), int(users[1]), relationship, context, occurred, occurred,
          json.dumps({"latest_observation_id": int(observation["id"])})),
     )
     relationship_row = connection.execute(
         """SELECT id FROM entity_relationships WHERE community_id=? AND source_user_id=? AND target_user_id=?
            AND relationship_type=? AND context_key=?""",
-        (int(observation["community_id"] or 1), int(users[0]), int(users[1]), relationship, context),
+        (tenant.community_id, int(users[0]), int(users[1]), relationship, context),
     ).fetchone()
     if relationship_row is not None:
         connection.execute(

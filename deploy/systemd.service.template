@@ -1,0 +1,25 @@
+[Unit]
+Description=__DESCRIPTION__
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__APP_USER__
+Group=__APP_GROUP__
+WorkingDirectory=__APP_DIR__
+Environment=PORT=__PORT__
+EnvironmentFile=-__ENV_FILE__
+ExecStart=__PYTHON__ -m src --env-file __ENV_FILE__ run
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__APP_DIR__ __CONFIG_DIR__ -/opt/qbot4k/data -/var/lib/qbot4k -/var/backups/qbot4k
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

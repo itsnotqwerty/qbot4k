@@ -21,9 +21,26 @@ def claim_processing_job(
     try:
         row = connection.execute(
             """
-            SELECT id
-            FROM processing_jobs
-            WHERE stage = ?
+                        WITH eligible_tenants AS (
+                                SELECT DISTINCT community_id
+                                FROM processing_jobs
+                                WHERE stage = ? AND community_id IS NOT NULL
+                                    AND (
+                                            (status IN ('pending', 'retry') AND available_at <= CURRENT_TIMESTAMP)
+                                            OR (status = 'running' AND lease_expires_at <= CURRENT_TIMESTAMP)
+                                    )
+                                    AND attempts < max_attempts
+                        ), selected_tenant AS (
+                                SELECT eligible_tenants.community_id
+                                FROM eligible_tenants
+                                LEFT JOIN tenant_job_schedule USING (community_id)
+                                ORDER BY COALESCE(last_claim_sequence, 0), eligible_tenants.community_id
+                                LIMIT 1
+                        )
+                        SELECT id,community_id
+                        FROM processing_jobs
+                        WHERE stage = ?
+                            AND community_id=(SELECT community_id FROM selected_tenant)
               AND (
                   (status IN ('pending', 'retry') AND available_at <= CURRENT_TIMESTAMP)
                   OR (status = 'running' AND lease_expires_at <= CURRENT_TIMESTAMP)
@@ -32,13 +49,14 @@ def claim_processing_job(
             ORDER BY priority ASC, available_at ASC, id ASC
             LIMIT 1
             """,
-            (normalized_stage,),
+            (normalized_stage, normalized_stage),
         ).fetchone()
         if row is None:
             connection.commit()
             return None
 
         job_id = int(row["id"])
+        community_id = int(row["community_id"]) if row["community_id"] is not None else None
         cursor = connection.execute(
             """
             UPDATE processing_jobs
@@ -60,6 +78,15 @@ def claim_processing_job(
         if cursor.rowcount != 1:
             connection.rollback()
             return None
+        if community_id is not None:
+            connection.execute(
+                """INSERT INTO tenant_job_schedule(community_id,last_claim_sequence)
+                   VALUES (?,(SELECT COALESCE(MAX(last_claim_sequence),0)+1 FROM tenant_job_schedule))
+                   ON CONFLICT(community_id) DO UPDATE SET
+                       last_claim_sequence=(SELECT COALESCE(MAX(last_claim_sequence),0)+1
+                                            FROM tenant_job_schedule)""",
+                (community_id,),
+            )
         connection.commit()
     except Exception:
         connection.rollback()

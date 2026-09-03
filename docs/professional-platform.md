@@ -28,9 +28,19 @@ Configure:
 ```text
 QBOT_TWITCH_EVENTSUB_SECRET=<at least 16 random characters>
 QBOT_TWITCH_EVENTSUB_CALLBACK_URL=https://example.com/webhooks/twitch/eventsub
+QBOT_TWITCH_CLIENT_ID=<Twitch application client ID>
+QBOT_TWITCH_CLIENT_SECRET=<Twitch application client secret>
+QBOT_TWITCH_OAUTH_REDIRECT_URI=https://example.com/integrations/twitch/callback
+QBOT_CREDENTIAL_ENCRYPTION_KEY=<Fernet key>
 ```
 
-Create or reconcile subscriptions from deployment automation using Twitch's EventSub API and record returned subscriptions in `twitch_eventsub_subscriptions`. The stored state is the control-plane inventory; Twitch remains the authority.
+The integrations page binds the selected broadcaster and reviewed scopes to the
+active operator and community. OAuth tokens are encrypted at rest, rotations
+are audited, and interrupted authorization remains resumable. A successful
+callback reconciles `stream.online` and `stream.offline` subscriptions and only
+marks the installation active after the connection health check succeeds. The
+stored subscription state is the control-plane inventory; Twitch remains the
+authority.
 
 ## 4. Durable event and worker runtime
 

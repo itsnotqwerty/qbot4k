@@ -8,7 +8,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -19,13 +19,14 @@ if __package__ in {None, ""}:
     from src.discord import DiscordConnector
     from src.health import build_health_snapshot, create_health_server
     from src.jobs import run_maintenance_jobs
-    from src.jobs import run_twitch_live_announcement_job
+    from src.jobs import run_onboarding_checkpoint_job, run_onboarding_role_job, run_scheduled_announcement_job, run_twitch_live_announcement_job
     from src.logging_utils import configure_logging
     from src.token_store import configure_token_store, persist_refreshed_twitch_tokens
     from src.twitch import TwitchConnector
     from src.twitch_auth import TwitchTokenManager
     from src.pipeline.analysis import AnalysisRegistry
     from src.intelligence.events import GenericEventAnalysisPipeline, SUPPORTED_EVENT_TYPES
+    from src.intelligence.community import issue_pilot_invitation
     from src.pipeline.message_analysis import (
         MESSAGE_ANALYSIS_JOB_TYPE,
         MessageAnalysisPipeline,
@@ -44,13 +45,14 @@ else:
     from .discord import DiscordConnector
     from .health import build_health_snapshot, create_health_server
     from .jobs import run_maintenance_jobs
-    from .jobs import run_twitch_live_announcement_job
+    from .jobs import run_onboarding_checkpoint_job, run_onboarding_role_job, run_scheduled_announcement_job, run_twitch_live_announcement_job
     from .logging_utils import configure_logging
     from .token_store import configure_token_store, persist_refreshed_twitch_tokens
     from .twitch import TwitchConnector
     from .twitch_auth import TwitchTokenManager
     from .pipeline.analysis import AnalysisRegistry
     from .intelligence.events import GenericEventAnalysisPipeline, SUPPORTED_EVENT_TYPES
+    from .intelligence.community import issue_pilot_invitation
     from .pipeline.message_analysis import (
         MESSAGE_ANALYSIS_JOB_TYPE,
         MessageAnalysisPipeline,
@@ -114,6 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate environment configuration")
     subparsers.add_parser("init-db", help="Initialize the SQLite schema")
     subparsers.add_parser("platform-audit", help="Audit professional-platform readiness")
+    invite_parser = subparsers.add_parser(
+        "issue-pilot-invite", help="Issue a single-use community onboarding invitation"
+    )
+    invite_parser.add_argument("community_id", type=int)
+    invite_parser.add_argument("--expires-hours", type=int, default=72)
+    invite_parser.add_argument("--operator-id", type=int)
 
     run_parser = subparsers.add_parser(
         "run",
@@ -182,6 +190,33 @@ def run_readiness_audit(env_file: Path | None = None) -> int:
         connection.close()
     print(json.dumps(result, indent=2, sort_keys=True))
     return 1 if result["status"] == "fail" else 0
+
+
+def run_issue_pilot_invite(
+    community_id: int,
+    expires_hours: int,
+    operator_id: int | None,
+    env_file: Path | None = None,
+) -> int:
+    if expires_hours < 1 or expires_hours > 720:
+        raise ConfigError("--expires-hours must be between 1 and 720")
+    settings = load_settings(env_file)
+    connection = connect_database(settings.database_path)
+    try:
+        initialize_database(connection)
+        code = issue_pilot_invitation(
+            connection, community_id=community_id,
+            expires_at=(datetime.now(timezone.utc) + timedelta(hours=expires_hours)).isoformat(),
+            created_by_operator_id=operator_id,
+        )
+    finally:
+        connection.close()
+    print(json.dumps({
+        "community_id": community_id,
+        "expires_hours": expires_hours,
+        "pilot_invite_code": code,
+    }, sort_keys=True))
+    return 0
 
 
 def run_application(once: bool, env_file: Path | None = None) -> int:
@@ -271,10 +306,25 @@ def run_application(once: bool, env_file: Path | None = None) -> int:
             maintenance_report.backup_path,
         )
         if "discord" in settings.enabled_services and "twitch" in settings.enabled_services:
-            announcements = run_twitch_live_announcement_job(settings)
+            announcements = run_twitch_live_announcement_job(
+                settings, twitch_token_manager
+            )
             if announcements > 0:
                 logging.getLogger("qbot4k.jobs").info(
                     "sent twitch live announcements count=%s", announcements)
+        if "discord" in settings.enabled_services:
+            checkpoint_reminders = run_onboarding_checkpoint_job(settings)
+            if checkpoint_reminders > 0:
+                logging.getLogger("qbot4k.jobs").info(
+                    "queued onboarding checkpoint reminders count=%s", checkpoint_reminders)
+            scheduled_announcements = run_scheduled_announcement_job(settings)
+            if scheduled_announcements > 0:
+                logging.getLogger("qbot4k.jobs").info(
+                    "sent scheduled announcements count=%s", scheduled_announcements)
+            newcomer_roles = run_onboarding_role_job(settings)
+            if newcomer_roles > 0:
+                logging.getLogger("qbot4k.jobs").info(
+                    "assigned newcomer roles count=%s", newcomer_roles)
         service_states["jobs"] = "ready"
     snapshot = build_health_snapshot(
         settings,
@@ -333,10 +383,24 @@ def run_application(once: bool, env_file: Path | None = None) -> int:
                 )
                 jobs_logger.info("maintenance run complete")
                 if "discord" in settings.enabled_services and "twitch" in settings.enabled_services:
-                    announcements = run_twitch_live_announcement_job(settings)
+                    announcements = run_twitch_live_announcement_job(
+                        settings, twitch_token_manager
+                    )
                     if announcements > 0:
                         jobs_logger.info(
                             "sent twitch live announcements count=%s", announcements)
+                if "discord" in settings.enabled_services:
+                    checkpoint_reminders = run_onboarding_checkpoint_job(settings)
+                    if checkpoint_reminders > 0:
+                        jobs_logger.info(
+                            "queued onboarding checkpoint reminders count=%s", checkpoint_reminders)
+                    scheduled_announcements = run_scheduled_announcement_job(settings)
+                    if scheduled_announcements > 0:
+                        jobs_logger.info(
+                            "sent scheduled announcements count=%s", scheduled_announcements)
+                    newcomer_roles = run_onboarding_role_job(settings)
+                    if newcomer_roles > 0:
+                        jobs_logger.info("assigned newcomer roles count=%s", newcomer_roles)
             except Exception:
                 jobs_logger.exception("maintenance run failed")
             else:
@@ -759,6 +823,10 @@ def main(argv: list[str] | None = None) -> int:
             return run_init_db(args.env_file)
         if args.command == "platform-audit":
             return run_readiness_audit(args.env_file)
+        if args.command == "issue-pilot-invite":
+            return run_issue_pilot_invite(
+                args.community_id, args.expires_hours, args.operator_id, args.env_file
+            )
         if args.command == "run":
             return run_application(args.once, args.env_file)
         if args.command == "watch":
