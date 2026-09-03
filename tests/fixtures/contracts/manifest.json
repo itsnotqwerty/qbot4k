@@ -1,0 +1,6241 @@
+{
+  "cli_commands": [
+    "check-config",
+    "init-db",
+    "issue-pilot-invite",
+    "platform-audit",
+    "run",
+    "watch"
+  ],
+  "configuration": {
+    "sensitive_variables": [
+      "QBOT_CREDENTIAL_ENCRYPTION_KEY",
+      "QBOT_DASHBOARD_SESSION_SECRET",
+      "QBOT_DISCORD_BOT_TOKEN",
+      "QBOT_DISCORD_OAUTH_CLIENT_SECRET",
+      "QBOT_INGEST_API_TOKEN",
+      "QBOT_TWITCH_BOT_TOKEN",
+      "QBOT_TWITCH_CLIENT_SECRET",
+      "QBOT_TWITCH_EVENTSUB_SECRET",
+      "QBOT_TWITCH_REFRESH_TOKEN"
+    ],
+    "variables": [
+      "QBOT_ANALYTICS_INTERVAL_SECONDS",
+      "QBOT_AUDIT_RETENTION_DAYS",
+      "QBOT_BACKUP_DIR",
+      "QBOT_BACKUP_INTERVAL_SECONDS",
+      "QBOT_BACKUP_RETENTION_COUNT",
+      "QBOT_CREDENTIAL_ENCRYPTION_KEY",
+      "QBOT_DASHBOARD_HOST",
+      "QBOT_DASHBOARD_PORT",
+      "QBOT_DASHBOARD_SESSION_SECRET",
+      "QBOT_DATABASE_PATH",
+      "QBOT_DATABASE_URL",
+      "QBOT_DEFAULT_COMMUNITY_SLUG",
+      "QBOT_DISCORD_BOT_TOKEN",
+      "QBOT_DISCORD_GUILD_IDS",
+      "QBOT_DISCORD_OAUTH_CLIENT_ID",
+      "QBOT_DISCORD_OAUTH_CLIENT_SECRET",
+      "QBOT_DISCORD_OAUTH_REDIRECT_URI",
+      "QBOT_ENABLED_SERVICES",
+      "QBOT_INGEST_API_TOKEN",
+      "QBOT_LEGAL_CONTACT_EMAIL",
+      "QBOT_LEGAL_EFFECTIVE_DATE",
+      "QBOT_LEGAL_JURISDICTION",
+      "QBOT_LEGAL_ORGANIZATION_NAME",
+      "QBOT_LOG_LEVEL",
+      "QBOT_MAINTENANCE_INTERVAL_SECONDS",
+      "QBOT_OPERATOR_GUILD_IDS",
+      "QBOT_RAW_ARCHIVE_DIR",
+      "QBOT_SYSTEMD_SERVICE_NAME",
+      "QBOT_TWITCH_BOT_TOKEN",
+      "QBOT_TWITCH_CHANNELS",
+      "QBOT_TWITCH_CLIENT_ID",
+      "QBOT_TWITCH_CLIENT_SECRET",
+      "QBOT_TWITCH_EVENTSUB_CALLBACK_URL",
+      "QBOT_TWITCH_EVENTSUB_SECRET",
+      "QBOT_TWITCH_JOIN_COMMAND_CHANNEL",
+      "QBOT_TWITCH_OAUTH_REDIRECT_URI",
+      "QBOT_TWITCH_REFRESH_TOKEN"
+    ]
+  },
+  "cryptographic_contracts": {
+    "installation_oauth_state": {
+      "payload_encoding": "base64url(json-utf8)",
+      "signature": "lowercase-hex(hmac-sha256(secret, encoded-payload-ascii))",
+      "wire_format": "encoded-payload.signature"
+    },
+    "login_oauth_state": {
+      "comparison": "constant-time",
+      "generation": "token_urlsafe(24)",
+      "name": "qbot4k_oauth_state"
+    },
+    "session_cookie": {
+      "attributes": [
+        "Path=/",
+        "HttpOnly",
+        "SameSite=Lax",
+        "Secure when HTTPS"
+      ],
+      "name": "qbot4k_session",
+      "payload_encoding": "base64url(json-utf8)",
+      "signature": "lowercase-hex(hmac-sha256(secret, encoded-payload-ascii))",
+      "wire_format": "encoded-payload.signature"
+    },
+    "twitch_eventsub": {
+      "comparison": "constant-time",
+      "maximum_age_seconds": 600,
+      "message": "message-id-utf8 + timestamp-utf8 + raw-body",
+      "signature": "sha256=lowercase-hex(hmac-sha256(secret, message))"
+    }
+  },
+  "format_version": 1,
+  "http_routes": [
+    {
+      "handler": "_serve_twitch_eventsub",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/webhooks/twitch/eventsub"
+        ]
+      },
+      "policy": {
+        "capability": "events.ingest",
+        "guard": "webhook_signature",
+        "kind": "http",
+        "scope": "installation"
+      },
+      "predicate": "handler.command == 'POST' and path == '/webhooks/twitch/eventsub'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'eventsub_not_configured'",
+          "'invalid_body_length'",
+          "'invalid_content_length'",
+          "'invalid_eventsub_signature'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_broadcaster_id'",
+          "'unknown_installation'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "observation_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'eventsub_not_configured'}",
+          "{'error': 'invalid_body_length'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_eventsub_signature'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_broadcaster_id'}",
+          "{'error': 'unknown_installation'}",
+          "{'status': 'unsupported_event'}",
+          "{'status': result.status, 'observation_id': result.observation_id}",
+          "{}"
+        ],
+        "redirects": [],
+        "statuses": [
+          "ACCEPTED",
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "NOT_FOUND",
+          "NO_CONTENT",
+          "OK",
+          "SERVICE_UNAVAILABLE"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_public_home",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/"
+        ]
+      },
+      "policy": {
+        "capability": "public.access",
+        "guard": "public",
+        "kind": "http",
+        "scope": "global"
+      },
+      "predicate": "handler.command == 'GET' and path == '/'",
+      "response": {
+        "content_types": [
+          "text/html; charset=utf-8"
+        ],
+        "errors": [],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [],
+        "statuses": [
+          "OK"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_dashboard",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/dashboard"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/dashboard'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_system_health",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/system-health"
+        ]
+      },
+      "policy": {
+        "capability": "public.access",
+        "guard": "public",
+        "kind": "http",
+        "scope": "global"
+      },
+      "predicate": "handler.command == 'GET' and path == '/system-health'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/live-ops"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/live-ops'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_dashboard_go_live",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/dashboard/go-live"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/dashboard/go-live'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/dashboard?status=Go%20Live%20failed'",
+          "'/dashboard?status=Go%20Live%20sent%200%20pings'",
+          "'/login'",
+          "f\"/dashboard?status={quote(f'Go Live sent {announcements} pings')}\""
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_dashboard_restart",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/dashboard/restart"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/dashboard/restart'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f\"/dashboard?status={quote(f'Restart requested for {service_name}')}\""
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_dashboard_reset_database",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/dashboard/reset-database"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/dashboard/reset-database'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "confirmation"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/dashboard?status=Database%20reset%20cancelled'",
+          "'/dashboard?status=Database%20reset%20failed'",
+          "'/login'",
+          "f'/dashboard?status={status}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_community_switch",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/community/switch"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/community/switch'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Community access is not available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid community'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "community_id"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/dashboard'",
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_users",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/users"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/users'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "dir",
+            "link_status",
+            "link_user_id",
+            "q",
+            "sort"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_signals",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/signals"
+        ]
+      },
+      "policy": {
+        "capability": "analytics.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/signals'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/intelligence"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/intelligence'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "alert_q",
+            "alert_status",
+            "assignee",
+            "severity",
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_search",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/search"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/search'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "context_id",
+            "end_at",
+            "entity_type",
+            "entity_value",
+            "event_type",
+            "limit",
+            "offset",
+            "platform",
+            "q",
+            "start_at",
+            "user_id"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_search_export",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/search/export.csv"
+        ]
+      },
+      "policy": {
+        "capability": "exports.create",
+        "guard": "session",
+        "kind": "export",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/search/export.csv'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_search_save",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/search/saved"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/search/saved'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "name",
+            "q"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/search?q={quote(query_text)}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_analytics",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/analytics"
+        ]
+      },
+      "policy": {
+        "capability": "analytics.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/analytics'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_analytics_export",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/analytics/export.json"
+        ]
+      },
+      "policy": {
+        "capability": "exports.create",
+        "guard": "session",
+        "kind": "export",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/analytics/export.json'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence_case",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/intelligence/cases/"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/intelligence/cases/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Case not found'",
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid case'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence_case_action",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/intelligence/cases/"
+        ],
+        "suffix": [
+          "/action"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/intelligence/cases/') and path.endswith('/action')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid case update'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "action",
+            "alert_id",
+            "body",
+            "message_id",
+            "note",
+            "observation_id",
+            "owner_operator_id",
+            "priority",
+            "role",
+            "status",
+            "summary",
+            "title",
+            "user_id"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/intelligence/cases/{case_id}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_audit",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/audit"
+        ]
+      },
+      "policy": {
+        "capability": "audit.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/audit'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "action_type",
+            "actor_id",
+            "entity_type",
+            "start_at"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence_alert_case",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/intelligence/alerts/"
+        ],
+        "suffix": [
+          "/case"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/intelligence/alerts/') and path.endswith('/case')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid alert'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/intelligence/cases/{case_id}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence_alert_disposition",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/intelligence/alerts/"
+        ],
+        "suffix": [
+          "/disposition"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/intelligence/alerts/') and path.endswith('/disposition')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid disposition'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "disposition"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/intelligence?status=Alert+resolved'",
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence_alert_workflow",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/intelligence/alerts/"
+        ],
+        "suffix": [
+          "/workflow"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/intelligence/alerts/') and path.endswith('/workflow')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid alert update'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "assigned_operator_id",
+            "status",
+            "suppress_until"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/intelligence?status=Alert+updated'",
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_intelligence_report_generate",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/intelligence/reports/generate"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/intelligence/reports/generate'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "report_type",
+            "user_id"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/intelligence?status=Entity+profile+requires+a+user+ID'",
+          "'/intelligence?status=Invalid+user+ID'",
+          "'/login'",
+          "f'/api/intelligence/reports/{report_id}'",
+          "f'/intelligence?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_users_link",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/users/link"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/users/link'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "dir",
+            "platform",
+            "q",
+            "selected_user_id",
+            "sort",
+            "usernames"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "_users_url(selected=selected_user_id, status='No usernames provided')",
+          "_users_url(selected=selected_user_id, status=status_message)",
+          "_users_url(status='Invalid selected user')",
+          "_users_url(status='Selected user not found')"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_users_unlink",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/users/unlink"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/users/unlink'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "confirmation",
+            "platform_account_id",
+            "user_id"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/users?link_status=' + quote('Invalid unlink request')",
+          "_user_url('Platform account does not belong to this user')",
+          "_user_url('Unlink confirmation failed')",
+          "_user_url(f'Unlinked {platform} account {username}')"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_user_moderation_action",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/users/"
+        ],
+        "suffix": [
+          "/moderation"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/users/') and path.endswith('/moderation')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Invalid user id'",
+          "'Missing form body'",
+          "'Not found'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "action_type",
+            "confirmation",
+            "reason",
+            "target_platform_account_id"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f\"/users/{user_id}?mod_status={quote('Invalid action type')}\"",
+          "f\"/users/{user_id}?mod_status={quote('Invalid platform account')}\"",
+          "f\"/users/{user_id}?mod_status={quote('Permanent ban confirmation required')}\"",
+          "f\"/users/{user_id}?mod_status={quote('Platform account does not belong to this user')}\"",
+          "f\"/users/{user_id}?mod_status={quote('Platform account not found')}\"",
+          "f\"/users/{user_id}?mod_status={quote('Reason is required')}\"",
+          "f\"/users/{user_id}?mod_status={quote(f'Moderation action {action_type} recorded')}\""
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_user_lifecycle_export",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/users/"
+        ],
+        "suffix": [
+          "/lifecycle.csv"
+        ]
+      },
+      "policy": {
+        "capability": "exports.create",
+        "guard": "session",
+        "kind": "export",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/users/') and path.endswith('/lifecycle.csv')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid user id'",
+          "'User not found'"
+        ],
+        "inputs": {
+          "query": [
+            "lifecycle"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_user_messages",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/users/"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/users/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid user id'",
+          "'Not found'",
+          "'User not found'"
+        ],
+        "inputs": {
+          "query": [
+            "account_status",
+            "lifecycle",
+            "mod_status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/moderation"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.queues.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/moderation'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "page",
+            "queue",
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_filter_save",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/moderation/filters"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.queues.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/moderation/filters'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "filters",
+            "name"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=' + quote('Filter saved')",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_work_assign",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/work/"
+        ],
+        "suffix": [
+          "/assign"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/work/') and path.endswith('/assign')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?queue=mine&status=' + quote('Work assigned')",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_review_resolve",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/reviews/"
+        ],
+        "suffix": [
+          "/resolve"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/reviews/') and path.endswith('/resolve')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "action_type",
+            "confirmation",
+            "duration_seconds",
+            "note",
+            "resolution"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=Review+resolved'",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_member_queue_resolve",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/reports/"
+        ],
+        "suffix": [
+          "/resolve"
+        ]
+      },
+      "policy": {
+        "capability": "appeals.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/reports/') and path.endswith('/resolve')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "note",
+            "resolution"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/moderation?status={queue_type.title()}+resolved'",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_member_queue_resolve",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/appeals/"
+        ],
+        "suffix": [
+          "/resolve"
+        ]
+      },
+      "policy": {
+        "capability": "appeals.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/appeals/') and path.endswith('/resolve')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "note",
+            "resolution"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/moderation?status={queue_type.title()}+resolved'",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_rule_save",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/moderation/rules"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/moderation/rules'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "action_duration_seconds",
+            "auto_enforce_action",
+            "enabled",
+            "enforcement_mode",
+            "name",
+            "pattern",
+            "rule_type",
+            "severity"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=Rule+saved'",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_rule_draft",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/moderation/rules/drafts"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/moderation/rules/drafts'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "action_duration_seconds",
+            "auto_enforce_action",
+            "name",
+            "pattern",
+            "platform_scope",
+            "rule_type",
+            "severity"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=Rule+draft+created'",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_rule_preview",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/rule-versions/"
+        ],
+        "suffix": [
+          "/preview"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/rule-versions/') and path.endswith('/preview')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "samples"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=' + quote(f\"Sample impact: {impact['match_count']} of {impact['sample_count']} matched\")",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_rule_publish",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/rule-versions/"
+        ],
+        "suffix": [
+          "/publish"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/rule-versions/') and path.endswith('/publish')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "lifecycle_state"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=' + ('Rule+rolled+back' if rollback else 'Rule+published')",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_rule_rollback",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/rule-versions/"
+        ],
+        "suffix": [
+          "/rollback"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/rule-versions/') and path.endswith('/rollback')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "lifecycle_state"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=' + ('Rule+rolled+back' if rollback else 'Rule+published')",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_moderation_rule_exemption",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/moderation/rules/"
+        ],
+        "suffix": [
+          "/exemptions"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/moderation/rules/') and path.endswith('/exemptions')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "exemption_type",
+            "exemption_value",
+            "reason"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/moderation?status=Rule+exemption+added'",
+          "f'/moderation?status={quote(str(exc))}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_commands",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/commands"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/commands'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_integrations",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/integrations"
+        ]
+      },
+      "policy": {
+        "capability": "integrations.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/integrations'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "error",
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_settings",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/settings"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/settings'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Community settings not found'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_settings_update",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/settings"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/settings'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "analytics_retention_days",
+            "anti_abuse_enforcement_mode",
+            "description",
+            "guidelines",
+            "join_raid_limit",
+            "join_raid_window_seconds",
+            "locale",
+            "mention_limit",
+            "message_burst_limit",
+            "message_burst_window_seconds",
+            "message_retention_days",
+            "name",
+            "timezone"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/settings?status=' + quote('Settings saved')"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_settings_operator_invite",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/settings/operators/invite"
+        ]
+      },
+      "policy": {
+        "capability": "operators.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/settings/operators/invite'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "discord_user_id",
+            "expires_hours",
+            "role"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/settings?status=' + quote('Operator invited')"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_announcements",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/announcements"
+        ]
+      },
+      "policy": {
+        "capability": "announcements.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/announcements'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Community not found'",
+          "'Forbidden'",
+          "'Select a community'"
+        ],
+        "inputs": {
+          "query": [
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_onboarding",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/onboarding"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/onboarding'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/html; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Select a community'"
+        ],
+        "inputs": {
+          "query": [
+            "status"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_onboarding_update",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/onboarding"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/onboarding'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid Discord installation'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'Onboarding management is not authorized'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "checkpoint_due_hours",
+            "checkpoint_reminder_enabled",
+            "checkpoint_reminder_template",
+            "discord_installation_id",
+            "enabled",
+            "newcomer_role_enabled",
+            "newcomer_role_id",
+            "self_service_verification_enabled",
+            "verification_evidence_required",
+            "verification_resource_enabled",
+            "verification_resource_template",
+            "verification_resource_url",
+            "welcome_channel_id",
+            "welcome_template"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/onboarding?status=Welcome%20automation%20saved'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_onboarding_verify",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/onboarding/verify"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/onboarding/verify'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Member is required'",
+          "'Missing form body'",
+          "'Newcomer checkpoint not found'",
+          "'Onboarding management is not authorized'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "platform_user_id",
+            "verification_evidence"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/onboarding?status=Member%20verified'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_onboarding_resource_save",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/onboarding/resources"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/onboarding/resources'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Invalid resource'",
+          "'Missing form body'",
+          "'Onboarding management is not authorized'",
+          "'Onboarding resource not found'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "enabled",
+            "message_template",
+            "resource_id",
+            "resource_url",
+            "sort_order",
+            "title"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/onboarding?status=Resource%20saved'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_onboarding_resource_delete",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/onboarding/resources/"
+        ],
+        "suffix": [
+          "/delete"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/onboarding/resources/') and path.endswith('/delete')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid resource'",
+          "'Onboarding management is not authorized'",
+          "'Onboarding resource not found'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "'/onboarding?status=Resource%20deleted'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_announcement_create",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/announcements"
+        ]
+      },
+      "policy": {
+        "capability": "announcements.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/announcements'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Announcement management is not authorized'",
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid Discord installation'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "body",
+            "platform",
+            "target_external_id",
+            "target_installation_id"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/announcements?status=Draft%20saved'",
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_announcement_approve",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/announcements/"
+        ],
+        "suffix": [
+          "/approve"
+        ]
+      },
+      "policy": {
+        "capability": "announcements.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/announcements/') and path.endswith('/approve')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Announcement management is not authorized'",
+          "'Community access is no longer available'",
+          "'Draft announcement not found'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid announcement'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "scheduled_at"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/announcements?status=Announcement%20scheduled'",
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_announcement_cancel",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/announcements/"
+        ],
+        "suffix": [
+          "/cancel"
+        ]
+      },
+      "policy": {
+        "capability": "announcements.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/announcements/') and path.endswith('/cancel')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Announcement management is not authorized'",
+          "'Announcement not found'",
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid announcement'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/announcements?status={status}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_announcement_retry",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/announcements/"
+        ],
+        "suffix": [
+          "/retry"
+        ]
+      },
+      "policy": {
+        "capability": "announcements.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/announcements/') and path.endswith('/retry')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Announcement management is not authorized'",
+          "'Announcement not found'",
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid announcement'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f'/announcements?status={status}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_discord_link",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/integrations/discord/link"
+        ]
+      },
+      "policy": {
+        "capability": "integrations.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/integrations/discord/link'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Discord installation is not authorized'",
+          "'Discord installation is not configured'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid community'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'Unable to create installation state'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "community_id",
+            "guild_id",
+            "pilot_invite_code"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "build_discord_install_url(client_id, self._discord_install_redirect_uri(handler), state_token, guild_id)"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "INTERNAL_SERVER_ERROR",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "SERVICE_UNAVAILABLE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_discord_install_callback",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/integrations/discord/callback"
+        ]
+      },
+      "policy": {
+        "capability": "integrations.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/integrations/discord/callback'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Discord OAuth is not configured'",
+          "'Discord installation failed'",
+          "'Discord installation state was already used'",
+          "'Forbidden'",
+          "'Invalid Discord installation state'"
+        ],
+        "inputs": {
+          "query": [
+            "code",
+            "guild_id",
+            "state"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/integrations?status=Discord%20installation%20pending'",
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_GATEWAY",
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "SERVICE_UNAVAILABLE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_twitch_link",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/integrations/twitch/link"
+        ]
+      },
+      "policy": {
+        "capability": "integrations.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/integrations/twitch/link'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing form body'",
+          "'Twitch OAuth is not configured'",
+          "'Twitch broadcaster is required'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {
+          "form": [
+            "broadcaster_login",
+            "scope"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "build_twitch_oauth_url(client_id, self._twitch_install_redirect_uri(handler), state_token, scopes)"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "SERVICE_UNAVAILABLE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_twitch_install_callback",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/integrations/twitch/callback"
+        ]
+      },
+      "policy": {
+        "capability": "integrations.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/integrations/twitch/callback'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Invalid Twitch installation state'",
+          "'Twitch OAuth is not configured'",
+          "'Twitch installation state was already used'"
+        ],
+        "inputs": {
+          "query": [
+            "code",
+            "error",
+            "error_description",
+            "state"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'",
+          "f'/integrations?error={quote(provider_error)}&resume={quote(state_token)}'",
+          "f'/integrations?error={quote(str(exc))}&resume={quote(state_token)}'",
+          "f'/integrations?status=Twitch%20installation%20pending&installation_id={installation_id}'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "SERVICE_UNAVAILABLE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_commands_update",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/commands"
+        ]
+      },
+      "policy": {
+        "capability": "settings.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/commands'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'Form body too large'",
+          "'Invalid Content-Length'",
+          "'Invalid form body'",
+          "'Missing command name'",
+          "'Missing form body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {
+          "form": [
+            "action",
+            "command_name",
+            "description_template",
+            "enabled",
+            "footer_template",
+            "record_type",
+            "response_template",
+            "title"
+          ]
+        },
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'",
+          "f\"/commands?status={quote(f'Deleted simple command {command_name}')}\"",
+          "f\"/commands?status={quote(f'Saved {label} {command_name}')}\""
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_login",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/login"
+        ]
+      },
+      "policy": {
+        "capability": "public.access",
+        "guard": "public",
+        "kind": "http",
+        "scope": "global"
+      },
+      "predicate": "handler.command == 'GET' and path == '/login'",
+      "response": {
+        "content_types": [
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Discord OAuth is not configured'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "redirect_target"
+        ],
+        "statuses": [
+          "FOUND",
+          "SERVICE_UNAVAILABLE"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_oauth_callback",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/auth/discord/callback",
+          "/oauth/discord/callback"
+        ]
+      },
+      "policy": {
+        "capability": "public.access",
+        "guard": "public",
+        "kind": "http",
+        "scope": "global"
+      },
+      "predicate": "handler.command == 'GET' and path in {'/auth/discord/callback', '/oauth/discord/callback'}",
+      "response": {
+        "content_types": [
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Discord OAuth failed'",
+          "'Discord OAuth is not configured'",
+          "'Invalid OAuth state'",
+          "'Missing OAuth code'",
+          "'Operator access is disabled'",
+          "'Session secret is not configured'",
+          "'You are not authorized to access the dashboard'"
+        ],
+        "inputs": {
+          "query": [
+            "code",
+            "state"
+          ]
+        },
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/dashboard'"
+        ],
+        "statuses": [
+          "BAD_GATEWAY",
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "SERVICE_UNAVAILABLE"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_logout",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/logout"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "optional_session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/logout'",
+      "response": {
+        "content_types": [
+          "application/json"
+        ],
+        "errors": [
+          "'origin_mismatch'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'origin_mismatch'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_overview",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/overview"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/overview'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "overview",
+          "services"
+        ],
+        "json_shapes": [
+          "{'overview': overview.__dict__, 'services': dict(self.service_states)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_live_ops",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/live-ops'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [
+          "payload"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_stream",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/stream"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.read",
+        "guard": "session",
+        "kind": "sse",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/live-ops/stream'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/event-stream; charset=utf-8",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_conversation_context",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/observations/"
+        ],
+        "suffix": [
+          "/context"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/api/observations/') and path.endswith('/context')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'invalid_observation_id'",
+          "'observation_not_found'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "payload",
+          "{'error': 'invalid_observation_id'}",
+          "{'error': 'observation_not_found'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_moderate",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/moderate"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/live-ops/moderate'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_action_parameters'",
+          "'invalid_action_type'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'message_not_found'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "'permanent_ban_confirmation_required'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "action_id",
+          "error",
+          "status"
+        ],
+        "json_shapes": [
+          "{'action_id': action_id, 'status': 'pending_provider_confirmation'}",
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_action_parameters'}",
+          "{'error': 'invalid_action_type'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'message_not_found'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': 'permanent_ban_confirmation_required'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "ACCEPTED",
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_incident_action",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/live-ops/incidents/"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/live-ops/incidents/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'incident_not_found'",
+          "'invalid_content_length'",
+          "'invalid_incident_action'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "'unsupported_incident_action'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "result",
+          "{'error': 'body_too_large'}",
+          "{'error': 'incident_not_found'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_incident_action'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': 'unsupported_incident_action'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_playbook",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/live-ops/playbooks/"
+        ],
+        "suffix": [
+          "/activate"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/live-ops/playbooks/') and path.endswith('/activate')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'incident_not_found'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "completed",
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'incident_not_found'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{**run, 'completed': completed}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_GATEWAY",
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_handoff",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/shifts/handoff"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/live-ops/shifts/handoff'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_handoff'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "shift_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_handoff'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'shift_id': shift_id, 'status': 'handed_off'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_shift_schedule",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/shifts"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/live-ops/shifts'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "shifts"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': str(exc)}",
+          "{'shifts': rows}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_shift_schedule",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/shifts"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/live-ops/shifts'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "shifts"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'shifts': rows}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_shield_mode",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/twitch/shield-mode"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/live-ops/twitch/shield-mode'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "result",
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_GATEWAY",
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_chat_settings",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/twitch/chat-settings"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/live-ops/twitch/chat-settings'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "'settings_object_required'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "result",
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': 'settings_object_required'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_GATEWAY",
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_live_ops_notification_destination",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/live-ops/notifications"
+        ]
+      },
+      "policy": {
+        "capability": "live_ops.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/live-ops/notifications'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "destination_id",
+          "error"
+        ],
+        "json_shapes": [
+          "{'destination_id': destination_id}",
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CREATED",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_users",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/users"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/users'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {
+          "query": [
+            "dir",
+            "q",
+            "sort"
+          ]
+        },
+        "json_response_keys": [
+          "items"
+        ],
+        "json_shapes": [
+          "{'items': [item.__dict__ for item in users]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_signals",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/signals"
+        ]
+      },
+      "policy": {
+        "capability": "analytics.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/signals'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "filters",
+          "items",
+          "sort"
+        ],
+        "json_shapes": [
+          "{'filters': {'signals': list(selected_signals)}, 'sort': {'by': sort_by, 'dir': sort_dir}, 'items': [{'display_name': display_name, **asdict(signal), 'label': signal.label} for display_name, signal in items]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_intelligence",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/intelligence"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/intelligence'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "alerts",
+          "cases",
+          "relationships",
+          "reports",
+          "sort",
+          "summary"
+        ],
+        "json_shapes": [
+          "{'summary': asdict(summary), 'sort': {'alerts': {'by': alert_sort, 'dir': alert_dir}, 'cases': {'by': case_sort, 'dir': case_dir}, 'relationships': {'by': relationship_sort, 'dir': relationship_dir}}, 'alerts': alerts, 'cases': cases, 'relationships': relationships, 'reports': reports}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_search",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/search"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/search'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "items"
+        ],
+        "json_shapes": [
+          "{'items': items}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_save_query",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/search/saved"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/search/saved'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'id': query_id, 'status': 'saved'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_observation_pivots",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/observations/"
+        ],
+        "suffix": [
+          "/pivots"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/api/observations/') and path.endswith('/pivots')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'observation_not_found'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "payload",
+          "{'error': 'observation_not_found'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_analytics",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/analytics"
+        ]
+      },
+      "policy": {
+        "capability": "analytics.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/analytics'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [
+          "payload"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_identity_review",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/identity-suggestions/"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/identity-suggestions/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': 'reviewed'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_operator_invitation",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/operators/invitations"
+        ]
+      },
+      "policy": {
+        "capability": "operators.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/operators/invitations'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "invitation_id"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'invitation_id': invitation_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CREATED",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_operator_access_action",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/operators/"
+        ]
+      },
+      "policy": {
+        "capability": "operators.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/operators/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': 'completed'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_bulk_moderation",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/moderation/bulk"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.bulk",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/moderation/bulk'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "result",
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_integration_revoke",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/integrations/"
+        ],
+        "suffix": [
+          "/revoke"
+        ]
+      },
+      "policy": {
+        "capability": "integrations.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/integrations/') and path.endswith('/revoke')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "installation_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': 'revoked', 'installation_id': installation_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CONFLICT",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_external_observation",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/external/observations"
+        ]
+      },
+      "policy": {
+        "capability": "events.write",
+        "guard": "api_client_or_session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/external/observations'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_bearer_token'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "analysis_job_id",
+          "error",
+          "observation_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_bearer_token'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': result.status, 'observation_id': result.observation_id, 'analysis_job_id': result.analysis_job_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CREATED",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS",
+          "UNAUTHORIZED"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_event",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/events"
+        ]
+      },
+      "policy": {
+        "capability": "events.write",
+        "guard": "api_client_or_session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/events'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_bearer_token'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "analysis_job_id",
+          "error",
+          "observation_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_bearer_token'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': result.status, 'observation_id': result.observation_id, 'analysis_job_id': result.analysis_job_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "CREATED",
+          "FORBIDDEN",
+          "FOUND",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS",
+          "UNAUTHORIZED"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_intelligence_report",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/intelligence/reports/"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/api/intelligence/reports/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'invalid_report_id'",
+          "'report_not_found'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "payload",
+          "{'error': 'invalid_report_id'}",
+          "{'error': 'report_not_found'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_case_export",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/intelligence/cases/"
+        ],
+        "suffix": [
+          "/export"
+        ]
+      },
+      "policy": {
+        "capability": "exports.create",
+        "guard": "session",
+        "kind": "export",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/api/intelligence/cases/') and path.endswith('/export')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'case_not_found'",
+          "'invalid_case_id'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error"
+        ],
+        "json_shapes": [
+          "{'error': 'case_not_found'}",
+          "{'error': 'invalid_case_id'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_case",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/intelligence/cases/"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command in {'GET', 'POST'} and path.startswith('/api/intelligence/cases/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_case_id'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "activity",
+          "case",
+          "entities",
+          "error",
+          "evidence"
+        ],
+        "json_shapes": [
+          "{'case': dict(case), 'entities': entities, 'evidence': evidence, 'activity': activity}",
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_case_id'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_alert_workflow",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/intelligence/alerts/"
+        ]
+      },
+      "policy": {
+        "capability": "cases.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/intelligence/alerts/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "alert_id",
+          "error",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': 'updated', 'alert_id': alert_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_user_detail",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/users/"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path.startswith('/api/users/')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'invalid_user_id'",
+          "'not_found'",
+          "'user_not_found'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "lifecycle",
+          "signals",
+          "user"
+        ],
+        "json_shapes": [
+          "{'error': 'invalid_user_id'}",
+          "{'error': 'not_found'}",
+          "{'error': 'user_not_found'}",
+          "{'user': {'user_id': profile.user_id, 'primary_display_name': profile.primary_display_name, 'current_reputation_score': profile.current_reputation_score, 'candidate_flag': profile.candidate_flag, 'score_confidence': profile.score_confidence, 'score_band': profile.score_band, 'score_model_version': profile.score_model_version, 'linked_accounts': [asdict(account) for account in profile.linked_accounts], 'notes': [dict(note) for note in profile.notes]}, 'signals': [{**asdict(signal), 'label': signal.label} for signal in signals], 'lifecycle': [asdict(event) for event in lifecycle_events]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_link_user",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/users/link"
+        ]
+      },
+      "policy": {
+        "capability": "members.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/users/link'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "'platform_account_not_found'",
+          "'user_not_found'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': 'platform_account_not_found'}",
+          "{'error': 'user_not_found'}",
+          "{'status': 'linked'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_add_note",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/users/"
+        ],
+        "suffix": [
+          "/notes"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/users/') and path.endswith('/notes')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'invalid_user_id'",
+          "'missing_body'",
+          "'not_found'",
+          "'origin_mismatch'",
+          "'user_not_found'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'invalid_user_id'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'not_found'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': 'user_not_found'}",
+          "{'status': 'noted'}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "NOT_FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_actions",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/moderation/actions"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.queues.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/moderation/actions'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "items"
+        ],
+        "json_shapes": [
+          "{'items': [action.__dict__ for action in actions]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_slo",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/slo"
+        ]
+      },
+      "policy": {
+        "capability": "analytics.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/slo'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "community_id",
+          "items"
+        ],
+        "json_shapes": [
+          "{'community_id': int(session.community_id), 'items': [asdict(sample) for sample in samples]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_reviews",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/moderation/reviews"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.queues.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/moderation/reviews'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "items"
+        ],
+        "json_shapes": [
+          "{'items': [review.__dict__ for review in reviews]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_review_resolve",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "prefix": [
+          "/api/moderation/reviews/"
+        ],
+        "suffix": [
+          "/resolve"
+        ]
+      },
+      "policy": {
+        "capability": "moderation.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path.startswith('/api/moderation/reviews/') and path.endswith('/resolve')",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "action_id",
+          "error",
+          "review_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': 'resolved', 'review_id': review_id, 'action_id': action_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_rules",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/moderation/rules"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/moderation/rules'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "items"
+        ],
+        "json_shapes": [
+          "{'items': [item.__dict__ for item in rules]}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_rule_save",
+      "methods": [
+        "POST"
+      ],
+      "paths": {
+        "exact": [
+          "/api/moderation/rules"
+        ]
+      },
+      "policy": {
+        "capability": "rules.manage",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'POST' and path == '/api/moderation/rules'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'",
+          "'body_too_large'",
+          "'invalid_content_length'",
+          "'invalid_json'",
+          "'invalid_payload'",
+          "'missing_body'",
+          "'origin_mismatch'",
+          "str(exc)"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "error",
+          "rule_id",
+          "status"
+        ],
+        "json_shapes": [
+          "{'error': 'body_too_large'}",
+          "{'error': 'invalid_content_length'}",
+          "{'error': 'invalid_json'}",
+          "{'error': 'invalid_payload'}",
+          "{'error': 'missing_body'}",
+          "{'error': 'origin_mismatch'}",
+          "{'error': str(exc)}",
+          "{'status': 'saved', 'rule_id': rule_id}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "BAD_REQUEST",
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "REQUEST_ENTITY_TOO_LARGE",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_health",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/health"
+        ]
+      },
+      "policy": {
+        "capability": "dashboard.access",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/health'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [],
+        "json_shapes": [
+          "payload"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    },
+    {
+      "handler": "_serve_api_audit",
+      "methods": [
+        "GET"
+      ],
+      "paths": {
+        "exact": [
+          "/api/audit"
+        ]
+      },
+      "policy": {
+        "capability": "audit.read",
+        "guard": "session",
+        "kind": "http",
+        "scope": "community"
+      },
+      "predicate": "handler.command == 'GET' and path == '/api/audit'",
+      "response": {
+        "content_types": [
+          "application/json",
+          "text/plain; charset=utf-8"
+        ],
+        "errors": [
+          "'Community access is no longer available'",
+          "'Forbidden'"
+        ],
+        "inputs": {},
+        "json_response_keys": [
+          "items"
+        ],
+        "json_shapes": [
+          "{'items': self._audit_items(query)}"
+        ],
+        "redirects": [
+          "'/login'"
+        ],
+        "statuses": [
+          "FORBIDDEN",
+          "FOUND",
+          "OK",
+          "TOO_MANY_REQUESTS"
+        ]
+      }
+    }
+  ],
+  "non_http_surfaces": {
+    "command:addcom": {
+      "capability": "settings.manage",
+      "guard": "command_operator",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "command:alias": {
+      "capability": "settings.manage",
+      "guard": "command_operator",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "command:credit": {
+      "capability": "members.read",
+      "guard": "installation_context",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "command:custom": {
+      "capability": "dashboard.access",
+      "guard": "installation_context",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "command:delcom": {
+      "capability": "settings.manage",
+      "guard": "command_operator",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "command:editcom": {
+      "capability": "settings.manage",
+      "guard": "command_operator",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "command:verify": {
+      "capability": "community.read",
+      "guard": "platform_identity",
+      "kind": "bot_command",
+      "scope": "community"
+    },
+    "job:maintenance": {
+      "capability": "system.maintenance",
+      "guard": "system",
+      "kind": "job",
+      "scope": "community"
+    },
+    "job:onboarding_checkpoints": {
+      "capability": "members.manage",
+      "guard": "system",
+      "kind": "job",
+      "scope": "community"
+    },
+    "job:onboarding_roles": {
+      "capability": "members.manage",
+      "guard": "system",
+      "kind": "job",
+      "scope": "installation"
+    },
+    "job:scheduled_announcements": {
+      "capability": "announcements.manage",
+      "guard": "system",
+      "kind": "job",
+      "scope": "installation"
+    },
+    "job:twitch_live_announcements": {
+      "capability": "announcements.manage",
+      "guard": "system",
+      "kind": "job",
+      "scope": "installation"
+    },
+    "lookup:installation": {
+      "capability": "integrations.manage",
+      "guard": "compound_lookup",
+      "kind": "direct_lookup",
+      "scope": "installation"
+    },
+    "lookup:member": {
+      "capability": "members.read",
+      "guard": "compound_lookup",
+      "kind": "direct_lookup",
+      "scope": "community"
+    },
+    "lookup:moderation": {
+      "capability": "moderation.queues.read",
+      "guard": "compound_lookup",
+      "kind": "direct_lookup",
+      "scope": "community"
+    },
+    "provider:announcement": {
+      "capability": "announcements.manage",
+      "guard": "installation_capability",
+      "kind": "provider_action",
+      "scope": "installation"
+    },
+    "provider:live_control": {
+      "capability": "live_ops.manage",
+      "guard": "installation_capability",
+      "kind": "provider_action",
+      "scope": "installation"
+    },
+    "provider:moderation": {
+      "capability": "moderation.manage",
+      "guard": "installation_capability",
+      "kind": "provider_action",
+      "scope": "installation"
+    }
+  },
+  "schema_objects": [
+    "api_clients",
+    "api_request_usage",
+    "audience_edges",
+    "audit_log",
+    "case_activity",
+    "case_entities",
+    "case_evidence",
+    "cohort_anomalies",
+    "cohort_baselines",
+    "command_analysis_results",
+    "command_definitions",
+    "communities",
+    "community_announcement_deliveries",
+    "community_announcements",
+    "community_cohort_anomalies",
+    "community_cohort_baselines",
+    "community_derived_signal_history",
+    "community_derived_signal_windows",
+    "community_graph_metric_history",
+    "community_graph_metrics",
+    "community_identity_link_suggestions",
+    "community_installations",
+    "community_intelligence_profiles",
+    "community_memberships",
+    "community_onboarding_members",
+    "community_onboarding_resources",
+    "community_onboarding_settings",
+    "community_policy_settings",
+    "community_signal_calculation_runs",
+    "content_analysis",
+    "content_entities",
+    "coordination_campaign_members",
+    "coordination_campaigns",
+    "data_subject_requests",
+    "dead_letter_events",
+    "derived_signal_evidence",
+    "derived_signal_history",
+    "derived_signal_windows",
+    "derived_signals",
+    "discord_channels",
+    "discord_install_intents",
+    "emerging_topics",
+    "entity_relationships",
+    "evaluation_labels",
+    "external_feed_sources",
+    "graph_metric_history",
+    "graph_metrics",
+    "identity_link_suggestions",
+    "idx_alerts_community_status",
+    "idx_audience_edges_community",
+    "idx_audit_log_created_at",
+    "idx_campaigns_community_time",
+    "idx_cases_community_status",
+    "idx_cases_status",
+    "idx_cohort_anomalies_score",
+    "idx_command_definitions_enabled",
+    "idx_community_announcement_deliveries",
+    "idx_community_announcement_queue",
+    "idx_community_cohort_anomalies_score",
+    "idx_community_graph_history",
+    "idx_community_graph_influence",
+    "idx_community_identity_suggestions_status",
+    "idx_community_signal_history_lookup",
+    "idx_community_signal_windows_lookup",
+    "idx_content_entities_value",
+    "idx_derived_signals_key_value",
+    "idx_derived_signals_user",
+    "idx_discord_channels_guild_name",
+    "idx_discord_install_intents_pending",
+    "idx_evaluation_runs_model_time",
+    "idx_identity_suggestions_status",
+    "idx_incident_activity_time",
+    "idx_installation_health_events_lookup",
+    "idx_intelligence_alerts_status",
+    "idx_message_attachments_message_id",
+    "idx_messages_installation_time",
+    "idx_messages_platform_account",
+    "idx_messages_sent_at",
+    "idx_messages_user_id",
+    "idx_moderation_actions_community_time",
+    "idx_moderation_actions_created_at",
+    "idx_moderation_actions_user_id",
+    "idx_notification_delivery_queue",
+    "idx_observations_actor_time",
+    "idx_observations_community_time",
+    "idx_observations_context_time",
+    "idx_observations_installation_time",
+    "idx_observations_occurred_at",
+    "idx_observations_platform_type_time",
+    "idx_onboarding_resources_order",
+    "idx_onboarding_role_queue",
+    "idx_operational_metrics_time",
+    "idx_operations_incidents_queue",
+    "idx_pilot_invitations_pending",
+    "idx_platform_accounts_user_id",
+    "idx_processing_jobs_available",
+    "idx_processing_jobs_lease",
+    "idx_processing_jobs_observation",
+    "idx_processing_jobs_tenant_available",
+    "idx_relationship_evidence_time",
+    "idx_relationships_source",
+    "idx_reports_generated",
+    "idx_reputation_events_user_id",
+    "idx_review_queue_status_created_at",
+    "idx_server_boost_requests_expires_at",
+    "idx_server_boost_requests_lookup",
+    "idx_service_reliability_buckets_lookup",
+    "idx_shift_schedules_due",
+    "idx_signal_evidence_observation",
+    "idx_signal_history_user_time",
+    "idx_signal_windows_key_value",
+    "idx_simple_command_definitions_enabled",
+    "idx_social_score_components_run",
+    "idx_social_score_runs_user_time",
+    "idx_stream_sessions_active",
+    "idx_tenant_slo_samples_lookup",
+    "idx_topic_history_time",
+    "idx_topics_community_velocity",
+    "idx_topics_velocity",
+    "idx_twitch_channels_status",
+    "idx_twitch_install_intents_pending",
+    "idx_twitch_live_announcements_lookup",
+    "idx_welcome_events_sender_target_created_at",
+    "incident_activity",
+    "incident_alerts",
+    "installation_credentials",
+    "installation_health_events",
+    "intelligence_alerts",
+    "intelligence_reports",
+    "intelligence_sharing_agreements",
+    "investigation_cases",
+    "legal_holds",
+    "member_appeals",
+    "member_reports",
+    "message_attachments",
+    "messages",
+    "metrics_rollups",
+    "model_evaluation_runs",
+    "model_registry",
+    "moderation_actions",
+    "moderation_rule_exemptions",
+    "moderation_rule_versions",
+    "moderation_rules",
+    "moderation_saved_filters",
+    "moderation_shift_schedules",
+    "moderation_shifts",
+    "notification_deliveries",
+    "notification_destinations",
+    "observation_fts",
+    "observations",
+    "observations_fts_delete",
+    "observations_fts_insert",
+    "observations_fts_update",
+    "operational_metrics",
+    "operations_incidents",
+    "operator_accounts",
+    "operator_community_roles",
+    "operator_discord_guild_permissions",
+    "operator_invitations",
+    "operator_permission_overrides",
+    "organizations",
+    "pilot_invitations",
+    "platform_accounts",
+    "post_stream_briefings",
+    "processing_jobs",
+    "raid_playbook_runs",
+    "raid_playbooks",
+    "raw_event_archive",
+    "relationship_evidence",
+    "replay_requests",
+    "reputation_events",
+    "review_queue",
+    "rule_matches",
+    "saved_queries",
+    "schema_migrations",
+    "server_boost_requests",
+    "service_reliability_buckets",
+    "signal_calculation_runs",
+    "simple_command_definitions",
+    "social_score_components",
+    "social_score_runs",
+    "stream_cohort_snapshots",
+    "stream_sessions",
+    "stream_states",
+    "tenant_job_schedule",
+    "tenant_quota_policies",
+    "tenant_quota_usage",
+    "tenant_slo_samples",
+    "threshold_backtests",
+    "topic_evidence",
+    "topic_history",
+    "twitch_channels",
+    "twitch_control_actions",
+    "twitch_eventsub_subscriptions",
+    "twitch_install_intents",
+    "twitch_live_announcements",
+    "user_notes",
+    "users",
+    "welcome_events",
+    "workspaces"
+  ],
+  "signed_payloads": {
+    "discord_install_state": [
+      "community_id",
+      "expires_at",
+      "guild_id",
+      "nonce",
+      "operator_id"
+    ],
+    "session": [
+      "community_id",
+      "expires_at",
+      "role",
+      "session_version",
+      "user_id",
+      "username"
+    ],
+    "twitch_install_state": [
+      "broadcaster_login",
+      "community_id",
+      "expires_at",
+      "nonce",
+      "operator_id",
+      "scopes"
+    ]
+  },
+  "webhook_signature_headers": [
+    "Twitch-Eventsub-Message-Id",
+    "Twitch-Eventsub-Message-Signature",
+    "Twitch-Eventsub-Message-Timestamp",
+    "Twitch-Eventsub-Message-Type"
+  ]
+}

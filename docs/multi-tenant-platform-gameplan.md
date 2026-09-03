@@ -79,7 +79,7 @@ constrained pilots; PostgreSQL is required before broad production launch.
 - [x] `P1-05` Move community configuration out of process-wide environment
    variables. Keep only deployment bootstrap and secrets settings in application
    config.
-- [ ] `P1-06` Add PostgreSQL behind the database boundary and provide a
+- [x] `P1-06` Add PostgreSQL behind the database boundary and provide a
    rehearsable SQLite export/import path with row-count and checksum verification.
 - [x] `P1-07` Encrypt installation credentials at rest and track credential
    rotation.
@@ -87,7 +87,7 @@ constrained pilots; PostgreSQL is required before broad production launch.
 ### P1 Exit Gate
 
 - [x] `P1-G1` Legacy migration is repeatable and rejects unresolved ownership.
-- [ ] `P1-G2` Domain and HTTP suites run against SQLite and PostgreSQL.
+- [x] `P1-G2` Domain and HTTP suites run against SQLite and PostgreSQL.
 - [x] `P1-G3` Backup restore and raw-event replay succeed in a clean environment.
 
 ## P2: Tenant Sessions and Permissions

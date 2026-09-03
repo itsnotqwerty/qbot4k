@@ -70,12 +70,18 @@ class MessageAnalysisPipeline:
 
     def __init__(
         self,
-        database_path: Path,
+        database_path: Path | str,
         *,
         command_registry: CommandRegistry | None = None,
+        moderation_shadow_mode: bool = False,
     ) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = (
+            database_path
+            if isinstance(database_path, str) and database_path.startswith(("postgres://", "postgresql://"))
+            else Path(database_path)
+        )
         self.command_registry = command_registry or build_default_command_registry()
+        self.moderation_shadow_mode = bool(moderation_shadow_mode)
 
     def analyze_message_created(
         self,
@@ -141,7 +147,7 @@ class MessageAnalysisPipeline:
                 connection,
                 message,
                 observation_id,
-                moderation_shadow_mode=bool(policy[0]),
+                moderation_shadow_mode=self.moderation_shadow_mode or bool(policy[0]),
             )
             tenant = TenantContext(job.community_id)
             content = analyze_observation_content(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import hashlib
+import importlib
 import sqlite3
 import json
 import threading
@@ -10,6 +11,12 @@ from pathlib import Path
 from collections.abc import Mapping
 
 from .contexts import TenantContext
+from .db_protocol import (
+    DatabaseConnection,
+    DatabaseTarget,
+    PostgreSQLConnection,
+    PostgreSQLRow,
+)
 from .intelligence.powerusers import (
     POWERUSER_THRESHOLD,
     default_social_score_for_name,
@@ -19,6 +26,7 @@ from .intelligence.powerusers import (
 )
 from .models import IngestionResult, NormalizedMessage, Observation, ObservationResult, CollectedObservation
 from .moderation import ModerationFinding, ModerationRule, evaluate_egregious_content, evaluate_message_moderation
+from .postgres_migrations import migrate_postgresql
 
 BUILTIN_EGREGIOUS_RULE_NAME = "builtin:egregious_content"
 BUILTIN_STREAMBOO_RULE_NAME = "builtin:streamboo_viewer_spam"
@@ -356,9 +364,13 @@ CREATE TABLE IF NOT EXISTS moderation_actions (
     status TEXT NOT NULL DEFAULT 'pending',
     error_message TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at TEXT
-    ,provider_status TEXT
-    ,provider_response_json TEXT NOT NULL DEFAULT '{}'
+    completed_at TEXT,
+    provider_status TEXT,
+    provider_response_json TEXT NOT NULL DEFAULT '{}',
+    assigned_operator_id INTEGER,
+    escalated_at TEXT,
+    provider_confirmed_at TEXT,
+    provider_event_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS reputation_events (
@@ -1843,7 +1855,28 @@ _SCHEMA_INIT_LOCK = threading.Lock()
 _INITIALIZED_DATABASES: set[str] = set()
 
 
-def connect_database(database_path: Path) -> sqlite3.Connection:
+def _connect_postgresql(database_url: str) -> DatabaseConnection:
+    try:
+        psycopg = importlib.import_module("psycopg")
+    except ImportError as exc:
+        raise RuntimeError(
+            "PostgreSQL requires the psycopg package; install requirements.txt"
+        ) from exc
+
+    def row_factory(cursor):
+        return lambda values: PostgreSQLRow(
+            [column.name for column in (cursor.description or ())], values,
+        )
+
+    return PostgreSQLConnection(psycopg.connect(database_url, row_factory=row_factory))
+
+
+def connect_database(database_target: Path | str) -> DatabaseConnection:
+    target = DatabaseTarget.parse(database_target)
+    if target.backend == "postgresql":
+        return _connect_postgresql(str(target.value))
+
+    database_path = Path(target.value)
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
@@ -1854,7 +1887,17 @@ def connect_database(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
-def initialize_database(connection: sqlite3.Connection, *, force: bool = False) -> None:
+def initialize_database(connection: DatabaseConnection, *, force: bool = False) -> None:
+    if isinstance(connection, PostgreSQLConnection):
+        def seed_postgresql(active_connection: DatabaseConnection) -> None:
+            _seed_default_command_definitions(active_connection)
+            _seed_builtin_moderation_rules(active_connection)
+            _seed_model_registry(active_connection)
+            _seed_raid_playbooks(active_connection)
+
+        migrate_postgresql(connection, SCHEMA_SQL, seed=seed_postgresql)
+        return
+
     database_row = connection.execute("PRAGMA database_list").fetchone()
     database_key = str(database_row[2] if database_row is not None else "")
     cacheable = bool(database_key and database_key != ":memory:")
@@ -2918,6 +2961,13 @@ def delete_simple_command_definition(connection: sqlite3.Connection, command_nam
 
 
 def list_tables(connection: sqlite3.Connection) -> list[str]:
+    if isinstance(connection, PostgreSQLConnection):
+        rows = connection.execute(
+            """SELECT table_name FROM information_schema.tables
+               WHERE table_schema=current_schema() AND table_type='BASE TABLE'
+               ORDER BY table_name"""
+        ).fetchall()
+        return [str(row[0]) for row in rows]
     rows = connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
         "ORDER BY name"
@@ -2937,6 +2987,21 @@ def reset_database(connection: sqlite3.Connection) -> dict[str, int]:
         name for name in list_tables(connection)
         if not name.startswith("observation_fts_")
     ]
+    if isinstance(connection, PostgreSQLConnection):
+        deleted_rows = sum(
+            int(connection.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
+            for name in tables
+        )
+        quoted_tables = ", ".join(f'"{name}"' for name in tables)
+        try:
+            if quoted_tables:
+                connection.execute(f"TRUNCATE TABLE {quoted_tables} RESTART IDENTITY CASCADE")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        initialize_database(connection, force=True)
+        return {"tables_cleared": len(tables), "rows_deleted": deleted_rows}
     deleted_rows = 0
     foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
     connection.execute("PRAGMA foreign_keys = OFF")
@@ -2962,11 +3027,28 @@ def reset_database(connection: sqlite3.Connection) -> dict[str, int]:
     return {"tables_cleared": len(tables), "rows_deleted": deleted_rows}
 
 
-def database_health(database_path: Path) -> dict[str, object]:
-    connection: sqlite3.Connection | None = None
+def database_health(database_path: Path | str) -> dict[str, object]:
+    connection: DatabaseConnection | None = None
     try:
         connection = connect_database(database_path)
         initialize_database(connection)
+        if isinstance(connection, PostgreSQLConnection):
+            table_count = int(connection.execute(
+                """SELECT COUNT(*) FROM information_schema.tables
+                   WHERE table_schema='public' AND table_type='BASE TABLE'"""
+            ).fetchone()[0])
+            schema_version = int(connection.execute(
+                "SELECT COALESCE(MAX(version),0) FROM schema_migrations"
+            ).fetchone()[0])
+            return {
+                "status": "ready" if schema_version == 27 else "degraded",
+                "path": str(database_path),
+                "backend": "postgresql",
+                "table_count": table_count,
+                "journal_mode": "postgresql",
+                "integrity": "ok" if schema_version == 27 else "migration_pending",
+                "schema_version": schema_version,
+            }
         table_count = connection.execute(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         ).fetchone()[0]
@@ -2975,11 +3057,12 @@ def database_health(database_path: Path) -> dict[str, object]:
         return {
             "status": "ready" if integrity == "ok" else "degraded",
             "path": str(database_path),
+            "backend": "sqlite",
             "table_count": table_count,
             "journal_mode": pragma_mode,
             "integrity": integrity,
         }
-    except sqlite3.Error as exc:
+    except Exception as exc:
         return {
             "status": "degraded",
             "path": str(database_path),
@@ -3628,7 +3711,7 @@ def ensure_canonical_user_for_platform_account(
 
     display_name = preferred_display_name.strip() or f"user_{platform_account_id}"
     initial_score = default_social_score_for_name(display_name)
-    connection.execute(
+    cursor = connection.execute(
         """
         INSERT INTO users (
             primary_display_name,
@@ -3638,13 +3721,10 @@ def ensure_canonical_user_for_platform_account(
         """,
         (display_name, initial_score, int(initial_score >= POWERUSER_THRESHOLD)),
     )
-    created_user = connection.execute(
-        "SELECT id FROM users WHERE rowid = last_insert_rowid()"
-    ).fetchone()
-    if created_user is None:
+    if cursor.lastrowid is None:
         raise sqlite3.IntegrityError("Failed to resolve canonical user after insert")
 
-    created_user_id = int(created_user[0])
+    created_user_id = int(cursor.lastrowid)
     connection.execute(
         """
         UPDATE platform_accounts
@@ -3668,10 +3748,10 @@ def ensure_canonical_user_for_platform_account(
             'auto_user_create',
             'user',
             ?,
-            json_object('platform_account_id', ?)
+            ?
         )
         """,
-        (created_user_id, platform_account_id),
+        (created_user_id, json.dumps({"platform_account_id": platform_account_id}, sort_keys=True)),
     )
     return created_user_id
 
@@ -4150,7 +4230,8 @@ def mark_moderation_action_completed(
             UPDATE moderation_actions
             SET status = 'completed', completed_at = CURRENT_TIMESTAMP,
                 error_message = NULL, provider_status = ?, provider_response_json = ?,
-                provider_confirmed_at = CASE WHEN platform='twitch' THEN CURRENT_TIMESTAMP
+                provider_confirmed_at = CASE WHEN platform='twitch'
+                                             THEN CAST(CURRENT_TIMESTAMP AS TEXT)
                                              ELSE provider_confirmed_at END
             WHERE id = ? AND community_id = ?
             """,
@@ -4455,7 +4536,7 @@ def persist_observation(
         with connection:
             cursor = connection.execute(
                 """
-                INSERT INTO observations (
+                INSERT OR IGNORE INTO observations (
                     platform,
                     community_id,
                     installation_id,
@@ -4498,6 +4579,13 @@ def persist_observation(
                     observation.schema_version,
                 ),
             )
+            if cursor.rowcount == 0:
+                return ObservationResult(
+                    status="duplicate",
+                    observation_id=None,
+                    actor_platform_account_id=actor_account_id,
+                    target_platform_account_id=target_account_id,
+                )
     except sqlite3.IntegrityError:
         if observation.external_event_id is None:
             raise

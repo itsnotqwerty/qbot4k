@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -51,9 +52,16 @@ def configure_tenant_quota(
         connection.execute(
             """INSERT INTO audit_log(
                    actor_type,actor_id,action_type,entity_type,entity_id,payload_json
-               ) VALUES ('operator',?,'tenant.quota_updated','community',?,json_object(
-                   'quota_type',?,'limit_count',?,'window_seconds',?))""",
-            (actor.actor_id, tenant.community_id, normalized_type, limit, window),
+               ) VALUES ('operator',?,'tenant.quota_updated','community',?,?)""",
+            (
+                actor.actor_id,
+                tenant.community_id,
+                json.dumps({
+                    "limit_count": limit,
+                    "quota_type": normalized_type,
+                    "window_seconds": window,
+                }, sort_keys=True),
+            ),
         )
 
 
@@ -80,7 +88,7 @@ def consume_tenant_quota(
     connection.execute(
         """INSERT INTO tenant_quota_usage(community_id,quota_type,window_start,usage_count)
            VALUES (?,?,?,?) ON CONFLICT(community_id,quota_type,window_start)
-           DO UPDATE SET usage_count=usage_count+excluded.usage_count""",
+              DO UPDATE SET usage_count=tenant_quota_usage.usage_count+excluded.usage_count""",
         (tenant.community_id, normalized_type, window_start, increment),
     )
     usage = int(connection.execute(

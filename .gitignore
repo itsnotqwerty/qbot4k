@@ -5,3 +5,8 @@ var/
 
 .venv/
 .env
+
+node_modules/
+_fresh/
+test-results/
+playwright-report/

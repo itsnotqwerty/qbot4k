@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "fixtures": {
+    "authorization.json": {
+      "origin": "synthetic",
+      "contains_production_data": false,
+      "redactions": ["credentials", "direct identifiers", "personal data"]
+    },
+    "golden.json": {
+      "origin": "synthetic",
+      "contains_production_data": false,
+      "redactions": ["credentials", "direct identifiers", "personal data"]
+    },
+    "manifest.json": {
+      "origin": "generated from repository source",
+      "contains_production_data": false,
+      "redactions": []
+    }
+  }
+}

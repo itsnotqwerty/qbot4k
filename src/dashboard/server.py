@@ -6,6 +6,7 @@ import io
 import hashlib
 import hmac
 import json
+from decimal import Decimal
 import os
 import sqlite3
 import subprocess
@@ -4474,7 +4475,10 @@ nav{display:flex;justify-content:space-between;align-items:center;border-bottom:
 			{"sections": sorted(key for key in payload if isinstance(payload[key], list))},
 		)
 		self._send_bytes(
-			handler, HTTPStatus.OK, json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"),
+			handler, HTTPStatus.OK, json.dumps(
+				payload, indent=2, sort_keys=True,
+				default=lambda value: float(value) if isinstance(value, Decimal) else str(value),
+			).encode("utf-8"),
 			"application/json", f"qbot4k-community-{session.community_id}-analytics.json",
 		)
 
@@ -6136,7 +6140,10 @@ document.addEventListener("DOMContentLoaded", () => {{
 		return f"{value:.2f}"
 
 	def _send_json(self, handler: BaseHTTPRequestHandler, status: HTTPStatus, payload: Mapping[str, object]) -> None:
-		response = json.dumps(payload, sort_keys=True).encode("utf-8")
+		response = json.dumps(
+			payload, sort_keys=True,
+			default=lambda value: float(value) if isinstance(value, Decimal) else str(value),
+		).encode("utf-8")
 		handler.send_response(status)
 		handler.send_header("Content-Type", "application/json")
 		self._send_security_headers(handler)

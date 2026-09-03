@@ -166,14 +166,18 @@ def parse_twitch_irc_message(raw_line: str) -> Mapping[str, object] | None:
 class TwitchConnector:
 	def __init__(
 		self,
-		database_path: Path,
+		database_path: Path | str,
 		*,
 		join_command_channel: str = "its_not_qwerty",
 		bootstrap_channels: tuple[str, ...] = (),
 		command_registry: CommandRegistry | None = None,
 		token_manager: TwitchTokenManager | None = None,
 	) -> None:
-		self.database_path = Path(database_path)
+		self.database_path = (
+			database_path
+			if isinstance(database_path, str) and database_path.startswith(("postgres://", "postgresql://"))
+			else Path(database_path)
+		)
 		self.join_command_channel = join_command_channel.strip().casefold()
 		self.bootstrap_channels = tuple(
 			channel.strip().casefold() for channel in bootstrap_channels if channel.strip()

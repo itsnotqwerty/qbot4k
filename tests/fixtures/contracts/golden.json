@@ -1,0 +1,89 @@
+{
+  "format_version": 1,
+  "scenarios": [
+    {
+      "id": "two-community-isolation",
+      "category": "tenant_isolation",
+      "operation": "select_tenant",
+      "input": {"community_id": 1, "records": [{"community_id": 2, "id": 20}, {"community_id": 1, "id": 10}]},
+      "expected": [{"community_id": 1, "id": 10}]
+    },
+    {
+      "id": "session-payload",
+      "category": "sessions",
+      "operation": "project",
+      "input": {"fields": ["community_id", "expires_at", "role", "session_version", "user_id", "username"], "record": {"community_id": 1, "expires_at": "2030-01-01T00:00:00+00:00", "role": "moderator", "session_version": 1, "user_id": "fixture-user", "username": "Fixture Operator"}},
+      "expected": {"community_id": 1, "expires_at": "2030-01-01T00:00:00+00:00", "role": "moderator", "session_version": 1, "user_id": "fixture-user", "username": "Fixture Operator"}
+    },
+    {
+      "id": "observation-projection",
+      "category": "observations",
+      "operation": "project",
+      "input": {"fields": ["community_id", "event_type", "external_event_id", "platform"], "record": {"community_id": 1, "event_type": "message.created", "external_event_id": "fixture-event-1", "platform": "discord", "received_at": "ignored"}},
+      "expected": {"community_id": 1, "event_type": "message.created", "external_event_id": "fixture-event-1", "platform": "discord"}
+    },
+    {
+      "id": "moderation-action",
+      "category": "moderation",
+      "operation": "project",
+      "input": {"fields": ["action_type", "community_id", "duration_seconds", "status"], "record": {"action_type": "timeout", "community_id": 1, "duration_seconds": 600, "status": "pending"}},
+      "expected": {"action_type": "timeout", "community_id": 1, "duration_seconds": 600, "status": "pending"}
+    },
+    {
+      "id": "job-claim-order",
+      "category": "jobs",
+      "operation": "sort_jobs",
+      "input": [{"id": 2, "priority": 5}, {"id": 3, "priority": 10}, {"id": 1, "priority": 10}],
+      "expected": [{"id": 1, "priority": 10}, {"id": 3, "priority": 10}, {"id": 2, "priority": 5}]
+    },
+    {
+      "id": "command-parse",
+      "category": "commands",
+      "operation": "parse_command",
+      "input": "!Verify fixture evidence",
+      "expected": {"arguments": ["fixture", "evidence"], "name": "verify"}
+    },
+    {
+      "id": "provider-normalization",
+      "category": "provider_normalization",
+      "operation": "normalize_provider",
+      "input": {"external_event_id": 42, "platform": "TwItCh", "username": " FixtureUser "},
+      "expected": {"external_event_id": "42", "platform": "twitch", "username": "FixtureUser"}
+    },
+    {
+      "id": "eventsub-envelope",
+      "category": "eventsub",
+      "operation": "project",
+      "input": {"fields": ["event", "subscription"], "record": {"event": {"broadcaster_user_id": "fixture-broadcaster"}, "subscription": {"type": "stream.online", "version": "1"}}},
+      "expected": {"event": {"broadcaster_user_id": "fixture-broadcaster"}, "subscription": {"type": "stream.online", "version": "1"}}
+    },
+    {
+      "id": "export-row",
+      "category": "exports",
+      "operation": "project",
+      "input": {"fields": ["community_id", "event_type", "id"], "record": {"community_id": 1, "event_type": "message.created", "id": 10}},
+      "expected": {"community_id": 1, "event_type": "message.created", "id": 10}
+    },
+    {
+      "id": "backup-manifest",
+      "category": "backup_metadata",
+      "operation": "project",
+      "input": {"fields": ["integrity", "schema_version", "table_counts"], "record": {"integrity": "ok", "schema_version": 27, "table_counts": {"communities": 2}}},
+      "expected": {"integrity": "ok", "schema_version": 27, "table_counts": {"communities": 2}}
+    },
+    {
+      "id": "api-json",
+      "category": "api_json",
+      "operation": "project",
+      "input": {"fields": ["community_id", "status"], "record": {"community_id": 1, "request_id": "ignored", "status": "ok"}},
+      "expected": {"community_id": 1, "status": "ok"}
+    },
+    {
+      "id": "representative-html",
+      "category": "html",
+      "operation": "normalize_html",
+      "input": "<main>\n  <h1>Fixture dashboard</h1>\n</main>",
+      "expected": "<main> <h1>Fixture dashboard</h1> </main>"
+    }
+  ]
+}

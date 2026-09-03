@@ -3,9 +3,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from pathlib import Path
 
 from ..db import connect_database, record_operational_metric
+from ..db_protocol import DatabaseTarget
 from .handlers import (
     claim_processing_job,
     complete_processing_job,
@@ -26,13 +26,13 @@ from ..intelligence.recovery import record_dead_letter
 class AnalysisWorker:
     def __init__(
         self,
-        database_path: Path,
+        database_path: DatabaseTarget,
         registry: AnalysisRegistry,
         *,
         worker_id: str = "analysis-1",
         poll_interval: float = 0.5,
     ) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = database_path
         self.registry = registry
         self.worker_id = worker_id
         self.poll_interval = poll_interval
@@ -151,13 +151,13 @@ class AnalysisWorker:
 class DiscordWorker:
     def __init__(
         self,
-        database_path: Path,
+        database_path: DatabaseTarget,
         registry: ActionRegistry,
         *,
         worker_id: str = "discord-1",
         poll_interval: float = 0.5,
     ) -> None:
-        self.database_path = Path(database_path)
+        self.database_path = database_path
         self.registry = registry
         self.worker_id = worker_id
         self.poll_interval = poll_interval

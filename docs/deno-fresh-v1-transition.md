@@ -68,53 +68,53 @@ Excluded:
 
 ## DF0: Contract Freeze and Migration Harness
 
-- [ ] `DF0-01` Generate a machine-readable inventory of every HTTP route,
+- [x] `DF0-01` Generate a machine-readable inventory of every HTTP route,
   method, status, content type, form field, JSON shape, redirect, and externally
   visible error from `DashboardApp.dispatch` and its handlers.
-- [ ] `DF0-02` Inventory session cookie fields and signatures, OAuth state,
+- [x] `DF0-02` Inventory session cookie fields and signatures, OAuth state,
   webhook signatures, configuration variables, CLI commands, job types,
   provider actions, schema objects, and authorization policies.
-- [ ] `DF0-03` Add language-neutral golden fixtures under
+- [x] `DF0-03` Add language-neutral golden fixtures under
   `tests/fixtures/contracts/` for two-community isolation, sessions,
   observations, moderation, jobs, commands, provider normalization, EventSub,
   exports, backup metadata, API JSON, and representative HTML.
-- [ ] `DF0-04` Scrub credentials and personal data from every fixture and add a
+- [x] `DF0-04` Scrub credentials and personal data from every fixture and add a
   fixture provenance and redaction check.
-- [ ] `DF0-05` Add a parity harness that runs one fixture against Python and
+- [x] `DF0-05` Add a parity harness that runs one fixture against Python and
   Deno and compares normalized output. Normalization may ignore declared IDs,
   timestamps, or nonces, but never tenant IDs, authorization results, provider
   payloads, status codes, or audit events.
-- [ ] `DF0-06` Add CI jobs for Python, Deno formatting/lint/type checking/tests,
+- [x] `DF0-06` Add CI jobs for Python, Deno formatting/lint/type checking/tests,
   PostgreSQL migrations, contract parity, and browser tests. Keep the Python
   suite mandatory until Python is removed.
 
 ### DF0 Exit Gate
 
-- [ ] `DF0-G1` Route, policy, job, provider, schema, and configuration manifests
+- [x] `DF0-G1` Route, policy, job, provider, schema, and configuration manifests
   are generated and checked for drift.
-- [ ] `DF0-G2` Golden fixtures cover every high-risk compatibility boundary and
+- [x] `DF0-G2` Golden fixtures cover every high-risk compatibility boundary and
   at least one authorized and denied tenant case per boundary.
-- [ ] `DF0-G3` CI can execute a minimal Python-versus-Deno fixture comparison.
+- [x] `DF0-G3` CI can execute a minimal Python-versus-Deno fixture comparison.
 
 ## DF1: PostgreSQL Compatibility Boundary
 
-- [ ] `DF1-01` Introduce a Python database protocol and backend selection behind
+- [x] `DF1-01` Introduce a Python database protocol and backend selection behind
   `connect_database`. Domain code must not branch on the backend.
-- [ ] `DF1-02` Translate ordered SQLite migrations into versioned PostgreSQL
+- [x] `DF1-02` Translate ordered SQLite migrations into versioned PostgreSQL
   migrations with an advisory migration lock and idempotent startup behavior.
-- [ ] `DF1-03` Replace SQLite-specific behavior deliberately, including WAL and
+- [x] `DF1-03` Replace SQLite-specific behavior deliberately, including WAL and
   `PRAGMA`, `BEGIN IMMEDIATE`, conflict syntax, placeholders, `lastrowid`,
   timestamp comparisons, JSON text access, and SQLite backup APIs.
-- [ ] `DF1-04` Replace FTS5 and its triggers with PostgreSQL `tsvector` and GIN
+- [x] `DF1-04` Replace FTS5 and its triggers with PostgreSQL `tsvector` and GIN
   indexes while preserving search and ranking behavior through fixtures.
-- [ ] `DF1-05` Implement processing-job claims with PostgreSQL row locking while
+- [x] `DF1-05` Implement processing-job claims with PostgreSQL row locking while
   preserving leases, retries, priority, idempotency, and tenant fairness.
-- [ ] `DF1-06` Build a rehearsable SQLite-to-PostgreSQL exporter/importer. Its
+- [x] `DF1-06` Build a rehearsable SQLite-to-PostgreSQL exporter/importer. Its
   manifest must include schema version, deterministic per-table checksums, row
   counts, orphan checks, tenant ownership checks, and source/target totals.
-- [ ] `DF1-07` Import in foreign-key order, reset sequences, validate all
+- [x] `DF1-07` Import in foreign-key order, reset sequences, validate all
   constraints, and keep the final source SQLite database read-only.
-- [ ] `DF1-08` Run domain and HTTP suites against SQLite and PostgreSQL. Add
+- [x] `DF1-08` Run domain and HTTP suites against SQLite and PostgreSQL. Add
   concurrency tests for jobs, idempotency, quotas, moderation completion, and
   migration locking.
 - [ ] `DF1-09` Move the Python deployment to PostgreSQL before the runtime port.
@@ -123,20 +123,20 @@ Excluded:
 
 ### DF1 Exit Gate
 
-- [ ] `DF1-G1` Fresh and upgrade-path PostgreSQL migrations are repeatable and
+- [x] `DF1-G1` Fresh and upgrade-path PostgreSQL migrations are repeatable and
   reject incompatible ownership or schema state.
-- [ ] `DF1-G2` Python domain and HTTP suites pass against both backends.
+- [x] `DF1-G2` Python domain and HTTP suites pass against both backends.
 - [ ] `DF1-G3` A production-size sanitized export/import drill produces matching
   row counts, checksums, search results, sequences, and zero orphans.
 - [ ] `DF1-G4` The Python PostgreSQL deployment passes SLO and recovery checks.
-- [ ] `DF1-G5` Existing gameplan items `P1-06` and `P1-G2` are complete.
+- [x] `DF1-G5` Existing gameplan items `P1-06` and `P1-G2` are complete.
 
 ## DF2: Deno Runtime Foundation
 
-- [ ] `DF2-01` Add pinned Deno and Fresh dependencies, `deno.json`, a lockfile,
+- [x] `DF2-01` Add pinned Deno and Fresh dependencies, `deno.json`, a lockfile,
   and tasks for formatting, linting, type checking, testing, development, and
   production roles.
-- [ ] `DF2-02` Add Fresh framework directories at the repository root and allow
+- [x] `DF2-02` Add Fresh framework directories at the repository root and allow
   TypeScript and Python domain modules to coexist during transition.
 - [ ] `DF2-03` Implement strict TypeScript equivalents of `TenantContext`,
   `ActorAttribution`, shared models, surface policies, validated configuration,
@@ -159,7 +159,7 @@ Excluded:
 
 ### DF2 Exit Gate
 
-- [ ] `DF2-G1` Deno formatting, linting, type checking, and unit tests pass.
+- [x] `DF2-G1` Deno formatting, linting, type checking, and unit tests pass.
 - [ ] `DF2-G2` Tenant, actor, policy, configuration, and cryptographic fixtures
   pass in both runtimes.
 - [ ] `DF2-G3` Each Deno process role starts, reports readiness, and shuts down
@@ -379,6 +379,8 @@ Rollback order:
 - `src/contexts.py`, `src/models.py`: canonical TypeScript contract sources.
 - `src/schema_scope.py`, `src/surface_policy.py`: tenancy and authorization
   inventories.
+- `src/database_transfer.py`: deterministic SQLite export and verified
+  PostgreSQL import rehearsal.
 - `src/dashboard/`: routes, sessions, query services, mutations, and rendering.
 - `src/pipeline/`, `src/jobs.py`: job states, workers, retries, and scheduling.
 - `src/discord.py`, `src/commands.py`: Discord and command behavior.

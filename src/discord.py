@@ -310,13 +310,17 @@ def _extract_discord_embed_text(payload: Mapping[str, object]) -> str:
 class DiscordConnector:
 	def __init__(
 		self,
-		database_path: Path,
+		database_path: Path | str,
 		*,
 		guild_ids: tuple[str, ...] = (),
 		command_registry: CommandRegistry | None = None,
 		bot_token: str | None = None,
 	) -> None:
-		self.database_path = Path(database_path)
+		self.database_path = (
+			database_path
+			if isinstance(database_path, str) and database_path.startswith(("postgres://", "postgresql://"))
+			else Path(database_path)
+		)
 		self.guild_ids = tuple(guild_id.strip() for guild_id in guild_ids if guild_id.strip())
 		self._bot_token = bot_token.strip() if bot_token else ""
 		self._command_registry = command_registry or build_default_command_registry()

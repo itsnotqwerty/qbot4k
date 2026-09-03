@@ -61,7 +61,8 @@ def live_operations_snapshot(connection: sqlite3.Connection, *, community_id: in
            LEFT JOIN coordination_campaigns c ON c.id=oi.campaign_id
            LEFT JOIN incident_alerts ia ON ia.incident_id=oi.id
            WHERE oi.community_id=? AND oi.status IN ('open','active','monitoring')
-           GROUP BY oi.id ORDER BY CASE oi.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
+           GROUP BY oi.id,oa.discord_username,c.message_count,c.actor_count,c.confidence
+           ORDER BY CASE oi.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 ELSE 2 END,
                     oi.updated_at DESC LIMIT 30""",
         (int(community_id),),
     ).fetchall()]
@@ -171,7 +172,7 @@ def _stream_timeline(
     rows = connection.execute(
         """SELECT id,event_type,occurred_at,text_raw,attributes_json
            FROM observations WHERE community_id=? AND datetime(occurred_at)>=datetime(?)
-             AND (? IS NULL OR datetime(occurred_at)<=datetime(?))
+                         AND (datetime(?) IS NULL OR datetime(occurred_at)<=datetime(?))
              AND (event_type LIKE 'stream.%' OR event_type LIKE 'moderation.%'
                   OR event_type IN ('channel.raided','channel.shared_chat','channel.shield_mode'))
            ORDER BY occurred_at,id LIMIT 150""",
@@ -185,22 +186,22 @@ def _stream_timeline(
 def _watermark(connection: sqlite3.Connection, community_id: int) -> str:
     row = connection.execute(
         """SELECT
-             (SELECT printf('%d:%s',COALESCE(MAX(id),0),COALESCE(MAX(ingested_at),''))
+                 (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) || ':' || COALESCE(MAX(ingested_at),'')
                 FROM observations WHERE community_id=?),
-             (SELECT printf('%d:%s',COALESCE(MAX(id),0),COALESCE(MAX(updated_at),''))
+                 (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) || ':' || COALESCE(MAX(updated_at),'')
                 FROM intelligence_alerts WHERE community_id=?),
-             (SELECT printf('%d:%s',COALESCE(MAX(id),0),COALESCE(MAX(updated_at),''))
+                 (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) || ':' || COALESCE(MAX(updated_at),'')
                 FROM operations_incidents WHERE community_id=?),
-             (SELECT printf('%d:%s',COALESCE(MAX(ma.id),0),
-                     COALESCE(MAX(COALESCE(ma.provider_confirmed_at,ma.completed_at,ma.created_at)),''))
+                 (SELECT CAST(COALESCE(MAX(ma.id),0) AS TEXT) || ':' ||
+                            COALESCE(MAX(COALESCE(ma.provider_confirmed_at,ma.completed_at,ma.created_at)),'')
                 FROM moderation_actions ma LEFT JOIN messages m ON m.id=ma.message_id
                 WHERE m.community_id=?),
-             (SELECT printf('%d:%s',COALESCE(MAX(id),0),
-                     COALESCE(MAX(COALESCE(confirmed_at,requested_at)),''))
+                 (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) || ':' ||
+                            COALESCE(MAX(COALESCE(confirmed_at,requested_at)),'')
                 FROM twitch_control_actions WHERE community_id=?),
-             (SELECT printf('%d:%s',COALESCE(MAX(id),0),COALESCE(MAX(generated_at),''))
+                 (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) || ':' || COALESCE(MAX(generated_at),'')
                 FROM post_stream_briefings WHERE community_id=?),
-             (SELECT printf('%d:%s',COALESCE(MAX(id),0),COALESCE(MAX(updated_at),''))
+                 (SELECT CAST(COALESCE(MAX(id),0) AS TEXT) || ':' || COALESCE(MAX(updated_at),'')
                 FROM notification_destinations WHERE community_id=?)""",
         (community_id,) * 7,
     ).fetchone()

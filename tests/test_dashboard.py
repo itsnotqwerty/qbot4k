@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import os
 import threading
 import unittest
 from dataclasses import replace
@@ -57,10 +58,25 @@ class NoRedirectHandler(HTTPRedirectHandler):
 class DashboardTests(unittest.TestCase):
 	def setUp(self) -> None:
 		self.tempdir = TemporaryDirectory()
-		self.database_path = Path(self.tempdir.name) / "dashboard.sqlite3"
+		self.database_path: Path | str = os.environ.get(
+			"QBOT_TEST_DATABASE_URL", Path(self.tempdir.name) / "dashboard.sqlite3"
+		)
+		if isinstance(self.database_path, str):
+			connection = connect_database(self.database_path)
+			try:
+				connection.execute("DROP SCHEMA public CASCADE")
+				connection.execute("CREATE SCHEMA public")
+				connection.commit()
+			finally:
+				connection.close()
+		database_environment = (
+			{"QBOT_DATABASE_URL": self.database_path}
+			if isinstance(self.database_path, str)
+			else {"QBOT_DATABASE_PATH": str(self.database_path)}
+		)
 		self.settings = AppSettings.from_env(
 			{
-				"QBOT_DATABASE_PATH": str(self.database_path),
+				**database_environment,
 				"QBOT_ENABLED_SERVICES": "web,jobs",
 				"QBOT_DASHBOARD_SESSION_SECRET": "session-secret",
 				"QBOT_DISCORD_OAUTH_CLIENT_ID": "oauth-client-id",
@@ -2311,7 +2327,12 @@ class DashboardTests(unittest.TestCase):
 			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM operator_accounts").fetchone()[0]), 0)
 			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM command_definitions").fetchone()[0]), 1)
 			self.assertEqual(int(connection.execute("SELECT COUNT(*) FROM moderation_rules").fetchone()[0]), 2)
-			self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+			if isinstance(self.database_path, str):
+				self.assertEqual(int(connection.execute(
+					"SELECT COUNT(*) FROM pg_constraint WHERE contype='f' AND NOT convalidated"
+				).fetchone()[0]), 0)
+			else:
+				self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 		finally:
 			connection.close()
 

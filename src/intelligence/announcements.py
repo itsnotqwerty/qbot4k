@@ -6,6 +6,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ..contexts import TenantContext
+from .community import require_installation_surface
+from .quotas import consume_tenant_quota
+
 
 AnnouncementSender = Callable[[str, str, str, str, dict[str, object]], str | None]
 MAX_DELIVERY_ATTEMPTS = 3
@@ -27,6 +31,9 @@ def create_announcement(
         raise ValueError("unsupported announcement platform")
     if not target_external_id.strip() or not body.strip():
         raise ValueError("announcement target and body are required")
+    consume_tenant_quota(
+        connection, tenant=TenantContext(int(community_id)), quota_type="announcements",
+    )
     installation_id = _resolve_target_installation(
         connection, community_id=int(community_id), platform=normalized_platform,
         target_installation_id=target_installation_id,
@@ -263,7 +270,7 @@ def dispatch_due_announcements(
            SELECT id,community_id,platform,target_external_id,body,installation_id,
                   external_community_id,source_json
            FROM due WHERE community_rank<=?
-           ORDER BY scheduled_at,id LIMIT ?""",
+            ORDER BY community_rank,scheduled_at,id LIMIT ?""",
         (
             due_at, MAX_DELIVERY_ATTEMPTS, max(1, min(int(per_community_limit), 100)),
             max(1, min(int(limit), 500)),
@@ -292,6 +299,12 @@ def dispatch_due_announcements(
                 (announcement_id, installation_id, attempt_number),
             ).lastrowid)
         try:
+            tenant = TenantContext(
+                community_id=int(row[1]), installation_id=installation_id,
+            )
+            require_installation_surface(
+                connection, tenant=tenant, surface="provider:announcement",
+            )
             source = json.loads(str(row[7] or "{}"))
             provider_message_id = sender(
                 str(row[2]), str(row[6]), str(row[3]), str(row[4]),

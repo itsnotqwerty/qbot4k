@@ -17,7 +17,7 @@ from src.pipeline.message_analysis import MESSAGE_ANALYSIS_JOB_TYPE, MessageAnal
 from src.pipeline.workers import AnalysisWorker
 
 
-def drain_analysis(database_path: Path) -> None:
+def drain_analysis(database_path: Path | str) -> None:
     registry = AnalysisRegistry()
     pipeline = MessageAnalysisPipeline(database_path)
     registry.register(MESSAGE_ANALYSIS_JOB_TYPE, pipeline.analyze_message_created)
@@ -39,7 +39,7 @@ def ingest_and_analyze(
         or ""
     ).strip()
     if external_community_id:
-        connection = connect_database(Path(connector.database_path))
+        connection = connect_database(connector.database_path)
         try:
             initialize_database(connection)
             existing = connection.execute(
@@ -59,7 +59,7 @@ def ingest_and_analyze(
 
     if result.status == "duplicate":
         external_id = payload.get("id") if platform == "discord" else payload.get("message_id")
-        connection = connect_database(Path(connector.database_path))
+        connection = connect_database(connector.database_path)
         try:
             row = connection.execute(
                 "SELECT id, platform_account_id FROM messages WHERE platform = ? AND platform_message_id = ?",
@@ -76,7 +76,7 @@ def ingest_and_analyze(
     if result.status != "persisted" or result.observation_id is None:
         return result
 
-    database_path = Path(connector.database_path)
+    database_path = connector.database_path
     drain_analysis(database_path)
 
     connection = connect_database(database_path)

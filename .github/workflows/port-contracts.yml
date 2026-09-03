@@ -1,0 +1,84 @@
+name: Port contracts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run mandatory Python suite
+        run: python -m unittest discover -v
+
+  contract-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.4
+      - name: Install locked Deno dependencies
+        run: deno install --frozen
+      - name: Check generated manifests and fixture redaction
+        run: python -m unittest -v tests.test_contract_inventory
+      - name: Check Deno runtime
+        run: deno task check
+      - name: Compare Python and Deno golden fixtures
+        run: |
+          python -m src.contract_parity tests/fixtures/contracts/golden.json
+          python -m src.contract_parity tests/fixtures/contracts/authorization.json
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.4
+      - name: Install locked Deno dependencies
+        run: deno install --frozen
+      - name: Install Chromium
+        run: deno run -A npm:playwright@1.62.1 install --with-deps chromium
+      - name: Run browser tests
+        run: deno task browser
+
+  postgresql-migrations:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: qbot4k-test
+          POSTGRES_DB: qbot4k
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d qbot4k"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-dev.txt
+      - name: Run PostgreSQL migration tests
+        env:
+          QBOT_TEST_POSTGRES_URL: postgresql://postgres:qbot4k-test@127.0.0.1:5432/qbot4k
+        run: python -m unittest -v tests.test_postgres_migrations tests.test_postgres_integration

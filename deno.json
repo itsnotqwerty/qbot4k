@@ -1,0 +1,52 @@
+{
+  "nodeModulesDir": "manual",
+  "tasks": {
+    "fmt": "deno fmt --check deno.json main.ts client.ts vite.config.ts playwright.config.ts routes/ islands/ tests/*.ts tests/browser/",
+    "lint": "deno lint .",
+    "typecheck": "deno check main.ts client.ts vite.config.ts playwright.config.ts routes/*.tsx islands/*.tsx tests/*.ts tests/browser/*.ts",
+    "test": "deno test --allow-read --allow-env=DENO_DEPLOYMENT_ID,GITHUB_SHA,CI_COMMIT_SHA tests/contract_fixture_runner_test.ts tests/fresh_foundation_test.ts",
+    "check": "deno task fmt && deno task lint && deno task typecheck && deno task test",
+    "dev": "vite",
+    "build": "vite build",
+    "start": "deno serve --allow-env --allow-net --allow-read _fresh/server.js",
+    "browser": "deno run -A npm:@playwright/test@1.62.1 test"
+  },
+  "lint": {
+    "rules": {
+      "tags": ["fresh", "recommended"]
+    }
+  },
+  "exclude": ["**/_fresh/*", "node_modules/"],
+  "imports": {
+    "@/": "./",
+    "fresh": "jsr:@fresh/core@2.3.3",
+    "preact": "npm:preact@10.29.1",
+    "@preact/signals": "npm:@preact/signals@2.9.0",
+    "@fresh/plugin-vite": "jsr:@fresh/plugin-vite@1.1.2",
+    "vite": "npm:vite@7.3.6",
+    "@types/babel__core": "npm:@types/babel__core@7.20.5",
+    "@playwright/test": "npm:@playwright/test@1.62.1"
+  },
+  "compilerOptions": {
+    "lib": ["dom", "dom.asynciterable", "dom.iterable", "deno.ns"],
+    "jsx": "precompile",
+    "jsxImportSource": "preact",
+    "jsxPrecompileSkipElements": [
+      "a",
+      "img",
+      "source",
+      "body",
+      "html",
+      "head",
+      "title",
+      "meta",
+      "script",
+      "link",
+      "style",
+      "base",
+      "noscript",
+      "template"
+    ],
+    "types": ["vite/client"]
+  }
+}

@@ -86,7 +86,7 @@ def _parse_bool(raw_value: str | None, default: bool = False) -> bool:
 
 @dataclass(frozen=True)
 class AppSettings:
-    database_path: Path
+    database_path: Path | str
     backup_dir: Path
     dashboard_host: str
     dashboard_port: int
@@ -122,6 +122,7 @@ class AppSettings:
     legal_contact_email: str | None
     legal_jurisdiction: str | None
     legal_effective_date: str | None
+    moderation_shadow_mode: bool = False
 
     @classmethod
     def from_env(
@@ -144,9 +145,9 @@ class AppSettings:
             # systemd, interactive shells, and configuration checks.
             env_map.update(_read_environment_file(explicit_path, required=True))
 
-        database_raw = env_map.get("QBOT_DATABASE_PATH")
+        database_raw = env_map.get("QBOT_DATABASE_URL") or env_map.get("QBOT_DATABASE_PATH")
         if not database_raw:
-            raise ConfigError("QBOT_DATABASE_PATH is required")
+            raise ConfigError("QBOT_DATABASE_URL or QBOT_DATABASE_PATH is required")
 
         enabled_services = _parse_csv(env_map.get("QBOT_ENABLED_SERVICES", "web,jobs,analysis"))
         if not enabled_services:
@@ -179,7 +180,11 @@ class AppSettings:
         if not twitch_channels:
             twitch_channels = ("its_not_qwerty",)
 
-        database_path = Path(database_raw).expanduser().resolve()
+        database_path: Path | str
+        if database_raw.startswith(("postgres://", "postgresql://")):
+            database_path = database_raw
+        else:
+            database_path = Path(database_raw).expanduser().resolve()
         settings = cls(
             database_path=database_path,
             backup_dir=Path(
@@ -244,7 +249,11 @@ class AppSettings:
                 48,
             ),
             raw_archive_dir=Path(
-                env_map.get("QBOT_RAW_ARCHIVE_DIR", str(database_path.parent / "raw-events"))
+                env_map.get(
+                    "QBOT_RAW_ARCHIVE_DIR",
+                    str(database_path.parent / "raw-events")
+                    if isinstance(database_path, Path) else "./var/raw-events",
+                )
             ).expanduser().resolve(),
             default_community_slug=env_map.get(
                 "QBOT_DEFAULT_COMMUNITY_SLUG", "default"
@@ -349,6 +358,9 @@ class AppSettings:
     def safe_summary(self) -> dict[str, object]:
         return {
             "database_path": str(self.database_path),
+            "database_backend": (
+                "postgresql" if isinstance(self.database_path, str) else "sqlite"
+            ),
             "backup_dir": str(self.backup_dir),
             "dashboard_host": self.dashboard_host,
             "dashboard_port": self.dashboard_port,

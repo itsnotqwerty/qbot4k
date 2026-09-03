@@ -34,6 +34,7 @@ from .intelligence.onboarding import dispatch_newcomer_roles, queue_due_checkpoi
 from .intelligence.scoring import SOCIAL_SCORE_MODEL_VERSION, calculate_social_score
 from .models import Observation
 from .db import collect_observation
+from .db_protocol import DatabaseTarget
 from .intelligence.analytics import (
 	refresh_community_cohort_baselines,
 	refresh_emerging_topics,
@@ -737,13 +738,19 @@ def refresh_metrics_rollups(connection: sqlite3.Connection, now: datetime) -> in
 
 
 def create_database_backup(
-	database_path: Path,
+	database_path: Path | str,
 	backup_dir: Path,
 	now: datetime,
 	*,
 	retention_count: int = 48,
 ) -> tuple[Path, Path, str]:
 	"""Create a transactionally consistent SQLite backup and prune old generations."""
+	target = DatabaseTarget.parse(database_path)
+	if target.backend != "sqlite":
+		raise NotImplementedError(
+			"PostgreSQL backups require the native backup workflow from DF4-06"
+		)
+	database_path = Path(target.value)
 	backup_dir.mkdir(parents=True, exist_ok=True)
 	timestamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
 	backup_path = backup_dir / f"{database_path.stem}-{timestamp}{database_path.suffix}"

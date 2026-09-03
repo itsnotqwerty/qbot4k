@@ -1097,13 +1097,20 @@ def complete_discord_install_intent(
                 json.dumps(sorted(platform_capabilities("discord"))),
             ),
         )
+        installation = connection.execute(
+            """SELECT id FROM community_installations
+               WHERE platform='discord' AND external_community_id=?""",
+            (normalized_guild_id,),
+        ).fetchone()
+        if installation is None:
+            raise sqlite3.IntegrityError("Discord installation was not persisted")
         connection.execute(
             """INSERT INTO audit_log(
                    actor_type, actor_id, action_type, entity_type, entity_id, payload_json
                ) VALUES ('operator', ?, 'integration.discord_link_pending',
                          'community_installation', ?, ?)""",
             (
-                int(operator_id), normalized_guild_id,
+                int(operator_id), int(installation[0]),
                 json.dumps(
                     {"community_id": int(community_id), "guild_id": normalized_guild_id},
                     sort_keys=True,

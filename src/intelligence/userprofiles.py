@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from typing import Mapping
@@ -52,7 +53,7 @@ def create_canonical_user(
 	effective_candidate_flag = candidate_flag or effective_score >= POWERUSER_THRESHOLD
 
 	with connection:
-		connection.execute(
+		cursor = connection.execute(
 			"""
 			INSERT INTO users (
 				primary_display_name,
@@ -62,22 +63,20 @@ def create_canonical_user(
 			""",
 			(name, effective_score, int(effective_candidate_flag)),
 		)
-		row = connection.execute(
-			"SELECT id FROM users WHERE rowid = last_insert_rowid()"
-		).fetchone()
-		if row is not None and effective_score != SOCIAL_SCORE_DEFAULT:
+		created_user_id = int(cursor.lastrowid) if cursor.lastrowid is not None else None
+		if created_user_id is not None and effective_score != SOCIAL_SCORE_DEFAULT:
 			record_reputation_evidence(
 				connection,
-				user_id=int(row[0]),
+				user_id=created_user_id,
 				delta=effective_score - SOCIAL_SCORE_DEFAULT,
 				reason_code="initial_score_calibration",
 				source_type="initial_calibration",
 			)
 
-	if row is None:
+	if created_user_id is None:
 		raise sqlite3.IntegrityError("Failed to resolve canonical user after insert")
 
-	return int(row[0])
+	return created_user_id
 
 
 def link_platform_account(
@@ -156,10 +155,12 @@ def link_platform_account(
 				'user_account_link',
 				'platform_account',
 				?,
-				json_object('platform', ?, 'platform_user_id', ?, 'user_id', ?)
+				?
 			)
 			""",
-			(operator_id, account[0], platform, platform_user_id, user_id),
+			(operator_id, account[0], json.dumps({
+				"platform": platform, "platform_user_id": platform_user_id, "user_id": user_id,
+			}, sort_keys=True)),
 		)
 		refresh_user_derived_signals(connection, user_id)
 		calculate_social_score(connection, user_id)
@@ -216,10 +217,12 @@ def unlink_platform_account(
 				'user_account_unlink',
 				'platform_account',
 				?,
-				json_object('platform', ?, 'platform_user_id', ?, 'user_id', ?)
+				?
 			)
 			""",
-			(operator_id, account[0], platform, platform_user_id, account[1]),
+			(operator_id, account[0], json.dumps({
+				"platform": platform, "platform_user_id": platform_user_id, "user_id": account[1],
+			}, sort_keys=True)),
 		)
 		if account[1] is not None:
 			refresh_user_derived_signals(connection, int(account[1]))
@@ -343,9 +346,9 @@ def _merge_canonical_users(
 		"""
 		INSERT INTO audit_log (
 			actor_type, actor_id, action_type, entity_type, entity_id, payload_json
-		) VALUES ('system', NULL, 'user_merge', 'user', ?, json_object('source_user_id', ?))
+		) VALUES ('system', NULL, 'user_merge', 'user', ?, ?)
 		""",
-		(target_user_id, source_user_id),
+		(target_user_id, json.dumps({"source_user_id": source_user_id}, sort_keys=True)),
 	)
 	connection.execute("DELETE FROM users WHERE id = ?", (source_user_id,))
 
