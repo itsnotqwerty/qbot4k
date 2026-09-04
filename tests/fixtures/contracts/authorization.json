@@ -1,17 +1,442 @@
 {
   "format_version": 1,
   "scenarios": [
-    {"id": "tenant-isolation-authorization", "category": "tenant_isolation", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "community.read", "granted_capabilities": ["community.read"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "community.read", "granted_capabilities": ["community.read"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "session-authorization", "category": "sessions", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "dashboard.access", "granted_capabilities": ["dashboard.access"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "dashboard.access", "granted_capabilities": ["dashboard.access"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "observation-authorization", "category": "observations", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "events.write", "granted_capabilities": ["events.write"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "events.write", "granted_capabilities": ["events.write"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "moderation-authorization", "category": "moderation", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "moderation.manage", "granted_capabilities": ["moderation.manage"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "moderation.manage", "granted_capabilities": ["moderation.manage"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "job-authorization", "category": "jobs", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "system.maintenance", "granted_capabilities": ["system.maintenance"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "system.maintenance", "granted_capabilities": ["system.maintenance"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "command-authorization", "category": "commands", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "settings.manage", "granted_capabilities": ["settings.manage"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "settings.manage", "granted_capabilities": ["settings.manage"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "provider-authorization", "category": "provider_normalization", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "integrations.manage", "granted_capabilities": ["integrations.manage"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "integrations.manage", "granted_capabilities": ["integrations.manage"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "eventsub-authorization", "category": "eventsub", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "events.ingest", "granted_capabilities": ["events.ingest"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "events.ingest", "granted_capabilities": ["events.ingest"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "export-authorization", "category": "exports", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "exports.create", "granted_capabilities": ["exports.create"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "exports.create", "granted_capabilities": ["exports.create"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "backup-authorization", "category": "backup_metadata", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "system.maintenance", "granted_capabilities": ["system.maintenance"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "system.maintenance", "granted_capabilities": ["system.maintenance"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "api-authorization", "category": "api_json", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "dashboard.access", "granted_capabilities": ["dashboard.access"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "dashboard.access", "granted_capabilities": ["dashboard.access"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]},
-    {"id": "html-authorization", "category": "html", "operation": "authorize_cases", "input": [{"actor_community_id": 1, "requested_community_id": 1, "required_capability": "dashboard.access", "granted_capabilities": ["dashboard.access"]}, {"actor_community_id": 2, "requested_community_id": 1, "required_capability": "dashboard.access", "granted_capabilities": ["dashboard.access"]}], "expected": [{"authorized": true, "reason": "allowed"}, {"authorized": false, "reason": "tenant_mismatch"}]}
+    {
+      "id": "tenant-isolation-authorization",
+      "category": "tenant_isolation",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "community.read",
+          "granted_capabilities": ["community.read"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "community.read",
+          "granted_capabilities": ["community.read"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "session-authorization",
+      "category": "sessions",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "dashboard.access",
+          "granted_capabilities": ["dashboard.access"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "dashboard.access",
+          "granted_capabilities": ["dashboard.access"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "observation-authorization",
+      "category": "observations",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "events.write",
+          "granted_capabilities": ["events.write"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "events.write",
+          "granted_capabilities": ["events.write"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "moderation-authorization",
+      "category": "moderation",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "moderation.manage",
+          "granted_capabilities": ["moderation.manage"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "moderation.manage",
+          "granted_capabilities": ["moderation.manage"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "job-authorization",
+      "category": "jobs",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "system.maintenance",
+          "granted_capabilities": ["system.maintenance"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "system.maintenance",
+          "granted_capabilities": ["system.maintenance"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "scoring-authorization",
+      "category": "scoring",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "signals.read",
+          "granted_capabilities": ["signals.read"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "signals.read",
+          "granted_capabilities": ["signals.read"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "command-authorization",
+      "category": "commands",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "settings.manage",
+          "granted_capabilities": ["settings.manage"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "settings.manage",
+          "granted_capabilities": ["settings.manage"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "slo-authorization",
+      "category": "slo",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "analytics.read",
+          "granted_capabilities": ["analytics.read"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "analytics.read",
+          "granted_capabilities": ["analytics.read"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "quota-authorization",
+      "category": "quotas",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "settings.manage",
+          "granted_capabilities": ["settings.manage"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "settings.manage",
+          "granted_capabilities": ["settings.manage"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "permission-authorization",
+      "category": "permissions",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "operators.manage",
+          "granted_capabilities": ["operators.manage"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "operators.manage",
+          "granted_capabilities": ["operators.manage"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "signal-authorization",
+      "category": "signals",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "analytics.read",
+          "granted_capabilities": ["analytics.read"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "analytics.read",
+          "granted_capabilities": ["analytics.read"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "analytics-authorization",
+      "category": "analytics",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "analytics.read",
+          "granted_capabilities": ["analytics.read"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "analytics.read",
+          "granted_capabilities": ["analytics.read"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "intelligence-authorization",
+      "category": "intelligence",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "intelligence.read",
+          "granted_capabilities": ["intelligence.read"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "intelligence.read",
+          "granted_capabilities": ["intelligence.read"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "provider-authorization",
+      "category": "provider_normalization",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "integrations.manage",
+          "granted_capabilities": ["integrations.manage"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "integrations.manage",
+          "granted_capabilities": ["integrations.manage"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "eventsub-authorization",
+      "category": "eventsub",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "events.ingest",
+          "granted_capabilities": ["events.ingest"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "events.ingest",
+          "granted_capabilities": ["events.ingest"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "export-authorization",
+      "category": "exports",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "exports.create",
+          "granted_capabilities": ["exports.create"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "exports.create",
+          "granted_capabilities": ["exports.create"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "backup-authorization",
+      "category": "backup_metadata",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "system.maintenance",
+          "granted_capabilities": ["system.maintenance"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "system.maintenance",
+          "granted_capabilities": ["system.maintenance"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "api-authorization",
+      "category": "api_json",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "dashboard.access",
+          "granted_capabilities": ["dashboard.access"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "dashboard.access",
+          "granted_capabilities": ["dashboard.access"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    },
+    {
+      "id": "html-authorization",
+      "category": "html",
+      "operation": "authorize_cases",
+      "input": [
+        {
+          "actor_community_id": 1,
+          "requested_community_id": 1,
+          "required_capability": "dashboard.access",
+          "granted_capabilities": ["dashboard.access"]
+        },
+        {
+          "actor_community_id": 2,
+          "requested_community_id": 1,
+          "required_capability": "dashboard.access",
+          "granted_capabilities": ["dashboard.access"]
+        }
+      ],
+      "expected": [
+        { "authorized": true, "reason": "allowed" },
+        { "authorized": false, "reason": "tenant_mismatch" }
+      ]
+    }
   ]
 }

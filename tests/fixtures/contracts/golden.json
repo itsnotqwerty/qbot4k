@@ -5,78 +5,1033 @@
       "id": "two-community-isolation",
       "category": "tenant_isolation",
       "operation": "select_tenant",
-      "input": {"community_id": 1, "records": [{"community_id": 2, "id": 20}, {"community_id": 1, "id": 10}]},
-      "expected": [{"community_id": 1, "id": 10}]
+      "input": {
+        "community_id": 1,
+        "records": [
+          { "community_id": 2, "id": 20 },
+          { "community_id": 1, "id": 10 }
+        ]
+      },
+      "expected": [{ "community_id": 1, "id": 10 }]
     },
     {
       "id": "session-payload",
       "category": "sessions",
       "operation": "project",
-      "input": {"fields": ["community_id", "expires_at", "role", "session_version", "user_id", "username"], "record": {"community_id": 1, "expires_at": "2030-01-01T00:00:00+00:00", "role": "moderator", "session_version": 1, "user_id": "fixture-user", "username": "Fixture Operator"}},
-      "expected": {"community_id": 1, "expires_at": "2030-01-01T00:00:00+00:00", "role": "moderator", "session_version": 1, "user_id": "fixture-user", "username": "Fixture Operator"}
+      "input": {
+        "fields": [
+          "community_id",
+          "expires_at",
+          "role",
+          "session_version",
+          "user_id",
+          "username"
+        ],
+        "record": {
+          "community_id": 1,
+          "expires_at": "2030-01-01T00:00:00+00:00",
+          "role": "moderator",
+          "session_version": 1,
+          "user_id": "fixture-user",
+          "username": "Fixture Operator"
+        }
+      },
+      "expected": {
+        "community_id": 1,
+        "expires_at": "2030-01-01T00:00:00+00:00",
+        "role": "moderator",
+        "session_version": 1,
+        "user_id": "fixture-user",
+        "username": "Fixture Operator"
+      }
     },
     {
       "id": "observation-projection",
       "category": "observations",
       "operation": "project",
-      "input": {"fields": ["community_id", "event_type", "external_event_id", "platform"], "record": {"community_id": 1, "event_type": "message.created", "external_event_id": "fixture-event-1", "platform": "discord", "received_at": "ignored"}},
-      "expected": {"community_id": 1, "event_type": "message.created", "external_event_id": "fixture-event-1", "platform": "discord"}
+      "input": {
+        "fields": [
+          "community_id",
+          "event_type",
+          "external_event_id",
+          "platform"
+        ],
+        "record": {
+          "community_id": 1,
+          "event_type": "message.created",
+          "external_event_id": "fixture-event-1",
+          "platform": "discord",
+          "received_at": "ignored"
+        }
+      },
+      "expected": {
+        "community_id": 1,
+        "event_type": "message.created",
+        "external_event_id": "fixture-event-1",
+        "platform": "discord"
+      }
     },
     {
       "id": "moderation-action",
       "category": "moderation",
       "operation": "project",
-      "input": {"fields": ["action_type", "community_id", "duration_seconds", "status"], "record": {"action_type": "timeout", "community_id": 1, "duration_seconds": 600, "status": "pending"}},
-      "expected": {"action_type": "timeout", "community_id": 1, "duration_seconds": 600, "status": "pending"}
+      "input": {
+        "fields": ["action_type", "community_id", "duration_seconds", "status"],
+        "record": {
+          "action_type": "timeout",
+          "community_id": 1,
+          "duration_seconds": 600,
+          "status": "pending"
+        }
+      },
+      "expected": {
+        "action_type": "timeout",
+        "community_id": 1,
+        "duration_seconds": 600,
+        "status": "pending"
+      }
+    },
+    {
+      "id": "moderation-rule-evaluation",
+      "category": "moderation",
+      "operation": "moderate_message",
+      "input": {
+        "message": {
+          "platform": "twitch",
+          "platform_user_id": "fixture-user",
+          "username": "FixtureUser",
+          "channel_id": "fixture-channel",
+          "content_raw": "BAD visit HTTPS://example.test",
+          "sent_at": "2026-09-03T10:00:00+00:00"
+        },
+        "rules": [
+          {
+            "id": 7,
+            "name": "Blocked term",
+            "rule_type": "exact_term",
+            "pattern": "bad",
+            "severity": "medium",
+            "auto_enforce_action": null,
+            "enabled": true,
+            "enforcement_mode": "shadow",
+            "action_duration_seconds": 600
+          },
+          {
+            "id": 8,
+            "name": "Links",
+            "rule_type": "link_restriction",
+            "pattern": "",
+            "severity": "high",
+            "auto_enforce_action": "timeout",
+            "enabled": true,
+            "enforcement_mode": "enforce",
+            "action_duration_seconds": 900
+          }
+        ]
+      },
+      "expected": [
+        {
+          "rule_id": 7,
+          "rule_name": "Blocked term",
+          "rule_type": "exact_term",
+          "severity": "medium",
+          "reason_code": "exact_term",
+          "auto_enforce_action": null,
+          "enforcement_mode": "shadow",
+          "action_duration_seconds": 600
+        },
+        {
+          "rule_id": 8,
+          "rule_name": "Links",
+          "rule_type": "link_restriction",
+          "severity": "high",
+          "reason_code": "link_restriction",
+          "auto_enforce_action": "timeout",
+          "enforcement_mode": "enforce",
+          "action_duration_seconds": 900
+        }
+      ]
     },
     {
       "id": "job-claim-order",
       "category": "jobs",
       "operation": "sort_jobs",
-      "input": [{"id": 2, "priority": 5}, {"id": 3, "priority": 10}, {"id": 1, "priority": 10}],
-      "expected": [{"id": 1, "priority": 10}, {"id": 3, "priority": 10}, {"id": 2, "priority": 5}]
+      "input": [
+        { "id": 2, "priority": 5 },
+        { "id": 3, "priority": 10 },
+        { "id": 1, "priority": 10 }
+      ],
+      "expected": [
+        { "id": 1, "priority": 10 },
+        { "id": 3, "priority": 10 },
+        { "id": 2, "priority": 5 }
+      ]
+    },
+    {
+      "id": "message-score-fuzzy-negative",
+      "category": "scoring",
+      "operation": "score_message",
+      "input": "you are an ashole",
+      "expected": [-10, "very_negative_content"]
+    },
+    {
+      "id": "moderation-score-action",
+      "category": "scoring",
+      "operation": "score_moderation",
+      "input": { "severity": "high", "action_type": "ban" },
+      "expected": [-70, "moderation_penalty"]
     },
     {
       "id": "command-parse",
       "category": "commands",
       "operation": "parse_command",
       "input": "!Verify fixture evidence",
-      "expected": {"arguments": ["fixture", "evidence"], "name": "verify"}
+      "expected": { "arguments": ["fixture", "evidence"], "name": "verify" }
+    },
+    {
+      "id": "command-render-discord",
+      "category": "commands",
+      "operation": "render_command",
+      "input": {
+        "platform": "discord",
+        "reply": {
+          "card": {
+            "title": "Status",
+            "description": "Ready",
+            "fields": [{ "name": "Queue", "value": "Empty" }],
+            "footer": "QBot4K",
+            "color": 1193046
+          }
+        }
+      },
+      "expected": {
+        "allowed_mentions": { "parse": [] },
+        "embeds": [
+          {
+            "title": "Status",
+            "description": "Ready",
+            "color": 1193046,
+            "fields": [{ "name": "Queue", "value": "Empty", "inline": false }],
+            "footer": { "text": "QBot4K" }
+          }
+        ]
+      }
+    },
+    {
+      "id": "command-template-deterministic",
+      "category": "commands",
+      "operation": "format_command_template",
+      "input": {
+        "template": "hello {author_username} roll={5..1} idx={0..{query}} max={0..9999999} literal={{ok}}",
+        "values": { "author_username": "sam", "query": "limit 49" }
+      },
+      "expected": "hello sam roll=5 idx=49 max=1000000 literal={ok}"
+    },
+    {
+      "id": "command-template-format-fallback",
+      "category": "commands",
+      "operation": "format_command_template",
+      "input": {
+        "template": "hello {author_username} roll={5..1} literal={{ok}} missing={missing}",
+        "values": { "author_username": "sam" }
+      },
+      "expected": "hello {author_username} roll=5 literal={{ok}} missing={missing}"
+    },
+    {
+      "id": "command-template-http-selectors",
+      "category": "commands",
+      "operation": "format_command_template",
+      "input": {
+        "template": "{GET}(https://example.test/user?q={query})[name=data.profile.name;score:data.profile.scores.1]name={name} score={score} active={GET}(https://example.test/user?q={query})[data.active] raw={GET}(https://example.test/raw)",
+        "values": { "query": "hello world" },
+        "responses": {
+          "GET https://example.test/user?q=hello+world": " {\"data\":{\"profile\":{\"name\":\"sam\",\"scores\":[5,7,9]},\"active\":true}} ",
+          "GET https://example.test/raw": "{raw}"
+        }
+      },
+      "expected": "name=sam score=7 active=true raw={raw}"
+    },
+    {
+      "id": "command-template-http-failure",
+      "category": "commands",
+      "operation": "format_command_template",
+      "input": {
+        "template": "{GET}(https://example.test/missing)[name:data.name]value={name}",
+        "values": {},
+        "responses": {}
+      },
+      "expected": "value={name}"
+    },
+    {
+      "id": "slo-calculations",
+      "category": "slo",
+      "operation": "calculate_slo",
+      "input": [
+        {
+          "kind": "latency",
+          "name": "webhook_acceptance_ms",
+          "target": 19,
+          "values": [
+            20,
+            1,
+            18,
+            2,
+            17,
+            3,
+            16,
+            4,
+            15,
+            5,
+            14,
+            6,
+            13,
+            7,
+            12,
+            8,
+            11,
+            9,
+            10,
+            19
+          ]
+        },
+        {
+          "kind": "percentage",
+          "name": "connector_health_percent",
+          "target": 75,
+          "values": [1, 1, 1, 0]
+        },
+        {
+          "kind": "count",
+          "name": "open_dead_letters",
+          "target": 0,
+          "value": 1
+        },
+        { "kind": "freshness", "value": null }
+      ],
+      "expected": [
+        {
+          "metric_name": "webhook_acceptance_ms",
+          "value": 19,
+          "target_value": 19,
+          "status": "met",
+          "evidence_count": 20
+        },
+        {
+          "metric_name": "connector_health_percent",
+          "value": 75,
+          "target_value": 75,
+          "status": "met",
+          "evidence_count": 4
+        },
+        {
+          "metric_name": "open_dead_letters",
+          "value": 1,
+          "target_value": 0,
+          "status": "breached",
+          "evidence_count": 1
+        },
+        {
+          "metric_name": "backup_freshness_seconds",
+          "value": 0,
+          "target_value": 86400,
+          "status": "no_data",
+          "evidence_count": 0
+        }
+      ]
+    },
+    {
+      "id": "quota-policy-window",
+      "category": "quotas",
+      "operation": "calculate_quota",
+      "input": {
+        "quota_type": " ExPoRtS ",
+        "limit_count": 12.9,
+        "window_seconds": 60.8,
+        "epoch": 1788436837
+      },
+      "expected": {
+        "quota_type": "exports",
+        "limit_count": 12,
+        "window_seconds": 60,
+        "window_epoch": 1788436800,
+        "retry_after_seconds": 23,
+        "default_limit_count": 100,
+        "default_window_seconds": 3600
+      }
+    },
+    {
+      "id": "permission-decisions",
+      "category": "permissions",
+      "operation": "permission_decisions",
+      "input": {
+        "decisions": [
+          { "role": "viewer", "capability": "community.read" },
+          { "role": "moderator", "capability": "moderation.bulk" },
+          { "role": "admin", "capability": "audit.read", "override": "deny" },
+          { "role": "viewer", "capability": "audit.read", "override": "grant" },
+          { "role": null, "capability": "dashboard.access" }
+        ],
+        "platform": " TwItCh "
+      },
+      "expected": {
+        "decisions": [true, false, false, true, false],
+        "platform_capabilities": [
+          "announcements",
+          "events",
+          "live_controls",
+          "member_lifecycle",
+          "moderation_actions"
+        ]
+      }
+    },
+    {
+      "id": "derived-signal-calculations",
+      "category": "signals",
+      "operation": "calculate_signals",
+      "input": {
+        "evidence": {
+          "user_id": 7,
+          "message_count": 4,
+          "channel_count": 2,
+          "platform_count": 2,
+          "account_count": 2,
+          "eligible_message_count": 3,
+          "positive_count": 1,
+          "negative_count": 1,
+          "negative_points": 10,
+          "reply_count": 1,
+          "welcome_positive_count": 1,
+          "welcome_count": 2,
+          "welcome_duplicate_count": 1,
+          "finding_count": 2,
+          "severity_points": 1.6,
+          "moderation_penalty_points": 25,
+          "window_start": "2026-09-03T10:00:00+00:00",
+          "window_end": "2026-09-03T11:00:00+00:00"
+        },
+        "calculated_at": "2026-09-03T12:00:00+00:00",
+        "signal_keys": [
+          "activity.eligible_message_count",
+          "moderation.severity_index",
+          "risk.composite"
+        ]
+      },
+      "expected": [
+        {
+          "user_id": 7,
+          "signal_key": "activity.eligible_message_count",
+          "value": 3,
+          "confidence": 0.2,
+          "evidence_count": 4,
+          "window_start": "2026-09-03T10:00:00+00:00",
+          "window_end": "2026-09-03T11:00:00+00:00",
+          "details": {
+            "unit": "messages",
+            "excludes": ["commands", "empty_messages"]
+          },
+          "analyzer_version": 2,
+          "calculated_at": "2026-09-03T12:00:00+00:00"
+        },
+        {
+          "user_id": 7,
+          "signal_key": "moderation.severity_index",
+          "value": 0.4,
+          "confidence": 0.2,
+          "evidence_count": 2,
+          "window_start": "2026-09-03T10:00:00+00:00",
+          "window_end": "2026-09-03T11:00:00+00:00",
+          "details": {
+            "weighted_severity": 1.6,
+            "message_count": 4,
+            "unit": "ratio"
+          },
+          "analyzer_version": 2,
+          "calculated_at": "2026-09-03T12:00:00+00:00"
+        },
+        {
+          "user_id": 7,
+          "signal_key": "risk.composite",
+          "value": 36.75,
+          "confidence": 0.2,
+          "evidence_count": 4,
+          "window_start": "2026-09-03T10:00:00+00:00",
+          "window_end": "2026-09-03T11:00:00+00:00",
+          "details": {
+            "unit": "score_0_100",
+            "negative_ratio": 0.25,
+            "moderation_rate": 0.5,
+            "severity_rate": 0.4,
+            "formula": "negative_ratio*45 + moderation_rate*35 + severity_rate*20",
+            "independent_of_social_score": true
+          },
+          "analyzer_version": 2,
+          "calculated_at": "2026-09-03T12:00:00+00:00"
+        }
+      ]
+    },
+    {
+      "id": "analytics-cohort-baseline",
+      "category": "analytics",
+      "operation": "calculate_cohort_baseline",
+      "input": [1, 1, 1, 3, 3, 3],
+      "expected": {
+        "sample_size": 6,
+        "mean_value": 2,
+        "stddev_value": 1,
+        "median_value": 2,
+        "p90_value": 3
+      }
+    },
+    {
+      "id": "analytics-emerging-topics",
+      "category": "analytics",
+      "operation": "calculate_emerging_topics",
+      "input": {
+        "community_id": 7,
+        "now": "2026-08-11T12:00:00+00:00",
+        "topic_keys": ["7:domain:unusual.example", "7:phrase:signal orchid"],
+        "observations": [
+          {
+            "observation_id": 1,
+            "text": "signal orchid wave https://unusual.example/story",
+            "context_id": "old",
+            "container_id": "old",
+            "occurred_at": "2026-08-05T09:00:00+00:00"
+          },
+          {
+            "observation_id": 2,
+            "text": "signal orchid wave https://unusual.example/story",
+            "context_id": "guild",
+            "container_id": "room-a",
+            "occurred_at": "2026-08-11T08:00:00+00:00"
+          },
+          {
+            "observation_id": 3,
+            "text": "signal orchid wave https://unusual.example/story",
+            "context_id": "guild",
+            "container_id": "room-b",
+            "occurred_at": "2026-08-11T09:00:00+00:00"
+          },
+          {
+            "observation_id": 4,
+            "text": "orchid signal flare",
+            "context_id": "guild",
+            "container_id": "room-c",
+            "occurred_at": "2026-08-11T10:00:00+00:00"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "topic_key": "7:domain:unusual.example",
+          "topic_kind": "domain",
+          "label": "unusual.example",
+          "current_count": 2,
+          "baseline_rate": 0.14285714285714285,
+          "velocity": 1.8571428571428572,
+          "context_count": 2,
+          "community_count": 2,
+          "unusualness": 3.7142857142857144,
+          "first_observed_at": "2026-08-05T09:00:00+00:00",
+          "last_observed_at": "2026-08-11T09:00:00+00:00",
+          "cluster_terms": [],
+          "cross_community_diffusion": true,
+          "evidence": [
+            [2, "room-a", "2026-08-11T08:00:00+00:00"],
+            [3, "room-b", "2026-08-11T09:00:00+00:00"]
+          ]
+        },
+        {
+          "topic_key": "7:phrase:signal orchid",
+          "topic_kind": "phrase",
+          "label": "signal orchid",
+          "current_count": 2,
+          "baseline_rate": 0.14285714285714285,
+          "velocity": 1.8571428571428572,
+          "context_count": 2,
+          "community_count": 2,
+          "unusualness": 3.7142857142857144,
+          "first_observed_at": "2026-08-05T09:00:00+00:00",
+          "last_observed_at": "2026-08-11T09:00:00+00:00",
+          "cluster_terms": [
+            "orchid signal",
+            "orchid wave",
+            "signal flare",
+            "signal orchid"
+          ],
+          "cross_community_diffusion": true,
+          "evidence": [
+            [2, "room-a", "2026-08-11T08:00:00+00:00"],
+            [3, "room-b", "2026-08-11T09:00:00+00:00"]
+          ]
+        }
+      ]
+    },
+    {
+      "id": "analytics-graph-metrics",
+      "category": "analytics",
+      "operation": "calculate_graph_metrics",
+      "input": {
+        "calculated_at": "2026-08-11T12:00:00+00:00",
+        "edges": [
+          {
+            "source_user_id": 10,
+            "target_user_id": 20,
+            "strength": 2,
+            "last_observed_at": "2026-08-11T12:00:00+00:00"
+          },
+          {
+            "source_user_id": 20,
+            "target_user_id": 30,
+            "strength": 2,
+            "last_observed_at": "2026-08-11T12:00:00+00:00"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "user_id": 10,
+          "in_degree": 0,
+          "out_degree": 2.0,
+          "weighted_degree": 2.0,
+          "betweenness": 0.0,
+          "pagerank": 0.18441678185487073,
+          "cluster_id": 1,
+          "is_bridge": false,
+          "influence_score": 0.29487090820566597
+        },
+        {
+          "user_id": 20,
+          "in_degree": 2.0,
+          "out_degree": 2.0,
+          "weighted_degree": 4.0,
+          "betweenness": 1.0,
+          "pagerank": 0.3411710466111787,
+          "cluster_id": 1,
+          "is_bridge": true,
+          "influence_score": 0.5717611802972662
+        },
+        {
+          "user_id": 30,
+          "in_degree": 2.0,
+          "out_degree": 0,
+          "weighted_degree": 2.0,
+          "betweenness": 0.0,
+          "pagerank": 0.4744121715339503,
+          "cluster_id": 1,
+          "is_bridge": false,
+          "influence_score": 0.4833679114970677
+        }
+      ]
+    },
+    {
+      "id": "analytics-identity-suggestions",
+      "category": "analytics",
+      "operation": "calculate_identity_suggestions",
+      "input": {
+        "accounts": [
+          {
+            "account_id": 1,
+            "platform": "discord",
+            "platform_user_id": "same-name",
+            "username": "SignalWatcher",
+            "user_id": 101,
+            "context": "Room"
+          },
+          {
+            "account_id": 2,
+            "platform": "twitch",
+            "platform_user_id": "same_name_2",
+            "username": "Signal_Watch",
+            "user_id": 102,
+            "context": "room"
+          },
+          {
+            "account_id": 3,
+            "platform": "discord",
+            "platform_user_id": "other",
+            "username": "Different",
+            "user_id": 103,
+            "context": ""
+          },
+          {
+            "account_id": 4,
+            "platform": "youtube",
+            "platform_user_id": "linked",
+            "username": "SignalWatcher",
+            "user_id": 101,
+            "context": "Room"
+          }
+        ]
+      },
+      "expected": [
+        {
+          "left_platform_account_id": 1,
+          "right_platform_account_id": 2,
+          "confidence": 0.9365196078431373,
+          "username_similarity": 0.9167,
+          "identifier_similarity": 0.9412,
+          "shared_context": true,
+          "manual_approval_required": true,
+          "model_version": 1
+        },
+        {
+          "left_platform_account_id": 2,
+          "right_platform_account_id": 4,
+          "confidence": 0.6941666666666667,
+          "username_similarity": 0.9167,
+          "identifier_similarity": 0.1333,
+          "shared_context": true,
+          "manual_approval_required": true,
+          "model_version": 1
+        }
+      ]
+    },
+    {
+      "id": "analytics-propagation-path",
+      "category": "analytics",
+      "operation": "calculate_propagation_path",
+      "input": {
+        "source_user_id": 1,
+        "target_user_id": 4,
+        "occurrences": [
+          {
+            "source_user_id": 1,
+            "target_user_id": 2,
+            "occurred_at": "2026-08-11T10:00:00+00:00"
+          },
+          {
+            "source_user_id": 2,
+            "target_user_id": 4,
+            "occurred_at": "2026-08-11T09:00:00+00:00"
+          },
+          {
+            "source_user_id": 1,
+            "target_user_id": 3,
+            "occurred_at": "2026-08-11T11:00:00+00:00"
+          },
+          {
+            "source_user_id": 3,
+            "target_user_id": 1,
+            "occurred_at": "2026-08-11T11:30:00+00:00"
+          },
+          {
+            "source_user_id": 3,
+            "target_user_id": 4,
+            "occurred_at": "2026-08-11T12:00:00+00:00"
+          }
+        ]
+      },
+      "expected": [1, 3, 4]
+    },
+    {
+      "id": "scoring-temporal-risk",
+      "category": "scoring",
+      "operation": "calculate_temporal_risk",
+      "input": [
+        {
+          "window_name": "24h",
+          "value": 82.12345,
+          "confidence": 0.91,
+          "evidence_count": 12
+        },
+        {
+          "window_name": "7d",
+          "value": 40.5,
+          "confidence": 0.8,
+          "evidence_count": 30
+        },
+        {
+          "window_name": "unknown",
+          "value": 99,
+          "confidence": 1,
+          "evidence_count": 99
+        }
+      ],
+      "expected": {
+        "value": 65.4741,
+        "confidence": 0.866,
+        "evidence_count": 30,
+        "window_values": { "24h": 82.1235, "7d": 40.5 }
+      }
+    },
+    {
+      "id": "server-boost-detection",
+      "category": "intelligence",
+      "operation": "server_boost_detection",
+      "input": [
+        {
+          "content": " /BUMP now",
+          "interaction_command_name": "boop",
+          "embed_text": "",
+          "author_is_bot": false
+        },
+        {
+          "content": "",
+          "interaction_command_name": "/BoOp",
+          "embed_text": "Completed successfully!",
+          "author_is_bot": true
+        },
+        {
+          "content": "Bump done!",
+          "interaction_command_name": "",
+          "embed_text": "",
+          "author_is_bot": false
+        }
+      ],
+      "expected": [
+        {
+          "command_name": "/bump",
+          "success_command": null,
+          "is_confirmation": false
+        },
+        {
+          "command_name": "/boop",
+          "success_command": "/boop",
+          "is_confirmation": true
+        },
+        {
+          "command_name": null,
+          "success_command": "/bump",
+          "is_confirmation": false
+        }
+      ]
+    },
+    {
+      "id": "intelligence-anti-abuse-decisions",
+      "category": "intelligence",
+      "operation": "anti_abuse_decisions",
+      "input": {
+        "policy": {
+          "enabled": true,
+          "enforcement_mode": " EnFoRcE ",
+          "message_burst_limit": 2.9,
+          "message_burst_window_seconds": 30.8,
+          "mention_limit": 2,
+          "join_raid_limit": 3,
+          "join_raid_window_seconds": 60
+        },
+        "message_input": {
+          "community_id": 7,
+          "platform_account_id": 42,
+          "occurred_at": "2026-08-06T05:01:00Z",
+          "recent_message_count": 2,
+          "mention_count": 2,
+          "is_moderator": false
+        },
+        "join_input": {
+          "community_id": 7,
+          "occurred_at": "2026-08-06T05:02:02Z",
+          "join_count": 3
+        }
+      },
+      "expected": {
+        "policy": {
+          "enabled": true,
+          "enforcement_mode": "enforce",
+          "message_burst_limit": 2,
+          "message_burst_window_seconds": 30,
+          "mention_limit": 2,
+          "join_raid_limit": 3,
+          "join_raid_window_seconds": 60
+        },
+        "message_findings": [
+          {
+            "reason_code": "message_flood",
+            "title": "Message flood detected",
+            "severity": "high",
+            "window_seconds": 30,
+            "dedupe_key": "anti-abuse:7:message_flood:42:59533082",
+            "enforcement_required": true
+          },
+          {
+            "reason_code": "mention_spam",
+            "title": "Mention spam detected",
+            "severity": "high",
+            "window_seconds": 30,
+            "dedupe_key": "anti-abuse:7:mention_spam:42:59533082",
+            "enforcement_required": true
+          }
+        ],
+        "join_finding": {
+          "reason_code": "join_raid",
+          "title": "Join raid detected",
+          "severity": "critical",
+          "window_seconds": 60,
+          "dedupe_key": "anti-abuse:7:join_raid:0:29766542",
+          "enforcement_required": false
+        }
+      }
+    },
+    {
+      "id": "intelligence-coordination-campaign",
+      "category": "intelligence",
+      "operation": "calculate_coordination_campaign",
+      "input": {
+        "current": {
+          "observation_id": 3,
+          "text": "Join the giveaway at https://bad.example/deal now",
+          "user_id": 10
+        },
+        "candidates": [
+          {
+            "observation_id": 2,
+            "text": "Different notice links https://bad.example/other today",
+            "user_id": 20
+          },
+          {
+            "observation_id": 1,
+            "text": "Join the giveaway at https://bad.example/deal now",
+            "user_id": 10
+          },
+          {
+            "observation_id": 4,
+            "text": "ordinary unrelated conversation",
+            "user_id": 30
+          }
+        ]
+      },
+      "expected": {
+        "campaign_key": "86bbe8ffb912a153c9a8b396",
+        "campaign_type": "near_duplicate",
+        "severity": "medium",
+        "message_count": 3,
+        "actor_count": 2,
+        "confidence": 0.8099999999999999,
+        "domains": ["bad.example"],
+        "tokens": [
+          "bad",
+          "deal",
+          "example",
+          "giveaway",
+          "https",
+          "join",
+          "now",
+          "the"
+        ],
+        "members": [
+          { "observation_id": 3, "user_id": 10, "similarity": 1.0 },
+          { "observation_id": 2, "user_id": 20, "similarity": 0.75 },
+          { "observation_id": 1, "user_id": 10, "similarity": 1.0 }
+        ]
+      }
+    },
+    {
+      "id": "content-understanding-threat",
+      "category": "intelligence",
+      "operation": "understand_content",
+      "input": {
+        "text": "I will hurt Alice Smith at home alice@example.invalid",
+        "attributes": { "referenced_message_id": 42, "thread_id": "thread-7" }
+      },
+      "expected": {
+        "language_code": "en",
+        "language_confidence": 0.35,
+        "sentiment_label": "negative",
+        "sentiment_score": -0.3162,
+        "intent_label": "threat",
+        "intent_confidence": 0.95,
+        "threat_level": "critical",
+        "threat_score": 0.95,
+        "indicators": [
+          "direct_future_threat",
+          "possible_personal_data_exposure"
+        ],
+        "entities": [
+          [
+            "email",
+            "alice@example.invalid",
+            "alice@example.invalid",
+            0.92,
+            32,
+            53
+          ],
+          ["named_entity", "Alice Smith", "alice smith", 0.62, 12, 23]
+        ],
+        "conversation": {
+          "is_question": false,
+          "reply_to": "42",
+          "thread_id": "thread-7",
+          "mentioned_accounts": []
+        }
+      }
     },
     {
       "id": "provider-normalization",
       "category": "provider_normalization",
       "operation": "normalize_provider",
-      "input": {"external_event_id": 42, "platform": "TwItCh", "username": " FixtureUser "},
-      "expected": {"external_event_id": "42", "platform": "twitch", "username": "FixtureUser"}
+      "input": {
+        "external_event_id": 42,
+        "platform": "TwItCh",
+        "username": " FixtureUser "
+      },
+      "expected": {
+        "external_event_id": "42",
+        "platform": "twitch",
+        "username": "FixtureUser"
+      }
     },
     {
       "id": "eventsub-envelope",
       "category": "eventsub",
       "operation": "project",
-      "input": {"fields": ["event", "subscription"], "record": {"event": {"broadcaster_user_id": "fixture-broadcaster"}, "subscription": {"type": "stream.online", "version": "1"}}},
-      "expected": {"event": {"broadcaster_user_id": "fixture-broadcaster"}, "subscription": {"type": "stream.online", "version": "1"}}
+      "input": {
+        "fields": ["event", "subscription"],
+        "record": {
+          "event": { "broadcaster_user_id": "fixture-broadcaster" },
+          "subscription": { "type": "stream.online", "version": "1" }
+        }
+      },
+      "expected": {
+        "event": { "broadcaster_user_id": "fixture-broadcaster" },
+        "subscription": { "type": "stream.online", "version": "1" }
+      }
     },
     {
       "id": "export-row",
       "category": "exports",
       "operation": "project",
-      "input": {"fields": ["community_id", "event_type", "id"], "record": {"community_id": 1, "event_type": "message.created", "id": 10}},
-      "expected": {"community_id": 1, "event_type": "message.created", "id": 10}
+      "input": {
+        "fields": ["community_id", "event_type", "id"],
+        "record": {
+          "community_id": 1,
+          "event_type": "message.created",
+          "id": 10
+        }
+      },
+      "expected": {
+        "community_id": 1,
+        "event_type": "message.created",
+        "id": 10
+      }
     },
     {
       "id": "backup-manifest",
       "category": "backup_metadata",
       "operation": "project",
-      "input": {"fields": ["integrity", "schema_version", "table_counts"], "record": {"integrity": "ok", "schema_version": 27, "table_counts": {"communities": 2}}},
-      "expected": {"integrity": "ok", "schema_version": 27, "table_counts": {"communities": 2}}
+      "input": {
+        "fields": ["integrity", "schema_version", "table_counts"],
+        "record": {
+          "integrity": "ok",
+          "schema_version": 27,
+          "table_counts": { "communities": 2 }
+        }
+      },
+      "expected": {
+        "integrity": "ok",
+        "schema_version": 27,
+        "table_counts": { "communities": 2 }
+      }
     },
     {
       "id": "api-json",
       "category": "api_json",
       "operation": "project",
-      "input": {"fields": ["community_id", "status"], "record": {"community_id": 1, "request_id": "ignored", "status": "ok"}},
-      "expected": {"community_id": 1, "status": "ok"}
+      "input": {
+        "fields": ["community_id", "status"],
+        "record": { "community_id": 1, "request_id": "ignored", "status": "ok" }
+      },
+      "expected": { "community_id": 1, "status": "ok" }
     },
     {
       "id": "representative-html",

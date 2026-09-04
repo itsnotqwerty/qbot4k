@@ -1,14 +1,14 @@
 # QBot4K Deploy
 
-This directory provides a Python-based systemd and nginx deployment flow modeled after `donut-deploy`. It uses a Python virtual environment and `requirements.txt`; Deno is not installed or required.
+This directory provides the systemd, nginx, authorization, cutover, and rollback
+artifacts used by the Deno/Fresh release installer at `../install.sh`.
 
 ## Requirements
 
 - Linux with systemd
-- Python 3.11 or newer with `venv`
-- nginx unless `--skip-nginx` is used
-- An existing service user, or the owner of the project directory
-- A configured QBot4K environment file supplied with `--env`
+- Deno 2.9.4
+- nginx
+- A configured QBot4K environment file at `/etc/qbot4k/qbot4k.env`
 
 Web deployments must set `QBOT_LEGAL_ORGANIZATION_NAME`,
 `QBOT_LEGAL_CONTACT_EMAIL`, `QBOT_LEGAL_JURISDICTION`, and
@@ -16,34 +16,21 @@ Web deployments must set `QBOT_LEGAL_ORGANIZATION_NAME`,
 and terms of service; configuration validation rejects a web deployment while
 any value is unresolved.
 
-## Preview
-
-Dry-run does not require root and does not modify the host:
-
-```bash
-python deploy/install.py \
-  --domain intelligence.example.com \
-  --env .env.production \
-  --http-only \
-  --dry-run
-```
-
 ## Install
 
 ```bash
-sudo python deploy/install.py \
-  --name qbot4k \
-  --domain intelligence.example.com \
-  --env .env.production \
-  --user qbot4k \
-  --group qbot4k
+sudo ./install.sh
 ```
 
-The installer creates or refreshes `.venv`, installs `requirements.txt`, renders the systemd unit, copies the environment to `/etc/qbot4k/qbot4k.env` with mode `0600`, runs `check-config` and `init-db` as the service user, validates nginx, and restarts only QBot4K and nginx. Use `--skip-deps` when the virtual environment was prepared from the same release and `--skip-nginx` when another ingress owns the domain.
+Run this command from the root of an extracted release. The installer provisions
+the pinned Deno runtime, release directory, role-specific systemd units, nginx
+configuration, persistent state, and permission-bounded service account.
 
 ## TLS
 
-When both certificate files exist, HTTPS is enabled and HTTP redirects to HTTPS. Defaults use `/etc/letsencrypt/live/<domain>/fullchain.pem` and `privkey.pem`. The installer does not obtain certificates.
+When both certificate files exist, HTTPS is enabled and HTTP redirects to HTTPS.
+Defaults use `/etc/letsencrypt/live/<domain>/fullchain.pem` and `privkey.pem`.
+The installer does not obtain certificates.
 
 A typical bootstrap is:
 
@@ -51,16 +38,51 @@ A typical bootstrap is:
 2. Obtain a certificate with an ACME client.
 3. Rerun without `--http-only`.
 
-Use `--cert` and `--key` for custom paths. If either explicit path is missing, installation fails before changing system configuration.
+Use `--cert` and `--key` for custom paths. If either explicit path is missing,
+installation fails before changing system configuration.
 
 ## Installed files
 
 For the default `qbot4k` name:
 
-- `/etc/systemd/system/qbot4k.service`
+- `/etc/systemd/system/qbot4k-web.service`
+- `/etc/systemd/system/qbot4k-jobs.service`
+- `/etc/systemd/system/qbot4k-analysis.service`
 - `/etc/qbot4k/qbot4k.env`
 - `/etc/nginx/conf.d/qbot4k.conf` unless `--skip-nginx` is used
 
-Rerunning updates the same project-owned files. nginx configuration is staged and tested; failed validation restores the previous file. The environment source is copied rather than referenced from the repository.
+Rerunning updates the same project-owned files. nginx configuration is staged
+and tested; failed validation restores the previous file. The environment source
+is copied rather than referenced from the repository. Units invoke the
+permission-bounded role tasks in `deno.json`, stop through SIGTERM, and serve
+Fresh static assets through nginx with immutable caching for hashed assets.
 
-Run `python deploy/install.py --help` for path, identity, port, TLS, and dry-run options. The root [install.sh](../install.sh) remains the release-directory installer for `/opt/qbot4k`; this deploy kit is intended for an already checked-out application directory.
+## Blue/green upstream switch
+
+Stage the release with `sudo ./install.sh --no-start`, configure the inactive
+web unit's loopback port and `QBOT_WEB_READ_ONLY=true`, then start it without
+changing nginx. The read-only profile permits health and observational requests
+but returns `503` before controllers run for HTTP mutations and OAuth callbacks.
+Remove the setting only as part of the audited ownership cutover.
+
+After the inactive web role reports ready on its loopback port, switch nginx
+with the project-owned helper:
+
+```bash
+sudo deploy/switch-nginx-upstream.sh \
+  --config /etc/nginx/conf.d/qbot4k.conf \
+  --target-port 8081 \
+  --public-health-url https://intelligence.example.com/health/ready
+```
+
+The helper checks the target directly, atomically changes only generated
+loopback `proxy_pass` entries, validates nginx, reloads it, and checks public
+readiness. A validation, reload, or public-health failure restores the previous
+upstream and reloads nginx. Success and rollback paths emit a JSON record with
+`duration_ms`; retain it with the cutover evidence. Run
+`deno task test:nginx-switchback` to validate both paths with isolated command
+fixtures.
+
+The root [install.sh](../install.sh) is the sole production installer for
+`/opt/qbot4k`. This directory contains the templates and operational helpers it
+packages.

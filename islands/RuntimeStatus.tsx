@@ -1,16 +1,23 @@
 import { useSignal } from "@preact/signals";
 
 export default function RuntimeStatus() {
-  const checked = useSignal(false);
+  const status = useSignal("Online");
+
+  const check = async () => {
+    status.value = "Checking";
+    try {
+      const response = await fetch("/health/ready");
+      status.value = response.ok ? "Ready" : "Degraded";
+    } catch {
+      status.value = "Unavailable";
+    }
+  };
+
   return (
-    <section class="runtime-status" aria-labelledby="runtime-status-title">
-      <div>
-        <h2 id="runtime-status-title">Runtime</h2>
-        <output>{checked.value ? "Ready" : "Online"}</output>
-      </div>
-      <button type="button" onClick={() => checked.value = true}>
-        Check
-      </button>
-    </section>
+    <div class="runtime-status">
+      <output aria-live="polite">{status.value}</output>
+      <button type="button" onClick={check}>Check now</button>
+      <a href="/health/ready">View status</a>
+    </div>
   );
 }

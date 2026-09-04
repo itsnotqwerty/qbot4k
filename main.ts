@@ -1,6 +1,485 @@
-import { App, staticFiles } from "fresh";
+import { App, type Context, staticFiles } from "fresh";
+import { healthResponse, type RoleHealthMonitor } from "./src/core/health.ts";
+import type { WebAuthController } from "./src/web/web_auth.ts";
+import { legalPage, type LegalSettings } from "./src/web/web_pages.ts";
+import type { WebDashboardController } from "./src/web/web_dashboard.ts";
+import type { WebModerationController } from "./src/web/web_moderation.ts";
+import type { WebCommandsController } from "./src/web/web_commands.ts";
+import type { WebAuditController } from "./src/web/web_audit.ts";
+import type { WebAnnouncementsController } from "./src/web/web_announcements.ts";
+import type { WebOnboardingController } from "./src/web/web_onboarding.ts";
+import type { WebSettingsController } from "./src/web/web_settings.ts";
+import type { WebIntegrationsController } from "./src/web/web_integrations.ts";
+import type { WebLiveOpsController } from "./src/web/web_live_ops.ts";
+import type { MachineIngestionController } from "./src/jobs/machine_ingestion.ts";
+import type { WebIntelligenceController } from "./src/web/web_intelligence.ts";
 
-export const app = new App()
-  .use(staticFiles())
-  .get("/api/fresh-health", () => Response.json({ status: "ready" }))
-  .fsRoutes();
+export function createApp(
+  monitor?: RoleHealthMonitor,
+  auth?: WebAuthController,
+  legalSettings?: LegalSettings,
+  dashboard?: WebDashboardController,
+  moderation?: WebModerationController,
+  commands?: WebCommandsController,
+  audit?: WebAuditController,
+  announcements?: WebAnnouncementsController,
+  onboarding?: WebOnboardingController,
+  settings?: WebSettingsController,
+  integrations?: WebIntegrationsController,
+  liveOps?: WebLiveOpsController,
+  machineIngestion?: MachineIngestionController,
+  intelligence?: WebIntelligenceController,
+): App<unknown> {
+  const health = (context: Context<unknown>): Promise<Response> =>
+    monitor
+      ? healthResponse(new URL(context.req.url).pathname, monitor)
+      : Promise.resolve(Response.json({ status: "ready" }));
+  const app = new App()
+    .use(staticFiles())
+    .get("/api/fresh-health", health)
+    .get("/health", health)
+    .get("/health/live", health)
+    .get("/health/ready", health)
+    .get("/privacy", () => legalPage("privacy", legalSettings))
+    .get("/terms", () => legalPage("terms", legalSettings));
+  if (auth) {
+    app
+      .get("/login", (context) => auth.login(context.req))
+      .get("/auth/discord/callback", (context) => auth.callback(context.req))
+      .get("/oauth/discord/callback", (context) => auth.callback(context.req))
+      .get(
+        "/system-health",
+        (context) => auth.systemHealth(context.req, monitor),
+      )
+      .post("/logout", (context) => auth.logout(context.req))
+      .post(
+        "/community/switch",
+        (context) => auth.switchCommunity(context.req),
+      );
+  }
+  if (dashboard) {
+    app
+      .get("/dashboard", (context) => dashboard.page(context.req, "overview"))
+      .post("/dashboard/go-live", (context) => dashboard.goLive(context.req))
+      .post("/dashboard/restart", (context) => dashboard.restart(context.req))
+      .post(
+        "/dashboard/reset-database",
+        (context) => dashboard.resetDatabase(context.req),
+      )
+      .get("/api/overview", (context) => dashboard.api(context.req, "overview"))
+      .get("/api/health", (context) => dashboard.health(context.req, monitor))
+      .get("/api/slo", (context) => dashboard.slo(context.req))
+      .get("/users", (context) => dashboard.page(context.req, "users"))
+      .get(
+        "/users/:userId",
+        (context) =>
+          dashboard.userPage(context.req, Number(context.params.userId)),
+      )
+      .get(
+        "/users/:userId/lifecycle.csv",
+        (context) =>
+          dashboard.lifecycleExport(context.req, Number(context.params.userId)),
+      )
+      .post("/users/unlink", (context) => dashboard.unlinkUser(context.req))
+      .post("/users/link", (context) => dashboard.linkUsersForm(context.req))
+      .get("/api/users", (context) => dashboard.api(context.req, "users"))
+      .get(
+        "/api/users/:userId",
+        (context) =>
+          dashboard.userDetail(context.req, Number(context.params.userId)),
+      )
+      .post("/api/users/link", (context) => dashboard.linkUser(context.req))
+      .post(
+        "/api/users/:userId/notes",
+        (context) =>
+          dashboard.addUserNote(context.req, Number(context.params.userId)),
+      )
+      .get("/search", (context) => dashboard.page(context.req, "search"))
+      .get("/api/search", (context) => dashboard.api(context.req, "search"))
+      .post(
+        "/search/saved",
+        (context) => dashboard.saveQuery(context.req, true),
+      )
+      .post("/api/search/saved", (context) => dashboard.saveQuery(context.req))
+      .get(
+        "/api/observations/:observationId/pivots",
+        (context) =>
+          dashboard.observationPivots(
+            context.req,
+            Number(context.params.observationId),
+          ),
+      )
+      .get(
+        "/search/export.csv",
+        (context) => dashboard.searchExport(context.req),
+      )
+      .get("/signals", (context) => dashboard.page(context.req, "signals"))
+      .get("/api/signals", (context) => dashboard.api(context.req, "signals"))
+      .post(
+        "/api/identity-suggestions/:suggestionId",
+        (context) =>
+          dashboard.reviewIdentitySuggestion(
+            context.req,
+            Number(context.params.suggestionId),
+          ),
+      )
+      .get("/analytics", (context) => dashboard.page(context.req, "analytics"))
+      .get(
+        "/api/analytics",
+        (context) => dashboard.api(context.req, "analytics"),
+      )
+      .get(
+        "/analytics/export.json",
+        (context) => dashboard.analyticsExport(context.req),
+      );
+  }
+  if (intelligence) {
+    app.get("/intelligence", (context) => intelligence.page(context.req))
+      .get("/api/intelligence", (context) => intelligence.api(context.req))
+      .get(
+        "/intelligence/cases/:caseId",
+        (context) =>
+          intelligence.caseResponse(
+            context.req,
+            Number(context.params.caseId),
+            false,
+          ),
+      )
+      .post(
+        "/intelligence/cases/:caseId/action",
+        (context) =>
+          intelligence.caseFormAction(
+            context.req,
+            Number(context.params.caseId),
+          ),
+      )
+      .post(
+        "/intelligence/alerts/:alertId/case",
+        (context) =>
+          intelligence.alertCase(context.req, Number(context.params.alertId)),
+      )
+      .post(
+        "/intelligence/alerts/:alertId/disposition",
+        (context) =>
+          intelligence.alertDisposition(
+            context.req,
+            Number(context.params.alertId),
+          ),
+      )
+      .post(
+        "/intelligence/alerts/:alertId/workflow",
+        (context) =>
+          intelligence.alertWorkflow(
+            context.req,
+            Number(context.params.alertId),
+            false,
+          ),
+      )
+      .post(
+        "/intelligence/reports/generate",
+        (context) => intelligence.generateReport(context.req),
+      )
+      .get(
+        "/api/intelligence/reports/:reportId",
+        (context) =>
+          intelligence.report(context.req, Number(context.params.reportId)),
+      )
+      .get(
+        "/api/intelligence/cases/:caseId/export",
+        (context) =>
+          intelligence.caseExport(context.req, Number(context.params.caseId)),
+      )
+      .get(
+        "/api/intelligence/cases/:caseId",
+        (context) =>
+          intelligence.caseResponse(
+            context.req,
+            Number(context.params.caseId),
+            true,
+          ),
+      )
+      .post(
+        "/api/intelligence/cases/:caseId",
+        (context) =>
+          intelligence.caseResponse(
+            context.req,
+            Number(context.params.caseId),
+            true,
+          ),
+      )
+      .post(
+        "/api/intelligence/alerts/:alertId",
+        (context) =>
+          intelligence.alertWorkflow(
+            context.req,
+            Number(context.params.alertId),
+            true,
+          ),
+      );
+  }
+  if (auth && !dashboard) {
+    app.get("/dashboard", (context) => auth.dashboard(context.req));
+  }
+  if (moderation) {
+    app
+      .get("/moderation", (context) => moderation.page(context.req))
+      .get("/api/reviews", (context) => moderation.list(context.req, "reviews"))
+      .get("/api/actions", (context) => moderation.list(context.req, "actions"))
+      .get(
+        "/api/moderation/actions",
+        (context) => moderation.list(context.req, "actions"),
+      )
+      .get("/api/rules", (context) => moderation.list(context.req, "rules"))
+      .get(
+        "/api/moderation/reviews",
+        (context) => moderation.list(context.req, "reviews"),
+      )
+      .get(
+        "/api/moderation/rules",
+        (context) => moderation.list(context.req, "rules"),
+      )
+      .post("/api/moderation/bulk", (context) => moderation.bulk(context.req))
+      .post(
+        "/users/:userId/moderation",
+        (context) =>
+          moderation.userAction(context.req, Number(context.params.userId)),
+      )
+      .post("/moderation/bulk", (context) => moderation.bulkForm(context.req))
+      .post(
+        "/moderation/filters",
+        (context) => moderation.saveFilter(context.req),
+      )
+      .post(
+        "/moderation/rules",
+        (context) => moderation.ruleSave(context.req, false),
+      )
+      .post(
+        "/api/moderation/rules",
+        (context) => moderation.ruleSave(context.req, true),
+      )
+      .post(
+        "/moderation/reviews/:reviewId/resolve",
+        (context) =>
+          moderation.resolveReview(
+            context.req,
+            Number(context.params.reviewId),
+            false,
+          ),
+      )
+      .post(
+        "/api/moderation/reviews/:reviewId/resolve",
+        (context) =>
+          moderation.resolveReview(
+            context.req,
+            Number(context.params.reviewId),
+            true,
+          ),
+      )
+      .post(
+        "/moderation/work/:workType/:itemId/assign",
+        (context) =>
+          moderation.assign(
+            context.req,
+            context.params.workType,
+            Number(context.params.itemId),
+          ),
+      )
+      .post(
+        "/moderation/reports/:itemId/resolve",
+        (context) =>
+          moderation.resolveMember(
+            context.req,
+            "report",
+            Number(context.params.itemId),
+          ),
+      )
+      .post(
+        "/moderation/appeals/:itemId/resolve",
+        (context) =>
+          moderation.resolveMember(
+            context.req,
+            "appeal",
+            Number(context.params.itemId),
+          ),
+      )
+      .post(
+        "/moderation/rules/drafts",
+        (context) => moderation.ruleDraft(context.req),
+      )
+      .post(
+        "/moderation/rule-versions/:versionId/preview",
+        (context) =>
+          moderation.rulePreview(context.req, Number(context.params.versionId)),
+      )
+      .post(
+        "/moderation/rule-versions/:versionId/publish",
+        (context) =>
+          moderation.rulePublish(context.req, Number(context.params.versionId)),
+      )
+      .post(
+        "/moderation/rule-versions/:versionId/rollback",
+        (context) =>
+          moderation.ruleRollback(
+            context.req,
+            Number(context.params.versionId),
+          ),
+      )
+      .post(
+        "/moderation/rules/:ruleId/exemptions",
+        (context) =>
+          moderation.ruleExemption(context.req, Number(context.params.ruleId)),
+      );
+  }
+  if (commands) {
+    app.get("/commands", (context) => commands.page(context.req))
+      .post("/commands", (context) => commands.update(context.req));
+  }
+  if (audit) {
+    app.get("/audit", (context) => audit.response(context.req, false))
+      .get("/api/audit", (context) => audit.response(context.req, true));
+  }
+  if (announcements) {
+    app.get("/announcements", (context) => announcements.page(context.req))
+      .post("/announcements", (context) => announcements.create(context.req))
+      .post(
+        "/announcements/:announcementId/:action",
+        (context) =>
+          announcements.transition(
+            context.req,
+            Number(context.params.announcementId),
+            context.params.action,
+          ),
+      );
+  }
+  if (onboarding) {
+    app.get("/onboarding", (context) => onboarding.page(context.req))
+      .post("/onboarding", (context) => onboarding.configure(context.req))
+      .post(
+        "/onboarding/verify",
+        (context) => onboarding.verify(context.req),
+      )
+      .post(
+        "/onboarding/resources",
+        (context) => onboarding.saveResource(context.req),
+      )
+      .post(
+        "/onboarding/resources/:resourceId/delete",
+        (context) =>
+          onboarding.deleteResource(
+            context.req,
+            Number(context.params.resourceId),
+          ),
+      );
+  }
+  if (settings) {
+    app.get("/settings", (context) => settings.page(context.req))
+      .post("/settings", (context) => settings.update(context.req))
+      .post(
+        "/settings/operators/invite",
+        (context) => settings.invite(context.req),
+      )
+      .post(
+        "/api/operators/invitations",
+        (context) => settings.invite(context.req, true),
+      )
+      .post(
+        "/api/operators/:entityId/:action",
+        (context) =>
+          settings.access(
+            context.req,
+            Number(context.params.entityId),
+            context.params.action,
+          ),
+      );
+  }
+  if (integrations) {
+    app.get("/integrations", (context) => integrations.page(context.req))
+      .post(
+        "/integrations/discord/link",
+        (context) => integrations.discordLink(context.req),
+      )
+      .get(
+        "/integrations/discord/callback",
+        (context) => integrations.discordCallback(context.req),
+      )
+      .post(
+        "/integrations/twitch/link",
+        (context) => integrations.twitchLink(context.req),
+      )
+      .get(
+        "/integrations/twitch/callback",
+        (context) => integrations.twitchCallback(context.req),
+      )
+      .post(
+        "/api/integrations/:installationId/revoke",
+        (context) =>
+          integrations.revoke(
+            context.req,
+            Number(context.params.installationId),
+          ),
+      );
+  }
+  if (liveOps) {
+    app.get("/live-ops", (context) => liveOps.page(context.req))
+      .get("/api/live-ops", (context) => liveOps.api(context.req))
+      .get("/api/live-ops/stream", (context) => liveOps.stream(context.req))
+      .get(
+        "/api/observations/:observationId/context",
+        (context) =>
+          liveOps.context(
+            context.req,
+            Number(context.params.observationId),
+          ),
+      )
+      .post(
+        "/api/live-ops/moderate",
+        (context) => liveOps.moderate(context.req),
+      )
+      .post(
+        "/api/live-ops/incidents/:incidentId/:action",
+        (context) =>
+          liveOps.incident(
+            context.req,
+            Number(context.params.incidentId),
+            context.params.action,
+          ),
+      )
+      .post(
+        "/api/live-ops/shifts/handoff",
+        (context) => liveOps.handoff(context.req),
+      )
+      .get("/api/live-ops/shifts", (context) => liveOps.shifts(context.req))
+      .post("/api/live-ops/shifts", (context) => liveOps.shifts(context.req))
+      .post(
+        "/api/live-ops/twitch/shield-mode",
+        (context) => liveOps.shield(context.req),
+      )
+      .post(
+        "/api/live-ops/twitch/chat-settings",
+        (context) => liveOps.chat(context.req),
+      )
+      .post(
+        "/api/live-ops/playbooks/:playbookKey/activate",
+        (context) => liveOps.playbook(context.req, context.params.playbookKey),
+      )
+      .post(
+        "/api/live-ops/notifications",
+        (context) => liveOps.destination(context.req),
+      );
+  }
+  if (machineIngestion) {
+    app.post(
+      "/webhooks/twitch/eventsub",
+      (context) => machineIngestion.eventsub(context.req),
+    ).post(
+      "/api/events",
+      (context) => machineIngestion.event(context.req),
+    ).post(
+      "/api/external/observations",
+      (context) => machineIngestion.external(context.req),
+    );
+  }
+  return app.fsRoutes();
+}
+
+export const app = createApp();

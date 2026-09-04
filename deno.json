@@ -1,34 +1,79 @@
 {
   "nodeModulesDir": "manual",
   "tasks": {
-    "fmt": "deno fmt --check deno.json main.ts client.ts vite.config.ts playwright.config.ts routes/ islands/ tests/*.ts tests/browser/",
+    "fmt": "deno fmt --check deno.json main.ts runtime.ts cli.ts client.ts database_transfer.ts backup_restore.ts cutover_monitor.ts cutover_preflight.ts vite.config.ts playwright.config.ts components/ routes/ islands/ src/**/*.ts tests/*.ts tests/browser/",
     "lint": "deno lint .",
-    "typecheck": "deno check main.ts client.ts vite.config.ts playwright.config.ts routes/*.tsx islands/*.tsx tests/*.ts tests/browser/*.ts",
-    "test": "deno test --allow-read --allow-env=DENO_DEPLOYMENT_ID,GITHUB_SHA,CI_COMMIT_SHA tests/contract_fixture_runner_test.ts tests/fresh_foundation_test.ts",
-    "check": "deno task fmt && deno task lint && deno task typecheck && deno task test",
+    "typecheck": "deno check main.ts runtime.ts cli.ts client.ts database_transfer.ts backup_restore.ts cutover_monitor.ts cutover_preflight.ts vite.config.ts playwright.config.ts components/*.tsx routes/*.tsx islands/*.tsx src/**/*.ts tests/*.ts tests/browser/*.ts",
+    "test": "deno test --allow-read --allow-write --allow-env=DENO_DEPLOYMENT_ID,GITHUB_SHA,CI_COMMIT_SHA,QBOT_TEST_POSTGRES_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 tests/contract_fixture_runner_test.ts tests/deno_abuse_test.ts tests/deno_analytics_test.ts tests/deno_analytics_persistence_test.ts tests/deno_announcement_dispatch_test.ts tests/deno_backup_test.ts tests/deno_campaigns_test.ts tests/deno_command_domain_test.ts tests/deno_config_test.ts tests/deno_content_analysis_test.ts tests/deno_contexts_models_test.ts tests/deno_database_boundary_test.ts tests/deno_dashboard_operations_test.ts tests/deno_discord_actions_test.ts tests/deno_discord_events_test.ts tests/deno_discord_gateway_test.ts tests/deno_discord_ingestion_test.ts tests/deno_discord_message_test.ts tests/deno_errors_logging_test.ts tests/deno_fernet_test.ts tests/deno_health_test.ts tests/deno_jobs_test.ts tests/deno_lifecycle_test.ts tests/deno_machine_ingestion_test.ts tests/deno_maintenance_test.ts tests/deno_message_analysis_test.ts tests/deno_moderation_rules_test.ts tests/deno_notifications_test.ts tests/deno_observations_test.ts tests/deno_onboarding_automation_test.ts tests/deno_operations_test.ts tests/deno_permissions_test.ts tests/deno_postgres_jobs_integration_test.ts tests/deno_provider_protocol_test.ts tests/deno_quota_test.ts tests/deno_raw_archive_test.ts tests/deno_retention_test.ts tests/deno_route_manifest_test.ts tests/deno_runtime_test.ts tests/deno_scoring_test.ts tests/deno_security_test.ts tests/deno_server_boosts_test.ts tests/deno_signals_test.ts tests/deno_slo_test.ts tests/deno_surface_policy_test.ts tests/deno_token_store_test.ts tests/deno_web_auth_test.ts tests/deno_web_dashboard_test.ts tests/deno_web_intelligence_test.ts tests/deno_web_moderation_test.ts tests/deno_web_commands_test.ts tests/deno_web_audit_test.ts tests/deno_web_announcements_test.ts tests/deno_web_onboarding_test.ts tests/deno_web_settings_test.ts tests/deno_web_integrations_test.ts tests/deno_web_live_ops_test.ts tests/fresh_foundation_test.ts",
+    "test:shadow-read": "deno test --allow-env=QBOT_TEST_POSTGRES_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 tests/deno_shadow_read_test.ts",
+    "test:ownership": "deno test --allow-read=src/postgres_schema.sql --allow-env=QBOT_TEST_POSTGRES_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 tests/deno_provider_ownership_test.ts tests/deno_provider_lease_coordinator_test.ts tests/deno_postgres_jobs_integration_test.ts tests/deno_provider_ownership_integration_test.ts",
+    "test:database-transfer": "deno test --allow-read --allow-write --allow-env=QBOT_TRANSFER_TEST_POSTGRES_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 tests/deno_database_transfer_test.ts",
+    "test:backup-restore": "deno test --allow-run=pg_dump,pg_restore --allow-read=/tmp,src/postgres_schema.sql --allow-write=/tmp --allow-env=QBOT_RESTORE_TEST_POSTGRES_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 tests/deno_backup_restore_integration_test.ts",
+    "test:cutover-monitor": "deno test --allow-read=src/postgres_schema.sql --allow-env=QBOT_MONITOR_TEST_POSTGRES_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 tests/deno_cutover_monitor_test.ts tests/deno_cutover_preflight_test.ts tests/deno_cutover_monitor_integration_test.ts",
+    "test:install-contract": "deno test --allow-read=install.sh,deploy/systemd.service.template tests/deno_install_contract_test.ts",
+    "test:release-boundary": "deno test --allow-read=. tests/deno_release_boundary_test.ts",
+    "test:web-read-only": "deno test tests/deno_web_read_only_test.ts",
+    "test:nginx-switchback": "deno test --allow-run=sh --allow-read=/tmp --allow-write=/tmp tests/deno_nginx_switchback_test.ts",
+    "test:cutover-sequence": "deno test --allow-run=sh --allow-read=/tmp --allow-write=/tmp tests/deno_cutover_sequence_test.ts",
+    "test:security-review": "deno test --allow-read --allow-write=/tmp --allow-run tests/deno_errors_logging_test.ts tests/deno_config_test.ts tests/deno_security_test.ts tests/deno_permissions_test.ts tests/deno_web_read_only_test.ts tests/deno_web_security_headers_test.ts tests/deno_retention_test.ts tests/deno_backup_test.ts tests/deno_install_contract_test.ts",
+    "test:blue-green": "deno test --allow-read --allow-env=DENO_DEPLOYMENT_ID,GITHUB_SHA,CI_COMMIT_SHA tests/contract_fixture_runner_test.ts tests/fresh_foundation_test.ts tests/deno_slo_test.ts tests/deno_operations_test.ts tests/deno_web_read_only_test.ts tests/deno_web_security_headers_test.ts && deno task test:security-review && deno task browser",
+    "check": "deno task fmt && deno task lint && deno task typecheck && deno task test && deno task test:shadow-read && deno task test:ownership && deno task test:database-transfer && deno task test:backup-restore && deno task test:cutover-monitor && deno task test:install-contract && deno task test:release-boundary && deno task test:web-read-only && deno task test:nginx-switchback && deno task test:cutover-sequence && deno task test:security-review && deno task test:blue-green && deno test tests/deno_twitch_auth_test.ts",
     "dev": "vite",
+    "watch": "deno task dev",
     "build": "vite build",
-    "start": "deno serve --allow-env --allow-net --allow-read _fresh/server.js",
+    "start": "deno task role:web",
+    "run": "deno task role:web",
+    "check-config": "deno run --no-prompt --allow-env --allow-read cli.ts check-config",
+    "init-db": "deno run --no-prompt --allow-env --allow-read --allow-net cli.ts init-db",
+    "migrate": "deno run --no-prompt --allow-env --allow-read --allow-net cli.ts migrate",
+    "platform-audit": "deno run --no-prompt --allow-env --allow-read --allow-net cli.ts platform-audit",
+    "issue-pilot-invite": "deno run --no-prompt --allow-env --allow-read --allow-net cli.ts issue-pilot-invite",
+    "transfer-job-ownership": "deno run --no-prompt --allow-env --allow-read --allow-net cli.ts transfer-job-ownership",
+    "transfer-installation-ownership": "deno run --no-prompt --allow-env --allow-read --allow-net cli.ts transfer-installation-ownership",
+    "database-transfer": "deno run --no-prompt --allow-read --allow-write --allow-env=PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net database_transfer.ts",
+    "backup-restore": "deno run --no-prompt --allow-run=pg_restore --allow-read --allow-env=QBOT_DATABASE_URL,QBOT_RESTORE_DATABASE_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net backup_restore.ts",
+    "cutover-monitor": "deno run --no-prompt --allow-env=QBOT_DATABASE_URL,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net cutover_monitor.ts",
+    "cutover-preflight": "deno run --no-prompt --allow-env=QBOT_DATABASE_URL,QBOT_WEB_READ_ONLY,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net cutover_preflight.ts",
+    "role:web": "deno run --no-prompt --allow-run=systemctl --allow-env=QBOT_DATABASE_URL,QBOT_DATABASE_PATH,QBOT_ENABLED_SERVICES,QBOT_LOG_LEVEL,QBOT_DASHBOARD_HOST,QBOT_DASHBOARD_PORT,QBOT_DASHBOARD_SESSION_SECRET,QBOT_OPERATOR_GUILD_IDS,QBOT_DISCORD_OAUTH_CLIENT_ID,QBOT_DISCORD_OAUTH_CLIENT_SECRET,QBOT_DISCORD_OAUTH_REDIRECT_URI,QBOT_LEGAL_ORGANIZATION_NAME,QBOT_LEGAL_CONTACT_EMAIL,QBOT_LEGAL_JURISDICTION,QBOT_LEGAL_EFFECTIVE_DATE,QBOT_SYSTEMD_SERVICE_NAME,QBOT_SHADOW_READ_UPSTREAM_URL,QBOT_WEB_READ_ONLY,DENO_DEPLOYMENT_ID,GITHUB_SHA,CI_COMMIT_SHA,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-read=static,_fresh --allow-net=127.0.0.1:5432,localhost:5432,127.0.0.1:8080,127.0.0.1:8081,localhost:8081 runtime.ts web",
+    "role:jobs": "deno run --no-prompt --allow-run=pg_dump,pg_restore --allow-env=QBOT_DATABASE_URL,QBOT_DATABASE_PATH,QBOT_ENABLED_SERVICES,QBOT_LOG_LEVEL,QBOT_MAINTENANCE_INTERVAL_SECONDS,QBOT_ANALYTICS_INTERVAL_SECONDS,QBOT_BACKUP_INTERVAL_SECONDS,QBOT_BACKUP_RETENTION_COUNT,QBOT_BACKUP_DIR,QBOT_RAW_ARCHIVE_DIR,QBOT_AUDIT_RETENTION_DAYS,QBOT_SYSTEMD_SERVICE_NAME,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-read=var --allow-write=var --allow-net=127.0.0.1:5432,localhost:5432 runtime.ts jobs",
+    "role:analysis": "deno run --no-prompt --allow-env=QBOT_DATABASE_URL,QBOT_DATABASE_PATH,QBOT_ENABLED_SERVICES,QBOT_LOG_LEVEL,QBOT_MODERATION_SHADOW_MODE,QBOT_SYSTEMD_SERVICE_NAME,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432 runtime.ts analysis",
+    "role:discord": "deno run --no-prompt --allow-env=QBOT_DATABASE_URL,QBOT_DATABASE_PATH,QBOT_ENABLED_SERVICES,QBOT_LOG_LEVEL,QBOT_DISCORD_BOT_TOKEN,QBOT_DISCORD_GUILD_IDS,QBOT_CREDENTIAL_ENCRYPTION_KEY,QBOT_SYSTEMD_SERVICE_NAME,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432,gateway.discord.gg:443,discord.com:443 runtime.ts discord",
+    "role:twitch": "deno run --no-prompt --allow-env=QBOT_DATABASE_URL,QBOT_DATABASE_PATH,QBOT_ENABLED_SERVICES,QBOT_LOG_LEVEL,QBOT_TWITCH_BOT_TOKEN,QBOT_TWITCH_REFRESH_TOKEN,QBOT_TWITCH_CLIENT_ID,QBOT_TWITCH_CLIENT_SECRET,QBOT_TWITCH_CHANNELS,QBOT_TWITCH_JOIN_COMMAND_CHANNEL,QBOT_CREDENTIAL_ENCRYPTION_KEY,QBOT_SYSTEMD_SERVICE_NAME,PGSSL,PGMAX,PGIDLE_TIMEOUT,PGCONNECT_TIMEOUT,PGMAX_LIFETIME,PGMAX_PIPELINE,PGBACKOFF,PGKEEP_ALIVE,PGPREPARE,PGDEBUG,PGFETCH_TYPES,PGPUBLICATIONS,PGTARGET_SESSION_ATTRS,PGTARGETSESSIONATTRS,PGAPPNAME --allow-net=127.0.0.1:5432,localhost:5432,irc.chat.twitch.tv:6697,eventsub.wss.twitch.tv:443,api.twitch.tv:443,id.twitch.tv:443 runtime.ts twitch",
     "browser": "deno run -A npm:@playwright/test@1.62.1 test"
   },
   "lint": {
     "rules": {
-      "tags": ["fresh", "recommended"]
+      "tags": [
+        "fresh",
+        "recommended"
+      ]
     }
   },
-  "exclude": ["**/_fresh/*", "node_modules/"],
+  "exclude": [
+    "**/_fresh/*",
+    "node_modules/"
+  ],
   "imports": {
     "@/": "./",
     "fresh": "jsr:@fresh/core@2.3.3",
+    "postgres": "npm:postgres@3.4.7",
     "preact": "npm:preact@10.29.1",
     "@preact/signals": "npm:@preact/signals@2.9.0",
     "@fresh/plugin-vite": "jsr:@fresh/plugin-vite@1.1.2",
+    "@std/path": "jsr:@std/path@1.1.2",
+    "@types/node": "npm:@types/node@22.15.15",
+    "unicode-case-folding": "npm:unicode-case-folding@1.1.1",
     "vite": "npm:vite@7.3.6",
     "@types/babel__core": "npm:@types/babel__core@7.20.5",
     "@playwright/test": "npm:@playwright/test@1.62.1"
   },
   "compilerOptions": {
-    "lib": ["dom", "dom.asynciterable", "dom.iterable", "deno.ns"],
+    "lib": [
+      "dom",
+      "dom.asynciterable",
+      "dom.iterable",
+      "deno.ns"
+    ],
     "jsx": "precompile",
     "jsxImportSource": "preact",
     "jsxPrecompileSkipElements": [
@@ -47,6 +92,8 @@
       "noscript",
       "template"
     ],
-    "types": ["vite/client"]
+    "types": [
+      "vite/client"
+    ]
   }
 }

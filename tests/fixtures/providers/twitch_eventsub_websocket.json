@@ -1,0 +1,33 @@
+[
+  {
+    "metadata": { "message_type": "session_welcome" },
+    "payload": {
+      "session": { "id": "session-1", "keepalive_timeout_seconds": 10 }
+    }
+  },
+  { "metadata": { "message_type": "session_keepalive" }, "payload": {} },
+  {
+    "metadata": { "message_type": "session_reconnect" },
+    "payload": {
+      "session": {
+        "reconnect_url": "wss://eventsub.wss.twitch.tv/ws?session=reconnect"
+      }
+    }
+  },
+  {
+    "metadata": { "message_type": "notification" },
+    "payload": {
+      "subscription": { "type": "stream.online", "status": "enabled" },
+      "event": { "broadcaster_user_id": "broadcaster-1" }
+    }
+  },
+  {
+    "metadata": { "message_type": "revocation" },
+    "payload": {
+      "subscription": {
+        "type": "stream.online",
+        "status": "authorization_revoked"
+      }
+    }
+  }
+]

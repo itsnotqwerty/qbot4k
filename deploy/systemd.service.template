@@ -1,7 +1,9 @@
 [Unit]
-Description=__DESCRIPTION__
+Description=__DESCRIPTION__ (__ROLE__)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -9,17 +11,23 @@ User=__APP_USER__
 Group=__APP_GROUP__
 WorkingDirectory=__APP_DIR__
 Environment=PORT=__PORT__
+Environment=QBOT_DASHBOARD_PORT=__PORT__
 EnvironmentFile=-__ENV_FILE__
-ExecStart=__PYTHON__ -m src --env-file __ENV_FILE__ run
+ExecStartPre=__DENO__ task --config __APP_DIR__/deno.json check-config --env-file=__ENV_FILE__
+ExecStart=__DENO__ task --config __APP_DIR__/deno.json role:__ROLE__ -- --env-file=__ENV_FILE__
+__HEALTH_CHECK__
 Restart=on-failure
 RestartSec=5
+KillSignal=SIGTERM
 TimeoutStopSec=30
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=__APP_DIR__ __CONFIG_DIR__ -/opt/qbot4k/data -/var/lib/qbot4k -/var/backups/qbot4k
+ReadOnlyPaths=__APP_DIR__
+ReadWritePaths=__CONFIG_DIR__ -/var/lib/qbot4k -/var/backups/qbot4k
 UMask=0077
+SyslogIdentifier=__SERVICE_NAME__-__ROLE__
 
 [Install]
 WantedBy=multi-user.target

@@ -154,7 +154,7 @@ constrained pilots; PostgreSQL is required before broad production launch.
 
 ## P4: Moderation Dashboard Rework
 
-- [ ] `P4-01` Decompose the monolithic dashboard server into controllers, query
+- [x] `P4-01` Decompose the monolithic dashboard server into controllers, query
    services, reusable server-rendered templates, static CSS, and progressively
    enhanced JavaScript while retaining the current runtime initially.
 - [x] `P4-02` Build a permission-aware application shell with community

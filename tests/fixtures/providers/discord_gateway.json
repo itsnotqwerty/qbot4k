@@ -1,0 +1,12 @@
+[
+  { "op": 10, "d": { "heartbeat_interval": 41250 } },
+  {
+    "op": 0,
+    "s": 42,
+    "t": "MESSAGE_CREATE",
+    "d": { "id": "event-1", "guild_id": "guild-1" }
+  },
+  { "op": 11, "d": null },
+  { "op": 7, "d": null },
+  { "op": 9, "d": true }
+]
