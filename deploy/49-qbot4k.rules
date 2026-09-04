@@ -1,9 +1,0 @@
-// Permit only the qbot4k service account to restart its own unit.
-polkit.addRule(function(action, subject) {
-    if (action.id == "org.freedesktop.systemd1.manage-units" &&
-        subject.user == "qbot4k" &&
-        action.lookup("unit") == "qbot4k.service" &&
-        action.lookup("verb") == "restart") {
-        return polkit.Result.YES;
-    }
-});
