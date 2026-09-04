@@ -1,4 +1,6 @@
 import { App, type Context, staticFiles } from "fresh";
+import Home from "./routes/index.tsx";
+import AppWrapper from "./routes/_app.tsx";
 import { healthResponse, type RoleHealthMonitor } from "./src/core/health.ts";
 import type { WebAuthController } from "./src/web/web_auth.ts";
 import { legalPage, type LegalSettings } from "./src/web/web_pages.ts";
@@ -30,12 +32,21 @@ export function createApp(
   machineIngestion?: MachineIngestionController,
   intelligence?: WebIntelligenceController,
 ): App<unknown> {
+  const stylesheet = () =>
+    Deno.readTextFile("static/styles.css").then((css) =>
+      new Response(css, {
+        headers: { "content-type": "text/css; charset=utf-8" },
+      })
+    );
   const health = (context: Context<unknown>): Promise<Response> =>
     monitor
       ? healthResponse(new URL(context.req.url).pathname, monitor)
       : Promise.resolve(Response.json({ status: "ready" }));
   const app = new App()
     .use(staticFiles())
+    .appWrapper(AppWrapper)
+    .route("/", { component: Home })
+    .get("/styles.css", stylesheet)
     .get("/api/fresh-health", health)
     .get("/health", health)
     .get("/health/live", health)

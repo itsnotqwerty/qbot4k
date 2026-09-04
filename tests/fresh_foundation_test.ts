@@ -14,6 +14,29 @@ Deno.test("Fresh foundation exposes runtime health", async () => {
   assertEquals(await response.json(), { status: "ready" });
 });
 
+Deno.test("Fresh foundation serves the homepage through the app handler", async () => {
+  const response = await app.handler()(
+    new Request("http://localhost/"),
+  );
+  assertEquals(response.status, 200);
+  assertEquals(
+    response.headers.get("content-type"),
+    "text/html; charset=utf-8",
+  );
+  const html = await response.text();
+  assertEquals(html.includes("QBot4K"), true);
+  assertEquals(html.includes('href="/styles.css"'), true);
+
+  const stylesheet = await app.handler()(
+    new Request("http://localhost/styles.css"),
+  );
+  assertEquals(stylesheet.status, 200);
+  assertEquals(
+    stylesheet.headers.get("content-type"),
+    "text/css; charset=utf-8",
+  );
+});
+
 Deno.test("Fresh shell renders core navigation without JavaScript", async () => {
   const html = render(h(Home, {}));
   assertEquals((await Deno.stat("static/styles.css")).isFile, true);
