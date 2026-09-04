@@ -21,6 +21,7 @@ Deno.test("shell installer renders the configured blue-green web port", async ()
     installer,
     "s|__APP_DIR__|/opt/qbot4k/current|g",
   );
+  assertStringIncludes(installer, "s|__START_COMMAND__|");
 });
 
 Deno.test("systemd port overrides the environment file for the web runtime", async () => {
@@ -30,10 +31,7 @@ Deno.test("systemd port overrides the environment file for the web runtime", asy
   assertStringIncludes(template, "Environment=PORT=__PORT__");
   assertStringIncludes(template, "Environment=QBOT_DASHBOARD_PORT=__PORT__");
   assertStringIncludes(template, "EnvironmentFile=-__ENV_FILE__");
-  assertStringIncludes(
-    template,
-    "ExecStart=__DENO__ task --config __APP_DIR__/deno.json role:__ROLE__",
-  );
+  assertStringIncludes(template, "ExecStart=__START_COMMAND__");
 });
 
 Deno.test("systemd and installers restrict runtime secrets and writes", async () => {
