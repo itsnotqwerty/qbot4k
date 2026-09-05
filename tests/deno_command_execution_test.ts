@@ -82,3 +82,56 @@ Deno.test("commands excluded from normalization resolve nothing", async () => {
   assertEquals(result.commandName, null);
   assertEquals(connection.queries.length, 0);
 });
+
+Deno.test("moderator alias creates a pointer to an existing command", async () => {
+  const connection = new FakeConnection([], (sql) => {
+    // aliasTarget(aliasName) -> not an alias; existingAlias check -> none
+    if (sql.includes("FROM simple_command_definitions")) return [];
+    // resolveAnyCommand(target) builtin lookup -> found
+    if (sql.includes("FROM command_definitions")) {
+      return [{ description_template: "https://example.com/docs" }];
+    }
+    return undefined;
+  });
+  const result = await new PostgresCommandExecutionRepository(connection)
+    .execute({ ...message, contentRaw: "!alias d docs" });
+  assertEquals(result.actionJobType, "discord.message.send");
+  const upsert = connection.queries.find((query) =>
+    query.sql.includes("INSERT INTO simple_command_definitions")
+  )!;
+  assertEquals(upsert.parameters, ["d", "alias:docs"]);
+  const payload = JSON.parse(String(connection.queries.at(-1)!.parameters[3]));
+  assertEquals(
+    payload.rendered_reply.embeds[0].description.includes(
+      "Aliased !d to !docs.",
+    ),
+    true,
+  );
+});
+
+Deno.test("alias resolution renders the target command output", async () => {
+  // simpleCommand call sequence for "!d":
+  //   1. aliasTarget(d)    -> "alias:docs"  (d is an alias)
+  //   2. aliasTarget(docs) -> plain text    (docs is not an alias, stop)
+  //   3. simpleCommand(docs) render -> plain text
+  const simpleResponses = [
+    [{ response_template: "alias:docs" }],
+    [{ response_template: "https://example.com/docs" }],
+    [{ response_template: "https://example.com/docs" }],
+  ];
+  let simpleCalls = 0;
+  const connection = new FakeConnection([], (sql) => {
+    if (sql.includes("FROM simple_command_definitions")) {
+      return simpleResponses[
+        Math.min(simpleCalls++, simpleResponses.length - 1)
+      ];
+    }
+    if (sql.includes("FROM command_definitions")) return [];
+    return undefined;
+  });
+  const result = await new PostgresCommandExecutionRepository(connection)
+    .execute({ ...message, contentRaw: "!d" });
+  assertEquals(result.actionJobType, "discord.message.send");
+  const payload = JSON.parse(String(connection.queries.at(-1)!.parameters[3]));
+  assertEquals(payload.rendered_reply.content, "https://example.com/docs");
+});

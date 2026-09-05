@@ -1,4 +1,8 @@
-import { AppSettings, ConfigError, safeDatabasePath } from "./src/core/config.ts";
+import {
+  AppSettings,
+  ConfigError,
+  safeDatabasePath,
+} from "./src/core/config.ts";
 import { withOperationalService } from "./src/data/operations.ts";
 
 interface Arguments {
@@ -112,7 +116,13 @@ export function parseArguments(args: readonly string[]): Arguments {
 
 export async function main(args = Deno.args): Promise<number> {
   const parsed = parseArguments(args);
-  const settings = AppSettings.fromEnv(undefined, { envFile: parsed.envFile });
+  const operationalRole = parsed.command === "check-config"
+    ? undefined
+    : "jobs" as const;
+  const settings = AppSettings.fromEnv(undefined, {
+    envFile: parsed.envFile,
+    ...(operationalRole ? { role: operationalRole } : {}),
+  });
   if (parsed.command === "check-config") {
     console.log(JSON.stringify(settings.safeSummary(), null, 2));
     return 0;

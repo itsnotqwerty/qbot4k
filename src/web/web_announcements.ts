@@ -46,10 +46,21 @@ export class PostgresAnnouncementRepository implements AnnouncementService {
       [communityId],
     );
     const items = await this.connection.query(
-      `SELECT a.id,a.platform,a.target_external_id,a.body,a.status,a.scheduled_at,a.last_error,a.timezone,i.display_name AS installation_name,(SELECT COUNT(*) FROM community_announcement_deliveries d WHERE d.announcement_id=a.id) AS attempt_count FROM community_announcements a LEFT JOIN community_installations i ON i.id=a.target_installation_id AND i.community_id=a.community_id WHERE a.community_id=$1 ORDER BY a.created_at DESC,a.id DESC`,
+      `SELECT a.id,a.platform,a.target_external_id,a.body,a.status,a.scheduled_at,a.last_error,a.timezone,
+              i.display_name AS installation_name,
+              dc.channel_name AS channel_name,
+              (SELECT COUNT(*) FROM community_announcement_deliveries d WHERE d.announcement_id=a.id) AS attempt_count
+         FROM community_announcements a
+         LEFT JOIN community_installations i ON i.id=a.target_installation_id AND i.community_id=a.community_id
+         LEFT JOIN discord_channels dc ON dc.channel_id=a.target_external_id AND a.platform='discord'
+        WHERE a.community_id=$1 ORDER BY a.created_at DESC,a.id DESC`,
       [communityId],
     );
-    return Object.freeze({ community, installations, items });
+    const channels = await this.connection.query(
+      `SELECT channel_id, channel_name, guild_id FROM discord_channels
+        WHERE channel_type = 0 ORDER BY LOWER(guild_id), LOWER(channel_name)`,
+    );
+    return Object.freeze({ community, installations, items, channels });
   }
   async create(
     communityId: number,

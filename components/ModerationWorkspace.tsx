@@ -4,6 +4,7 @@ import type {
   ModerationWorkResult,
 } from "@/src/domain/moderation.ts";
 import { DashboardHeader } from "./DashboardHeader.tsx";
+import { EmptyState } from "./ui.tsx";
 
 export function ModerationWorkspace(
   { snapshot, work, query }: {
@@ -107,9 +108,11 @@ export function ModerationWorkspace(
           </form>
           {work.items.length === 0
             ? (
-              <p class="empty-state">
-                No {query.queue ?? "unassigned"} work. The queue is clear.
-              </p>
+              <EmptyState
+                title={`No ${query.queue ?? "unassigned"} work`}
+                hint="The queue is clear. Flagged messages and pending reviews route here for a moderator to action."
+                columns={["Work", "Platform", "Author", "Severity", "Status"]}
+              />
             )
             : null}
           <div class="table-wrap">

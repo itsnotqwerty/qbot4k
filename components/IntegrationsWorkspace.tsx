@@ -1,5 +1,6 @@
 import type { IntegrationSnapshot } from "@/src/web/web_integrations.ts";
 import { DashboardHeader } from "./DashboardHeader.tsx";
+import { EmptyState } from "./ui.tsx";
 export function IntegrationsWorkspace(
   { community, guilds, installations, canManage, status, error }:
     & IntegrationSnapshot
@@ -74,7 +75,13 @@ export function IntegrationsWorkspace(
             )
             : null}
           {discord.length === 0
-            ? <p class="empty-state">No Discord servers connected.</p>
+            ? (
+              <EmptyState
+                title="No Discord servers connected"
+                hint="Add QBot4K to a server you administer. Connected servers and their ingestion status appear here."
+                columns={["Server", "Channels", "Status", "Health"]}
+              />
+            )
             : (
               <div class="table-wrap">
                 <table class="command-table">
@@ -151,7 +158,13 @@ export function IntegrationsWorkspace(
             )
             : null}
           {twitch.length === 0
-            ? <p class="empty-state">No Twitch channels connected.</p>
+            ? (
+              <EmptyState
+                title="No Twitch channels connected"
+                hint="Link a Twitch channel to ingest chat and run commands. Connected channels and their health appear here."
+                columns={["Channel", "Status", "Health", "Scopes"]}
+              />
+            )
             : (
               <div class="table-wrap">
                 <table class="command-table">

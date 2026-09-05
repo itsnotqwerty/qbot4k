@@ -95,9 +95,14 @@ export async function runRole(
     throw new TypeError(`role ${role} is not enabled by QBOT_ENABLED_SERVICES`);
   }
   lifecycle.install();
+  let heartbeat: ReturnType<typeof setInterval> | null = null;
   try {
     await service.start(lifecycle.abortController.signal);
     monitor.setStatus("ready");
+    await monitor.recordHeartbeat();
+    heartbeat = setInterval(() => {
+      void monitor.recordHeartbeat();
+    }, 15_000);
     options.onReady?.();
     if (options.once) {
       options.writeSnapshot?.(await monitor.snapshot());
@@ -105,9 +110,11 @@ export async function runRole(
     }
     await lifecycle.wait();
   } finally {
+    if (heartbeat) clearInterval(heartbeat);
     monitor.setStatus("stopping");
     await service.stop();
     monitor.setStatus("down");
+    await monitor.recordHeartbeat();
     lifecycle.dispose();
   }
 }
@@ -381,7 +388,15 @@ export class WebRoleService implements RoleService {
       auth,
       this.database.commandRegistry(),
     );
-    const audit = new WebAuditController(auth, this.database.auditService());
+    const settingsService = this.database.settingsService();
+    const audit = new WebAuditController(
+      auth,
+      this.database.auditService(),
+      async (communityId) => {
+        const snapshot = await settingsService.snapshot(communityId);
+        return String(snapshot.community.timezone ?? "UTC");
+      },
+    );
     const announcements = new WebAnnouncementsController(
       auth,
       this.database.announcementService(),
@@ -517,6 +532,8 @@ export async function main(args = Deno.args): Promise<void> {
   const monitor = new RoleHealthMonitor(
     database as DatabaseHealthSource,
     parsed.role,
+    new Date(),
+    database,
   );
   // Prefer the stored broadcaster credential for Twitch when no static bot
   // token is configured, so the OAuth-linked channel drives ingestion.

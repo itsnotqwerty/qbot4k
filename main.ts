@@ -3,7 +3,7 @@ import Home from "./routes/index.tsx";
 import AppWrapper from "./routes/_app.tsx";
 import { healthResponse, type RoleHealthMonitor } from "./src/core/health.ts";
 import type { WebAuthController } from "./src/web/web_auth.ts";
-import { legalPage, type LegalSettings } from "./src/web/web_pages.ts";
+import { legalPage, type LegalSettings, statusPage } from "./src/web/web_pages.ts";
 import type { WebDashboardController } from "./src/web/web_dashboard.ts";
 import type { WebModerationController } from "./src/web/web_moderation.ts";
 import type { WebCommandsController } from "./src/web/web_commands.ts";
@@ -52,6 +52,7 @@ export function createApp(
     .get("/health", health)
     .get("/health/live", health)
     .get("/health/ready", health)
+    .get("/status", () => statusPage())
     .get("/privacy", () => legalPage("privacy", legalSettings))
     .get("/terms", () => legalPage("terms", legalSettings));
   if (auth) {

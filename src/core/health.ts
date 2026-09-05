@@ -20,6 +20,19 @@ export interface HealthSnapshot {
   readonly uptime: Readonly<Record<string, string | number>>;
 }
 
+export interface RoleHeartbeatStore {
+  writeRoleHeartbeat(
+    role: string,
+    status: string,
+    detail?: Readonly<Record<string, unknown>>,
+  ): Promise<void>;
+  roleHeartbeats(): Promise<
+    Readonly<Record<string, { status: string; updatedAt: string }>>
+  >;
+}
+
+const HEARTBEAT_STALE_SECONDS = 120;
+
 export class RoleHealthMonitor {
   private status: ServiceStatus = "starting";
   private readonly startedAt: Date;
@@ -28,6 +41,7 @@ export class RoleHealthMonitor {
     private readonly database: DatabaseHealthSource,
     readonly role: ServiceRole,
     startedAt = new Date(),
+    private readonly heartbeats?: RoleHeartbeatStore,
   ) {
     this.startedAt = startedAt;
   }
@@ -36,12 +50,42 @@ export class RoleHealthMonitor {
     this.status = status;
   }
 
+  async recordHeartbeat(): Promise<void> {
+    if (!this.heartbeats) return;
+    try {
+      await this.heartbeats.writeRoleHeartbeat(this.role, this.status);
+    } catch {
+      // Heartbeats are best-effort and must not fail the role.
+    }
+  }
+
   async snapshot(now = new Date()): Promise<HealthSnapshot> {
     const database = await this.database.health();
+    const remote: Readonly<
+      Record<string, { status: string; updatedAt: string }>
+    > = this.heartbeats
+      ? await this.heartbeats.roleHeartbeats().catch(
+        () => ({} as Record<string, { status: string; updatedAt: string }>),
+      )
+      : {};
+    const allowed: readonly ServiceStatus[] = [
+      "starting",
+      "ready",
+      "degraded",
+      "stopping",
+      "down",
+    ];
     const services = Object.fromEntries(
-      SERVICE_ROLES.map((
-        role,
-      ) => [role, role === this.role ? this.status : "disabled"]),
+      SERVICE_ROLES.map((role) => {
+        if (role === this.role) return [role, this.status];
+        const heartbeat = remote[role];
+        if (!heartbeat) return [role, "disabled"];
+        const ageSeconds = (now.valueOf() - new Date(heartbeat.updatedAt)
+          .valueOf()) / 1000;
+        if (ageSeconds > HEARTBEAT_STALE_SECONDS) return [role, "down"];
+        const status = heartbeat.status as ServiceStatus;
+        return [role, allowed.includes(status) ? status : "down"];
+      }),
     ) as Record<ServiceRole, ServiceStatus>;
     const uptimeSeconds = Math.max(
       0,

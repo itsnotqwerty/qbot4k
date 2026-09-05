@@ -11,7 +11,7 @@ export function AppShell({ children }: AppShellProps) {
         <a class="brand" href="/" aria-label="QBot4K home">QBot4K</a>
         <nav aria-label="Primary navigation">
           <a href="/">Home</a>
-          <a href="/health/ready">System status</a>
+          <a href="/status">System status</a>
         </nav>
       </header>
       <main class="page-content">{children}</main>
@@ -20,7 +20,7 @@ export function AppShell({ children }: AppShellProps) {
         <nav aria-label="Legal and service links">
           <a href="/privacy">Privacy</a>
           <a href="/terms">Terms</a>
-          <a href="/health/live">Service health</a>
+          <a href="/status">Status</a>
         </nav>
       </footer>
     </div>

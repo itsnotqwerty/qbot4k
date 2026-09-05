@@ -287,6 +287,44 @@ export class PostgresDatabase {
     }
   }
 
+  async writeRoleHeartbeat(
+    role: string,
+    status: string,
+    detail: Readonly<Record<string, unknown>> = {},
+  ): Promise<void> {
+    await this.withConnection((connection) =>
+      connection.query(
+        `INSERT INTO role_heartbeats(role, status, detail_json, updated_at)
+         VALUES ($1,$2,$3,CURRENT_TIMESTAMP)
+         ON CONFLICT(role) DO UPDATE SET
+           status=EXCLUDED.status, detail_json=EXCLUDED.detail_json,
+           updated_at=EXCLUDED.updated_at`,
+        [role, status, JSON.stringify(detail)],
+      ).then(() => undefined)
+    );
+  }
+
+  async roleHeartbeats(): Promise<
+    Readonly<Record<string, { status: string; updatedAt: string }>>
+  > {
+    const rows = await this.withConnection((connection) =>
+      connection.query(
+        "SELECT role, status, updated_at FROM role_heartbeats",
+      )
+    );
+    return Object.freeze(
+      Object.fromEntries(
+        rows.map((row) => [
+          String(row.role),
+          {
+            status: String(row.status),
+            updatedAt: String(row.updated_at),
+          },
+        ]),
+      ),
+    );
+  }
+
   async health(): Promise<DatabaseHealth> {
     let reserved: ReservedPostgresSql | undefined;
     try {
@@ -325,8 +363,8 @@ export class PostgresDatabase {
     };
     return {
       enqueue: (input) => request((repository) => repository.enqueue(input)),
-      claim: (stage, workerId) =>
-        request((repository) => repository.claim(stage, workerId)),
+      claim: (stage, workerId, jobTypes) =>
+        request((repository) => repository.claim(stage, workerId, jobTypes)),
       complete: (jobId, workerId) =>
         request((repository) => repository.complete(jobId, workerId)),
       renewLease: (jobId, workerId, leaseSeconds) =>
@@ -1031,7 +1069,10 @@ export class PostgresDatabase {
         reserved.release();
       }
     };
-    return { list: (query) => request((audit) => audit.list(query)) };
+    return {
+      list: (query, timeZone) =>
+        request((audit) => audit.list(query, timeZone)),
+    };
   }
 
   announcementService(): AnnouncementService {

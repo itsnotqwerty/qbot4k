@@ -1,5 +1,6 @@
 import { AppShell } from "@/components/AppShell.tsx";
 import { RuntimePanel } from "@/components/RuntimePanel.tsx";
+import DemoCollage from "@/islands/DemoCollage.tsx";
 
 export default function Home() {
   return (
@@ -37,6 +38,7 @@ export default function Home() {
           </p>
         </article>
       </section>
+      <DemoCollage />
       <RuntimePanel />
     </AppShell>
   );

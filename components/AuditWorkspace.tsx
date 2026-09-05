@@ -1,5 +1,16 @@
 import type { DatabaseRow } from "@/src/data/database.ts";
 import { DashboardHeader } from "./DashboardHeader.tsx";
+import { EmptyState } from "./ui.tsx";
+
+// Timestamps arrive pre-formatted in the community timezone
+// (YYYY-MM-DD HH24:MI:SS); render as-is rather than re-localizing.
+const auditTime = (value: unknown): string => {
+  const text = String(value ?? "").trim();
+  if (!text) return "—";
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/u.test(text)) return text;
+  const date = new Date(text);
+  return Number.isNaN(date.valueOf()) ? text : date.toLocaleString();
+};
 
 export function AuditWorkspace(
   { items, query }: {
@@ -68,7 +79,7 @@ export function AuditWorkspace(
                 return (
                   <tr key={String(item.id)}>
                     <td class="command-name">
-                      {new Date(String(item.created_at)).toLocaleString()}
+                      {auditTime(item.created_at)}
                     </td>
                     <td>{actorName}</td>
                     <td>
@@ -88,7 +99,15 @@ export function AuditWorkspace(
             </tbody>
           </table>
         </div>
-        {!items.length ? <p class="empty-state">No audit events.</p> : null}
+        {!items.length
+          ? (
+            <EmptyState
+              title="No audit events"
+              hint="Operator and system actions are recorded here with actor, action, subject, and payload for full traceability."
+              columns={["Time", "Actor", "Action", "Subject", "Details"]}
+            />
+          )
+          : null}
       </main>
     </div>
   );

@@ -18,5 +18,6 @@ the code expires and is consumed when the Discord installation flow starts.
 !stoicism   ${GET}(https://stoic.tekloon.net/stoic-quote)[author:data.author,quote:data.quote] "${quote}" - ${author} !twitch     https://twitch.tv/its_not_qwerty
 !website	https://gatewaycorporate.org/
 !wolfram    ${GET}(https://api.wolframalpha.com/v1/result?i=${query}&appid=VY3XG3AVGY)
-!x		    https://x.com/Samuel_Roux_ !youtube	   https://youtube.com/@apollyvision
+!x		    https://x.com/Samuel_Roux_
+!youtube	https://youtube.com/@apollyvision
 !zen        ${GET}(https://zenquotes.io/api/quotes)[quote:${0..49}.q] "${quote}"

@@ -141,7 +141,8 @@ Deno.test("DF3 intelligence HTML and API routes bind the active tenant", async (
   assertEquals(page.status, 200);
   assertEquals(page.headers.get("content-type"), "text/html; charset=utf-8");
   const html = await page.text();
-  assertEquals(html.includes("Intelligence workspace"), true);
+  assertEquals(html.includes("Intelligence"), true);
+  assertEquals(html.includes("Alert queue"), true);
   assertEquals(html.includes('href="/styles.css"'), true);
   assertEquals(html.includes('href="/commands"'), true);
   const api = await handler(

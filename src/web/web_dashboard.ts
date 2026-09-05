@@ -3,6 +3,9 @@ import { render } from "npm:preact-render-to-string@6.7.0";
 import { DashboardDataView } from "../../components/DashboardDataView.tsx";
 import { UserProfileWorkspace } from "../../components/UserProfileWorkspace.tsx";
 import { SearchWorkspace } from "../../components/SearchWorkspace.tsx";
+import { AnalyticsWorkspace } from "../../components/AnalyticsWorkspace.tsx";
+import { OverviewWorkspace } from "../../components/OverviewWorkspace.tsx";
+import { SignalsWorkspace } from "../../components/SignalsWorkspace.tsx";
 import type { DashboardSession } from "../security/security.ts";
 import {
   constantTimeEqual,
@@ -124,20 +127,39 @@ export class WebDashboardController {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
-    const items = surface === "overview"
-      ? undefined
-      : this.items(surface, data);
+    if (surface === "analytics") {
+      const html = render(h(AnalyticsWorkspace, {
+        metrics: data as DashboardItem,
+      }));
+      return new Response(dashboardDocument(html, "Analytics | QBot4K"), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    if (surface === "overview") {
+      const html = render(h(OverviewWorkspace, {
+        metrics: data as DashboardItem,
+      }));
+      return new Response(dashboardDocument(html, "Overview | QBot4K"), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    if (surface === "signals") {
+      const html = render(h(SignalsWorkspace, {
+        items: this.items(surface, data),
+        query: url.searchParams.get("q") ?? "",
+      }));
+      return new Response(dashboardDocument(html, "Signals | QBot4K"), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+    const items = this.items(surface, data);
     const html = render(h(DashboardDataView, {
-      title: surface === "overview"
-        ? "Overview"
-        : surface[0].toUpperCase() + surface.slice(1),
-      eyebrow: surface === "overview"
-        ? "Community workspace"
-        : "Community data",
+      title: surface[0].toUpperCase() + surface.slice(1),
+      eyebrow: "Community data",
       description: `Tenant-scoped ${surface} for the active community.`,
       ...(items ? { items } : { metrics: data as DashboardItem }),
       query: url.searchParams.get("q") ?? "",
-      activePath: surface === "overview" ? "/dashboard" : `/${surface}`,
+      activePath: `/${surface}`,
     }));
     return new Response(dashboardDocument(html), {
       headers: { "content-type": "text/html; charset=utf-8" },

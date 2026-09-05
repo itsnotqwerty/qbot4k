@@ -98,6 +98,13 @@ CREATE TABLE IF NOT EXISTS service_reliability_buckets (
     PRIMARY KEY(service_name, bucket_start)
 );
 
+CREATE TABLE IF NOT EXISTS role_heartbeats (
+    role TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text)
+);
+
 CREATE TABLE IF NOT EXISTS processing_job_ownership (
     job_type TEXT PRIMARY KEY,
     owner_runtime TEXT NOT NULL DEFAULT 'python'

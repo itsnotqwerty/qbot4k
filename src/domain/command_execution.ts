@@ -169,10 +169,38 @@ export class PostgresCommandExecutionRepository {
       );
     }
     if (name === "alias") {
-      return card(
-        "Commands",
-        "Command aliases are not available in this runtime.",
+      const aliasName = normalizeCustomCommandName(arguments_[0] ?? "");
+      const targetName = normalizeCustomCommandName(arguments_[1] ?? "");
+      if (!aliasName || !targetName) {
+        return card("Commands", "Usage: !alias <newcommand> <existingcommand>");
+      }
+      if (aliasName === targetName) {
+        return card("Commands", "A command cannot alias itself.");
+      }
+      const existingAlias = await this.simpleCommand(aliasName);
+      if (existingAlias) {
+        return card("Commands", `!${aliasName} already exists.`);
+      }
+      const target = await this.resolveAnyCommand(targetName);
+      if (!target) {
+        return card("Commands", `!${targetName} does not exist.`);
+      }
+      if (target.startsWith(ALIAS_PREFIX)) {
+        return card(
+          "Commands",
+          `!${targetName} is itself an alias; alias the target directly.`,
+        );
+      }
+      await this.connection.query(
+        `INSERT INTO simple_command_definitions(
+           command_name,response_template,enabled
+         ) VALUES ($1,$2,1)
+         ON CONFLICT(command_name) DO UPDATE SET
+           response_template=EXCLUDED.response_template,enabled=1,
+           updated_at=CURRENT_TIMESTAMP`,
+        [aliasName, `${ALIAS_PREFIX}${targetName}`],
       );
+      return card("Commands", `Aliased !${aliasName} to !${targetName}.`);
     }
     if (name === "credit") {
       const row = (await this.connection.query(
@@ -199,8 +227,17 @@ export class PostgresCommandExecutionRepository {
     arguments_: readonly string[],
     input: CommandMessageInput,
   ): Promise<CommandReply | null> {
-    const commandName = normalizeCustomCommandName(name);
+    let commandName = normalizeCustomCommandName(name);
     if (!commandName) return null;
+    const seen = new Set<string>([commandName]);
+    // Follow simple-command aliases (up to a few hops) to their target.
+    for (let hop = 0; hop < 5; hop += 1) {
+      const aliasTarget = await this.aliasTarget(commandName);
+      if (!aliasTarget) break;
+      if (seen.has(aliasTarget)) return null;
+      seen.add(aliasTarget);
+      commandName = aliasTarget;
+    }
     const values = {
       query: arguments_.join(" "),
       user: input.username,
@@ -280,7 +317,35 @@ export class PostgresCommandExecutionRepository {
       [commandName],
     ))[0];
   }
+
+  // Returns the alias target name when the command is an alias, else null.
+  private async aliasTarget(commandName: string): Promise<string | null> {
+    const row = await this.simpleCommand(commandName);
+    if (!row) return null;
+    const template = String(row.response_template);
+    if (!template.startsWith(ALIAS_PREFIX)) return null;
+    const target = normalizeCustomCommandName(
+      template.slice(ALIAS_PREFIX.length),
+    );
+    return target || null;
+  }
+
+  // Returns the response template for a builtin or simple command, else null.
+  private async resolveAnyCommand(
+    commandName: string,
+  ): Promise<string | null> {
+    const builtin = (await this.connection.query(
+      `SELECT description_template FROM command_definitions
+        WHERE command_name=$1 AND enabled=1`,
+      [commandName],
+    ))[0];
+    if (builtin) return String(builtin.description_template);
+    const simple = await this.simpleCommand(commandName);
+    return simple ? String(simple.response_template) : null;
+  }
 }
+
+const ALIAS_PREFIX = "alias:";
 
 function hasOperatorRole(roleNames: readonly string[]): boolean {
   return roleNames.some((role) =>

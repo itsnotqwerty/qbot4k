@@ -109,12 +109,10 @@ Deno.test("Twitch IRC sends messages only to joined channels while ready", async
   const running = client.connectOnce(new AbortController().signal);
   while (client.health().status !== "ready") await Promise.resolve();
   await client.sendMessage("#ALPHA", "announcement");
-  await assertRejects(
-    () => client.sendMessage("missing", "announcement"),
-    TypeError,
-    "not joined",
-  );
   assertEquals(connection.writes.at(-1), "PRIVMSG #alpha :announcement");
+  await client.sendMessage("missing", "follow-up");
+  assertEquals(connection.writes.at(-2), "JOIN #missing");
+  assertEquals(connection.writes.at(-1), "PRIVMSG #missing :follow-up");
   blocked.resolve(null);
   await assertRejects(() => running, TypeError, "connection closed");
 });

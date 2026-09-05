@@ -168,16 +168,53 @@ async function mergeCanonicalUser(
   await connection.query("DELETE FROM users WHERE id=$1", [sourceUserId]);
 }
 
+const IANA_TIMEZONE_ALIAS: Readonly<Record<string, string>> = {
+  CST: "America/Chicago",
+  CDT: "America/Chicago",
+  EST: "America/New_York",
+  EDT: "America/New_York",
+  MST: "America/Denver",
+  MDT: "America/Denver",
+  PST: "America/Los_Angeles",
+  PDT: "America/Los_Angeles",
+};
+
+function ianaTimeZone(zone: unknown): string {
+  const raw = String(zone ?? "").trim();
+  if (!raw) return "UTC";
+  const aliased = IANA_TIMEZONE_ALIAS[raw.toUpperCase()] ?? raw;
+  return /^[A-Za-z_]+\/[A-Za-z_]+/u.test(aliased) ? aliased : "UTC";
+}
+
 export class DashboardQueryRepository implements DashboardQueryService {
   constructor(private readonly connection: DatabaseConnection) {}
+
+  private async communityTimeZone(communityId: number): Promise<string> {
+    const row = (await this.connection.query(
+      "SELECT timezone FROM communities WHERE id=$1",
+      [communityId],
+    ))[0];
+    return ianaTimeZone(row?.timezone);
+  }
 
   async overview(communityId: number): Promise<DashboardItem> {
     const metrics = await this.connection.query(
       `SELECT
         (SELECT COUNT(*) FROM messages WHERE community_id = $1) AS messages_total,
+        (SELECT COUNT(*) FROM messages WHERE community_id = $1
+          AND sent_at::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '24 hours') AS messages_24h,
+        (SELECT COUNT(*) FROM messages WHERE community_id = $1
+          AND sent_at::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '48 hours'
+          AND sent_at::timestamptz < CURRENT_TIMESTAMP - INTERVAL '24 hours') AS messages_prev_24h,
         (SELECT COUNT(*) FROM review_queue AS r JOIN messages AS m ON m.id = r.message_id
           WHERE r.status = 'open' AND m.community_id = $1) AS open_reviews,
+        (SELECT COUNT(*) FROM review_queue AS r JOIN messages AS m ON m.id = r.message_id
+          WHERE r.status = 'open' AND m.community_id = $1
+          AND r.created_at::timestamptz >= CURRENT_TIMESTAMP - INTERVAL '24 hours') AS open_reviews_24h,
         (SELECT COUNT(*) FROM moderation_actions WHERE status = 'pending' AND community_id = $1) AS pending_actions,
+        (SELECT COUNT(*) FROM intelligence_alerts WHERE community_id = $1 AND status = 'open') AS open_alerts,
+        (SELECT COUNT(*) FROM intelligence_alerts WHERE community_id = $1 AND status = 'open'
+          AND severity IN ('critical','high')) AS high_alerts,
         (SELECT COUNT(*) FROM community_derived_signal_windows
           WHERE community_id = $1 AND window_name = '24h') AS derived_signals`,
       [communityId],
@@ -290,14 +327,25 @@ export class DashboardQueryRepository implements DashboardQueryService {
     parameters.push(boundedInt(query.get("limit"), 100, 1, 500));
     const limitIndex = parameters.length;
     parameters.push(boundedInt(query.get("offset"), 0, 0, 100_000));
+    const timeZone = await this.communityTimeZone(communityId);
+    parameters.push(timeZone);
+    const zoneIndex = parameters.length;
     const rows = await this.connection.query(
-      `SELECT o.id, o.occurred_at, o.platform, o.event_type, o.external_event_id,
+      `SELECT o.id,
+              to_char(o.occurred_at::timestamptz AT TIME ZONE $${zoneIndex},
+                      'YYYY-MM-DD HH24:MI:SS') AS occurred_at,
+              o.platform, o.event_type, o.external_event_id,
               o.container_id, o.context_id, actor.user_id AS actor_user_id,
-              target.user_id AS target_user_id, ca.language_code, ca.sentiment_label,
+              target.user_id AS target_user_id,
+              COALESCE(actor_user.primary_display_name, actor.username) AS actor_name,
+              COALESCE(target_user.primary_display_name, target.username) AS target_name,
+              ca.language_code, ca.sentiment_label,
               ca.intent_label, ca.threat_level, o.text_raw
          FROM observations AS o
          LEFT JOIN platform_accounts AS actor ON actor.id = o.actor_platform_account_id
          LEFT JOIN platform_accounts AS target ON target.id = o.target_platform_account_id
+         LEFT JOIN users AS actor_user ON actor_user.id = actor.user_id
+         LEFT JOIN users AS target_user ON target_user.id = target.user_id
          LEFT JOIN content_analysis AS ca ON ca.observation_id = o.id
         WHERE ${conditions.join(" AND ")}
         ORDER BY o.occurred_at DESC, o.id DESC LIMIT $${limitIndex} OFFSET $${
@@ -630,10 +678,20 @@ export class DashboardQueryRepository implements DashboardQueryService {
           continue;
         }
         for (const account of matches) {
-          const sourceUserId = account.source_user_id === null ||
+          let sourceUserId = account.source_user_id === null ||
               account.source_user_id === undefined
             ? null
             : Number(account.source_user_id);
+          if (sourceUserId === null) {
+            const messageOwners = await connection.query(
+              `SELECT DISTINCT user_id FROM messages
+                WHERE platform_account_id=$1 AND user_id IS NOT NULL`,
+              [Number(account.id)],
+            );
+            if (messageOwners.length === 1) {
+              sourceUserId = Number(messageOwners[0].user_id);
+            }
+          }
           await connection.query(
             `UPDATE platform_accounts SET user_id=$1,detached_from_user_id=NULL,
                updated_at=CURRENT_TIMESTAMP WHERE id=$2`,

@@ -23,15 +23,21 @@ export class PostgresTwitchIngestionService implements TwitchIngestionService {
 
   async channels(): Promise<readonly string[]> {
     const rows = await this.connection.query(
-      `SELECT external_community_id FROM community_installations
+      `SELECT LOWER(COALESCE(
+           NULLIF(metadata_json::jsonb->>'broadcaster_login',''),
+           NULLIF(display_name,''),
+           external_community_id)) AS login
+         FROM community_installations
         WHERE platform='twitch' AND status='active'
           AND EXISTS (SELECT 1 FROM installation_runtime_leases lease
             WHERE lease.installation_id=community_installations.id
               AND lease.owner_runtime='deno' AND lease.lease_holder IS NOT NULL
               AND lease.lease_expires_at::timestamptz>CURRENT_TIMESTAMP)
-        ORDER BY LOWER(external_community_id)`,
+        ORDER BY login`,
     );
-    return Object.freeze(rows.map((row) => String(row.external_community_id)));
+    return Object.freeze(
+      rows.map((row) => String(row.login)).filter((login) => login.length > 0),
+    );
   }
 
   async ingest(

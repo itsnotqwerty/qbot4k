@@ -51,8 +51,8 @@ const payload = {
 
 Deno.test("Twitch ingestion discovers active installation channels", async () => {
   const connection = new FakeConnection([[
-    { external_community_id: "alpha" },
-    { external_community_id: "beta" },
+    { login: "alpha" },
+    { login: "beta" },
   ]]);
   assertEquals(
     await new PostgresTwitchIngestionService(
@@ -103,7 +103,7 @@ Deno.test("Twitch installation health persists joins and reconnect failures", as
   const health = new PostgresTwitchInstallationHealth(connection);
   await health.ready(["#Alpha"]);
   await health.failed("connection reset");
-  assertEquals(connection.calls[0].parameters, ['["alpha"]']);
+  assertEquals(connection.calls[0].parameters, ['{"alpha"}']);
   assertEquals(connection.calls[0].sql.includes("health_status='ready'"), true);
   assertEquals(
     connection.calls[2].sql.includes("integration.twitch_verified"),

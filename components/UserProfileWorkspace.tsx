@@ -1,5 +1,6 @@
 import type { DashboardItem } from "@/src/web/web_queries.ts";
 import { DashboardHeader } from "./DashboardHeader.tsx";
+import { EmptyState } from "./ui.tsx";
 
 const fieldLabel = (key: string): string =>
   ({
@@ -75,7 +76,13 @@ export function UserProfileWorkspace(
             </p>
           </div>
           {linkedAccounts.length === 0
-            ? <p class="empty-state">No linked platform accounts.</p>
+            ? (
+              <EmptyState
+                title="No linked platform accounts"
+                hint="Accounts from Discord and Twitch that resolve to this person appear here. Link an account below to merge activity into this profile."
+                columns={["Platform", "Username", "Context", "Actions"]}
+              />
+            )
             : (
               <div class="table-wrap">
                 <table class="command-table">

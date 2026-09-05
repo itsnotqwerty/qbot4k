@@ -1,5 +1,6 @@
 import type { DatabaseRow } from "@/src/data/database.ts";
 import { DashboardHeader } from "./DashboardHeader.tsx";
+import { EmptyState } from "./ui.tsx";
 
 export function CommandsWorkspace(
   { builtins, simple, status }: {
@@ -160,9 +161,11 @@ export function CommandsWorkspace(
 
           {simple.length === 0
             ? (
-              <p class="empty-state">
-                No custom plaintext commands are configured yet.
-              </p>
+              <EmptyState
+                title="No custom commands yet"
+                hint="Create a plaintext response command above. It becomes available in chat immediately on every linked platform."
+                columns={["Command", "Response", "Actions"]}
+              />
             )
             : (
               <div class="table-wrap">

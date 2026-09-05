@@ -2,7 +2,10 @@ import { h } from "preact";
 import { render } from "npm:preact-render-to-string@6.7.0";
 import { SettingsWorkspace } from "../../components/SettingsWorkspace.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
-import { constantTimeEqual, isAllowedSameSiteOrigin } from "../security/security.ts";
+import {
+  constantTimeEqual,
+  isAllowedSameSiteOrigin,
+} from "../security/security.ts";
 import type { DashboardSession } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
@@ -38,6 +41,29 @@ export interface SettingsService {
     action: string,
     reason: string,
   ): Promise<void>;
+}
+
+const IANA_TIMEZONE_ALIAS: Readonly<Record<string, string>> = {
+  CST: "America/Chicago",
+  CDT: "America/Chicago",
+  EST: "America/New_York",
+  EDT: "America/New_York",
+  MST: "America/Denver",
+  MDT: "America/Denver",
+  PST: "America/Los_Angeles",
+  PDT: "America/Los_Angeles",
+};
+
+function normalizeTimeZoneName(zone: string): string | null {
+  const raw = zone.trim();
+  if (!raw) return null;
+  const aliased = IANA_TIMEZONE_ALIAS[raw.toUpperCase()] ?? raw;
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: aliased }).format();
+    return aliased;
+  } catch {
+    return null;
+  }
 }
 
 export class PostgresSettingsRepository implements SettingsService {
@@ -99,9 +125,8 @@ export class PostgresSettingsRepository implements SettingsService {
     if (!locale || locale.length > 35) {
       throw new TypeError("locale must be between 1 and 35 characters");
     }
-    try {
-      new Intl.DateTimeFormat("en", { timeZone: timezone }).format();
-    } catch {
+    const normalizedTimeZone = normalizeTimeZoneName(timezone);
+    if (!normalizedTimeZone) {
       throw new TypeError("timezone is not recognized");
     }
     if (description.length > 1000) {
@@ -156,7 +181,7 @@ export class PostgresSettingsRepository implements SettingsService {
         [
           name,
           locale,
-          timezone,
+          normalizedTimeZone,
           description,
           guidelines,
           this.flag(input.notifications_enabled),
@@ -188,7 +213,7 @@ export class PostgresSettingsRepository implements SettingsService {
         communityId,
         {
           locale,
-          timezone,
+          timezone: normalizedTimeZone,
           notifications_enabled: Boolean(input.notifications_enabled),
         },
       );
