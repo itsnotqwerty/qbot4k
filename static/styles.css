@@ -280,8 +280,19 @@ footer a {
 }
 
 .hero {
-  max-width: 780px;
+  max-width: 920px;
   margin-bottom: clamp(56px, 9vh, 96px);
+}
+
+.hero h1 {
+  text-transform: none;
+  letter-spacing: -0.045em;
+  font-size: clamp(40px, 7vw, 76px);
+  line-height: 1.02;
+}
+
+.hero-accent {
+  color: var(--signal);
 }
 
 .eyebrow,
@@ -313,6 +324,14 @@ h1 {
   color: var(--muted);
   font-size: 21px;
   line-height: 1.5;
+}
+
+.hero-sub {
+  margin: 14px 0 0;
+  color: var(--ink);
+  font: 700 13px/1.4 ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .hero-actions {
