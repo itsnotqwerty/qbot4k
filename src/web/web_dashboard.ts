@@ -1,9 +1,15 @@
 import { h } from "preact";
 import { render } from "npm:preact-render-to-string@6.7.0";
 import { DashboardDataView } from "../../components/DashboardDataView.tsx";
+import { UserProfileWorkspace } from "../../components/UserProfileWorkspace.tsx";
+import { SearchWorkspace } from "../../components/SearchWorkspace.tsx";
 import type { DashboardSession } from "../security/security.ts";
-import { constantTimeEqual } from "../security/security.ts";
+import {
+  constantTimeEqual,
+  isAllowedSameSiteOrigin,
+} from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
+import { dashboardDocument } from "./web_document.ts";
 import type { RoleHealthMonitor } from "../core/health.ts";
 import type { DashboardItem, DashboardQueryService } from "./web_queries.ts";
 export { roleAllows } from "../security/permissions.ts";
@@ -109,6 +115,15 @@ export class WebDashboardController {
       authorized.communityId!,
       url.searchParams,
     );
+    if (surface === "search") {
+      const html = render(h(SearchWorkspace, {
+        items: this.items(surface, data),
+        query: url.searchParams.get("q") ?? "",
+      }));
+      return new Response(dashboardDocument(html, "Search | QBot4K"), {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
     const items = surface === "overview"
       ? undefined
       : this.items(surface, data);
@@ -122,8 +137,9 @@ export class WebDashboardController {
       description: `Tenant-scoped ${surface} for the active community.`,
       ...(items ? { items } : { metrics: data as DashboardItem }),
       query: url.searchParams.get("q") ?? "",
+      activePath: surface === "overview" ? "/dashboard" : `/${surface}`,
     }));
-    return new Response(`<!doctype html>${html}`, {
+    return new Response(dashboardDocument(html), {
       headers: { "content-type": "text/html; charset=utf-8" },
     });
   }
@@ -299,23 +315,26 @@ export class WebDashboardController {
       userId,
     );
     if (!payload) return new Response("User not found", { status: 404 });
-    const user = payload.user as DashboardItem;
-    const items = [
-      ...(payload.signals as readonly DashboardItem[]),
-      ...(payload.lifecycle as readonly DashboardItem[]),
-    ];
-    const html = render(h(DashboardDataView, {
-      title: String(user.primary_display_name ?? `User ${userId}`),
-      eyebrow: "Canonical profile",
-      description:
-        "Tenant-scoped profile, linked accounts, signals, and lifecycle.",
-      metrics: user,
-      items,
-      query: "",
+    const rawUser = payload.user as DashboardItem;
+    const { linked_accounts, notes, ...user } = rawUser;
+    const url = new URL(request.url);
+    const html = render(h(UserProfileWorkspace, {
+      user,
+      linkedAccounts: (linked_accounts ?? []) as readonly DashboardItem[],
+      notes: (notes ?? []) as readonly DashboardItem[],
+      status: url.searchParams.get("status") ?? "",
+      accountStatus: url.searchParams.get("account_status") ?? "",
+      canManage: roleAllows(authorized.role, "settings.manage"),
     }));
-    return new Response(`<!doctype html>${html}`, {
-      headers: { "content-type": "text/html; charset=utf-8" },
-    });
+    return new Response(
+      dashboardDocument(
+        html,
+        `${String(user.primary_display_name ?? `User ${userId}`)} | QBot4K`,
+      ),
+      {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      },
+    );
   }
 
   async lifecycleExport(request: Request, userId: number): Promise<Response> {
@@ -612,7 +631,7 @@ export class WebDashboardController {
   }
 
   private validOrigin(request: Request): boolean {
-    return request.headers.get("origin") === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
   }
 
   private redirect(location: string): Response {

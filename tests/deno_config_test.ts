@@ -54,7 +54,7 @@ Deno.test("settings reject unknown and incomplete service combinations", () => {
         baseEnv({ QBOT_ENABLED_SERVICES: "twitch,analysis" }),
       ),
     ConfigError,
-    "QBOT_TWITCH_BOT_TOKEN is required",
+    "QBOT_TWITCH_BOT_TOKEN or a stored Twitch credential",
   );
   assertThrows(
     () => AppSettings.fromEnv(baseEnv({ QBOT_DASHBOARD_PORT: "70000" })),

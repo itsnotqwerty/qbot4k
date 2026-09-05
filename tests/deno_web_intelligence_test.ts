@@ -1,7 +1,10 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import { createApp } from "../main.ts";
 import { createSessionCookie } from "../src/security/security.ts";
-import { type OperatorAuthStore, WebAuthController } from "../src/web/web_auth.ts";
+import {
+  type OperatorAuthStore,
+  WebAuthController,
+} from "../src/web/web_auth.ts";
 import {
   type IntelligenceCaseDetail,
   type IntelligenceService,
@@ -123,7 +126,6 @@ async function fixture(role = "analyst") {
       undefined,
       undefined,
       undefined,
-      undefined,
       controller,
     ).handler(),
     headers: { cookie: `qbot4k_session=${cookie}`, origin: "http://localhost" },
@@ -138,7 +140,10 @@ Deno.test("DF3 intelligence HTML and API routes bind the active tenant", async (
   );
   assertEquals(page.status, 200);
   assertEquals(page.headers.get("content-type"), "text/html; charset=utf-8");
-  assertEquals((await page.text()).includes("Intelligence workspace"), true);
+  const html = await page.text();
+  assertEquals(html.includes("Intelligence workspace"), true);
+  assertEquals(html.includes('href="/styles.css"'), true);
+  assertEquals(html.includes('href="/commands"'), true);
   const api = await handler(
     new Request("http://localhost/api/intelligence", { headers }),
   );

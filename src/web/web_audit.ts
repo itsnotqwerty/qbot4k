@@ -5,6 +5,7 @@ import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
 import type { DashboardSession } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 export interface AuditService {
   list(query: URLSearchParams): Promise<readonly DatabaseRow[]>;
@@ -26,7 +27,9 @@ export class PostgresAuditRepository implements AuditService {
     const actorId = query.get("actor_id")?.trim() ?? "";
     if (/^\d+$/u.test(actorId)) where.push(`actor_id=${bind(Number(actorId))}`);
     const startAt = query.get("start_at")?.trim();
-    if (startAt) where.push(`created_at>=${bind(startAt)}`);
+    if (startAt) {
+      where.push(`created_at::timestamptz>=${bind(startAt)}::timestamptz`);
+    }
     const limit = Math.max(
       1,
       Math.min(Number.parseInt(query.get("limit") ?? "200") || 200, 500),
@@ -58,7 +61,10 @@ export class WebAuditController {
     const items = await this.audit.list(query);
     if (json) return Response.json({ items });
     return new Response(
-      `<!doctype html>${render(h(AuditWorkspace, { items, query }))}`,
+      dashboardDocument(
+        render(h(AuditWorkspace, { items, query })),
+        "Audit | QBot4K",
+      ),
       { headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }

@@ -1,4 +1,8 @@
-import { assertEquals, assertThrows } from "jsr:@std/assert@1.0.14";
+import {
+  assertEquals,
+  assertStringIncludes,
+  assertThrows,
+} from "jsr:@std/assert@1.0.14";
 import { DatabaseSync } from "node:sqlite";
 import postgres from "postgres";
 import { parseTransferArguments } from "../database_transfer.ts";
@@ -53,6 +57,16 @@ Deno.test("database transfer classifies every PostgreSQL schema table", async ()
   assertEquals(
     tables.filter((table) => !(table in SCHEMA_SCOPE_INVENTORY)),
     [],
+  );
+});
+
+Deno.test("PostgreSQL schema stores Discord permissions as bigint", async () => {
+  const schema = await Deno.readTextFile(
+    new URL("../src/postgres_schema.sql", import.meta.url),
+  );
+  assertStringIncludes(
+    schema,
+    "ALTER COLUMN permissions TYPE BIGINT USING permissions::BIGINT",
   );
 });
 

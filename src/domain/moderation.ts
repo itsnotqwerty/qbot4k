@@ -899,10 +899,14 @@ export class PostgresModerationRepository implements ModerationService {
       );
     }
     if (query.startAt?.trim()) {
-      conditions.push(`created_at>=${bind(query.startAt.trim())}`);
+      conditions.push(
+        `created_at::timestamptz>=${bind(query.startAt.trim())}::timestamptz`,
+      );
     }
     if (query.endAt?.trim()) {
-      conditions.push(`created_at<=${bind(query.endAt.trim())}`);
+      conditions.push(
+        `created_at::timestamptz<=${bind(query.endAt.trim())}::timestamptz`,
+      );
     }
     if (query.assignment === "unassigned") {
       conditions.push("assigned_operator_id IS NULL");
@@ -913,7 +917,7 @@ export class PostgresModerationRepository implements ModerationService {
       `SELECT 'review' AS work_type,q.id AS item_id,m.platform,p.username,q.severity,q.queue_reason_code AS reason,m.content_raw AS summary,q.assigned_operator_id,q.status,q.resolution AS resolution_state,q.created_at FROM review_queue q JOIN messages m ON m.id=q.message_id JOIN platform_accounts p ON p.id=m.platform_account_id WHERE m.community_id=$1 UNION ALL SELECT 'appeal',a.id,ma.platform,p.username,a.severity,a.reason,ma.action_type,a.assigned_operator_id,a.status,a.disposition,a.created_at FROM member_appeals a JOIN moderation_actions ma ON ma.id=a.moderation_action_id JOIN platform_accounts p ON p.id=a.appellant_platform_account_id WHERE a.community_id=$1 UNION ALL SELECT 'report',r.id,p.platform,p.username,r.severity,r.category,r.summary,r.assigned_operator_id,r.status,r.resolution,r.created_at FROM member_reports r JOIN platform_accounts p ON p.id=r.subject_platform_account_id WHERE r.community_id=$1`;
     const offset = bind((page - 1) * 25);
     const result = await this.connection.query(
-      `SELECT *,COUNT(*) OVER() AS total_count,EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-created_at))/3600 AS sla_age_hours FROM (${union}) AS work ${
+      `SELECT *,COUNT(*) OVER() AS total_count,EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP-created_at::timestamptz))/3600 AS sla_age_hours FROM (${union}) AS work ${
         conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""
       } ORDER BY created_at DESC,item_id DESC LIMIT 25 OFFSET ${offset}`,
       parameters,

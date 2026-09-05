@@ -2,10 +2,14 @@ import { h } from "preact";
 import { render } from "npm:preact-render-to-string@6.7.0";
 import { LiveOpsWorkspace } from "../../components/LiveOpsWorkspace.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
-import { constantTimeEqual } from "../security/security.ts";
+import {
+  constantTimeEqual,
+  isAllowedSameSiteOrigin,
+} from "../security/security.ts";
 import type { DashboardSession } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 import { queueIncidentNotifications } from "../domain/notifications.ts";
 
 export type LiveOpsSnapshot = Readonly<Record<string, unknown>>;
@@ -81,11 +85,11 @@ export class PostgresLiveOpsRepository implements LiveOpsService {
       [communityId],
     );
     const metrics = (await this.connection.query(
-      "SELECT COUNT(*) AS messages,COUNT(DISTINCT platform_account_id) AS chatters,COUNT(DISTINCT channel_id) AS channels FROM messages WHERE community_id=$1 AND sent_at>=CURRENT_TIMESTAMP-INTERVAL '5 minutes'",
+      "SELECT COUNT(*) AS messages,COUNT(DISTINCT platform_account_id) AS chatters,COUNT(DISTINCT channel_id) AS channels FROM messages WHERE community_id=$1 AND sent_at::timestamptz>=CURRENT_TIMESTAMP-INTERVAL '5 minutes'",
       [communityId],
     ))[0] ?? {};
     const openAlerts = await this.connection.query(
-      "SELECT id,observation_id,alert_type,severity,status,title,summary,confidence,assigned_operator_id,created_at FROM intelligence_alerts WHERE community_id=$1 AND status IN ('open','triaged','acknowledged','in_case') AND (suppressed_until IS NULL OR suppressed_until<CURRENT_TIMESTAMP) ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,created_at DESC LIMIT 50",
+      "SELECT id,observation_id,alert_type,severity,status,title,summary,confidence,assigned_operator_id,created_at FROM intelligence_alerts WHERE community_id=$1 AND status IN ('open','triaged','acknowledged','in_case') AND (suppressed_until IS NULL OR suppressed_until::timestamptz<CURRENT_TIMESTAMP) ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,created_at DESC LIMIT 50",
       [communityId],
     );
     const incidents = await this.connection.query(
@@ -104,7 +108,7 @@ export class PostgresLiveOpsRepository implements LiveOpsService {
       "SELECT playbook_key,name,description,severity,steps_json FROM raid_playbooks WHERE enabled=1 ORDER BY CASE severity WHEN 'critical' THEN 0 ELSE 1 END,name",
     );
     const counts = (await this.connection.query(
-      "SELECT COUNT(*) FILTER (WHERE ma.status='pending') AS pending_actions,COUNT(*) FILTER (WHERE ma.status='failed') AS failed_actions,COUNT(*) FILTER (WHERE ma.provider_confirmed_at IS NOT NULL) AS confirmed_actions FROM moderation_actions ma LEFT JOIN messages m ON m.id=ma.message_id WHERE m.community_id=$1 AND ma.created_at>=CURRENT_TIMESTAMP-INTERVAL '1 day'",
+      "SELECT COUNT(*) FILTER (WHERE ma.status='pending') AS pending_actions,COUNT(*) FILTER (WHERE ma.status='failed') AS failed_actions,COUNT(*) FILTER (WHERE ma.provider_confirmed_at IS NOT NULL) AS confirmed_actions FROM moderation_actions ma LEFT JOIN messages m ON m.id=ma.message_id WHERE m.community_id=$1 AND ma.created_at::timestamptz>=CURRENT_TIMESTAMP-INTERVAL '1 day'",
       [communityId],
     ))[0] ?? {};
     const reviews = Number(
@@ -186,13 +190,13 @@ export class PostgresLiveOpsRepository implements LiveOpsService {
     ] as const;
     const prior = await this.connection.query(
       `${common}
-        AND (o.occurred_at<$4 OR (o.occurred_at=$4 AND o.id<=$5))
+        AND (o.occurred_at::timestamptz<$4::timestamptz OR (o.occurred_at::timestamptz=$4::timestamptz AND o.id<=$5))
        ORDER BY o.occurred_at DESC,o.id DESC LIMIT 12`,
       parameters,
     );
     const following = await this.connection.query(
       `${common}
-        AND (o.occurred_at>$4 OR (o.occurred_at=$4 AND o.id>$5))
+        AND (o.occurred_at::timestamptz>$4::timestamptz OR (o.occurred_at::timestamptz=$4::timestamptz AND o.id>$5))
        ORDER BY o.occurred_at,o.id LIMIT 6`,
       parameters,
     );
@@ -308,7 +312,7 @@ export class PostgresLiveOpsRepository implements LiveOpsService {
       }
       if (action === "route-on-call") {
         const onCall = (await connection.query(
-          "SELECT operator_id FROM moderation_shift_schedules WHERE community_id=$1 AND status IN ('scheduled','active') AND starts_at<=CURRENT_TIMESTAMP AND ends_at>CURRENT_TIMESTAMP ORDER BY starts_at DESC,id DESC LIMIT 1",
+          "SELECT operator_id FROM moderation_shift_schedules WHERE community_id=$1 AND status IN ('scheduled','active') AND starts_at::timestamptz<=CURRENT_TIMESTAMP AND ends_at::timestamptz>CURRENT_TIMESTAMP ORDER BY starts_at DESC,id DESC LIMIT 1",
           [communityId],
         ))[0];
         if (!onCall) throw new TypeError("no operator is currently on call");
@@ -385,7 +389,7 @@ export class PostgresLiveOpsRepository implements LiveOpsService {
       }
       if (
         (await connection.query(
-          "SELECT 1 FROM moderation_shift_schedules WHERE community_id=$1 AND status IN ('scheduled','active') AND starts_at<$2 AND ends_at>$3",
+          "SELECT 1 FROM moderation_shift_schedules WHERE community_id=$1 AND status IN ('scheduled','active') AND starts_at::timestamptz<$2::timestamptz AND ends_at::timestamptz>$3::timestamptz",
           [communityId, end.toISOString(), start.toISOString()],
         ))[0]
       ) throw new TypeError("shift overlaps an existing on-call schedule");
@@ -523,15 +527,19 @@ export class WebLiveOpsController {
     const session = await this.authorize(request);
     if (session instanceof Response) return session;
     const snapshot = await this.service.snapshot(session.communityId!);
+    const url = new URL(request.url);
     return new Response(
-      `<!doctype html>${
+      dashboardDocument(
         render(
           h(LiveOpsWorkspace, {
             snapshot,
             canManage: roleAllows(session.role, "admin.manage"),
+            canGoLive: roleAllows(session.role, "operators.manage"),
+            status: url.searchParams.get("status") ?? "",
           }),
-        )
-      }`,
+        ),
+        "Live operations | QBot4K",
+      ),
       { headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }
@@ -783,7 +791,7 @@ export class WebLiveOpsController {
     return session;
   }
   private origin(request: Request) {
-    return request.headers.get("origin") === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
   }
   private message(error: unknown) {
     return error instanceof Error ? error.message : String(error);

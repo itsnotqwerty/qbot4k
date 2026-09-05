@@ -1,5 +1,6 @@
 import postgres from "postgres";
 import { TenantContext } from "../core/contexts.ts";
+import { FernetCipher } from "../security/fernet.ts";
 import { OperatorAuthRepository, ScopedRepository } from "./repository.ts";
 import type { OperatorAuthStore } from "../web/web_auth.ts";
 import {
@@ -14,7 +15,10 @@ import {
   type CommandRegistry,
   PostgresCommandRegistry,
 } from "../web/web_commands.ts";
-import { type AuditService, PostgresAuditRepository } from "../web/web_audit.ts";
+import {
+  type AuditService,
+  PostgresAuditRepository,
+} from "../web/web_audit.ts";
 import {
   type AnnouncementService,
   PostgresAnnouncementRepository,
@@ -52,6 +56,7 @@ import {
   PostgresProcessingJobRepository,
   type ProcessingJobStore,
 } from "../jobs/jobs.ts";
+import { PostgresStreamSessionRepository } from "../jobs/stream_sessions.ts";
 import {
   type MessageAnalysisShadowRunner,
   PostgresMessageAnalysisRepository,
@@ -77,6 +82,13 @@ import {
   PostgresTwitchActionRepository,
   type TwitchModerationApi,
 } from "../providers/twitch/twitch_actions.ts";
+import {
+  PostgresTwitchMessageRepository,
+  type TwitchMessageSender,
+} from "../providers/twitch/twitch_messages.ts";
+import {
+  PostgresSocialScoreRepository,
+} from "../domain/score_materialization.ts";
 import {
   type ObservationCollector,
   PostgresObservationRepository,
@@ -249,6 +261,13 @@ export class PostgresDatabase {
     this.healthTarget =
       `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
     this.pool = postgres(databaseUrl, {
+      host: parsedUrl.hostname,
+      port: Number(parsedUrl.port || "5432"),
+      username: decodeURIComponent(parsedUrl.username),
+      database: decodeURIComponent(parsedUrl.pathname.slice(1)),
+      password: parsedUrl.password
+        ? decodeURIComponent(parsedUrl.password)
+        : () => "",
       max: options.maxConnections ?? 10,
       transform: { undefined: null },
     });
@@ -358,13 +377,25 @@ export class PostgresDatabase {
     };
   }
 
-  discordIngestionService(): DiscordIngestionService {
+  discordIngestionService(discordApi?: DiscordApi): DiscordIngestionService {
+    const channelName = discordApi
+      ? async (channelId: string) => {
+        const channel = await discordApi.getChannel(channelId);
+        return channel
+          ? {
+            name: String(channel.name ?? channelId),
+            type: Number(channel.type ?? 0),
+          }
+          : null;
+      }
+      : undefined;
     return {
       ingest: (eventName, data) =>
         this.withConnection((connection) =>
           new PostgresDiscordIngestionService(
             connection,
             new PostgresObservationRepository(connection),
+            channelName,
           ).ingest(eventName, data)
         ),
     };
@@ -425,6 +456,31 @@ export class PostgresDatabase {
       );
   }
 
+  twitchMessageHandler(sender: TwitchMessageSender): JobHandler {
+    return (job) =>
+      this.withConnection((connection) =>
+        new PostgresTwitchMessageRepository(connection, sender).sendMessage(job)
+      );
+  }
+
+  socialScoreHandler(): JobHandler {
+    return async (job) => {
+      await this.withConnection((connection) =>
+        new PostgresSocialScoreRepository(connection).calculate(
+          Number(job.payload.user_id),
+        )
+      );
+    };
+  }
+
+  streamSessionHandler(): JobHandler {
+    return async (job) => {
+      await this.withConnection((connection) =>
+        new PostgresStreamSessionRepository(connection).handle(job)
+      );
+    };
+  }
+
   twitchIngestionService(
     bootstrapChannels: readonly string[] = [],
   ): TwitchIngestionService {
@@ -461,6 +517,37 @@ export class PostgresDatabase {
           new PostgresTwitchInstallationHealth(connection).failed(error)
         ),
     };
+  }
+
+  async twitchInstallationTokens(
+    encryptionKey: string,
+    broadcasterLogin?: string,
+  ): Promise<{ accessToken: string; refreshToken: string | null } | null> {
+    return await this.withConnection(async (connection) => {
+      const row = (await connection.query(
+        `SELECT c.access_token_ciphertext, c.refresh_token_ciphertext
+           FROM installation_credentials AS c
+           JOIN community_installations AS i ON i.id = c.installation_id
+          WHERE i.platform = 'twitch'
+            AND i.status IN ('pending', 'active', 'degraded')
+            AND ($1 = '' OR LOWER(i.display_name) = LOWER($1)
+              OR LOWER(i.metadata_json::jsonb->>'broadcaster_login') = LOWER($1))
+          ORDER BY i.updated_at DESC, i.id DESC LIMIT 1`,
+        [broadcasterLogin ?? ""],
+      ))[0];
+      if (!row) return null;
+      const cipher = await FernetCipher.fromKey(encryptionKey);
+      const decode = (value: unknown): string =>
+        value instanceof Uint8Array
+          ? new TextDecoder().decode(value)
+          : String(value);
+      return {
+        accessToken: await cipher.decrypt(decode(row.access_token_ciphertext)),
+        refreshToken: row.refresh_token_ciphertext == null
+          ? null
+          : await cipher.decrypt(decode(row.refresh_token_ciphertext)),
+      };
+    });
   }
 
   twitchStreamPollingService(

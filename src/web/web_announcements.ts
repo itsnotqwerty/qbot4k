@@ -3,9 +3,11 @@ import { render } from "npm:preact-render-to-string@6.7.0";
 import { AnnouncementsWorkspace } from "../../components/AnnouncementsWorkspace.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
 import type { DashboardSession } from "../security/security.ts";
+import { isAllowedSameSiteOrigin } from "../security/security.ts";
 import { consumeTenantQuota } from "../domain/quota.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 export interface AnnouncementService {
   list(
@@ -211,15 +213,16 @@ export class WebAnnouncementsController {
     if (session instanceof Response) return session;
     const data = await this.announcements.list(session.communityId!);
     return new Response(
-      `<!doctype html>${
+      dashboardDocument(
         render(
           h(AnnouncementsWorkspace, {
             ...data,
             canManage: roleAllows(session.role, "admin.manage"),
             status: new URL(request.url).searchParams.get("status") ?? "",
           }),
-        )
-      }`,
+        ),
+        "Announcements | QBot4K",
+      ),
       { headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }
@@ -296,8 +299,7 @@ export class WebAnnouncementsController {
     return session;
   }
   private validOrigin(request: Request) {
-    const origin = request.headers.get("origin")?.replace(/\/$/u, "");
-    return !origin || origin === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
   }
   private redirect(location: string) {
     return new Response(null, { status: 302, headers: { location } });

@@ -4,10 +4,14 @@ import { IntegrationsWorkspace } from "../../components/IntegrationsWorkspace.ts
 import type { AppSettingsValues } from "../core/config.ts";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
 import { FernetCipher } from "../security/fernet.ts";
-import { constantTimeEqual } from "../security/security.ts";
+import {
+  constantTimeEqual,
+  isAllowedSameSiteOrigin,
+} from "../security/security.ts";
 import type { DashboardSession } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 const TWITCH_SCOPES = new Set([
   "moderator:read:followers",
@@ -15,6 +19,8 @@ const TWITCH_SCOPES = new Set([
   "moderator:manage:banned_users",
   "moderator:manage:chat_settings",
   "moderator:manage:shield_mode",
+  "chat:read",
+  "chat:edit",
 ]);
 type InstallState = {
   readonly operator_id: string;
@@ -109,7 +115,19 @@ export class FetchIntegrationOAuthGateway implements IntegrationOAuthGateway {
         redirect_uri: redirectUri,
       }),
     });
-    if (!response.ok) throw new TypeError("Discord installation failed");
+    if (!response.ok) {
+      let detail = `HTTP ${response.status}`;
+      try {
+        const body = await response.json() as {
+          error?: string;
+          error_description?: string;
+        };
+        if (body.error) {
+          detail = `${body.error}: ${body.error_description ?? ""}`.trim();
+        }
+      } catch { /* non-JSON error body */ }
+      throw new TypeError(`Discord installation failed (${detail})`);
+    }
   }
   async exchangeTwitch(
     code: string,
@@ -165,7 +183,23 @@ export class PostgresIntegrationRepository implements IntegrationService {
     ))[0];
     if (!community) throw new TypeError("Community not found");
     const guilds = await this.connection.query(
-      "SELECT guild_id FROM operator_discord_guild_permissions WHERE operator_id=$1 AND (permissions & 40) != 0 ORDER BY guild_id",
+      `SELECT permissions.guild_id,
+              COALESCE(
+                NULLIF(permissions.guild_name, ''),
+                NULLIF(installation.display_name, permissions.guild_id),
+                permissions.guild_id
+              ) AS guild_name
+         FROM operator_discord_guild_permissions AS permissions
+         LEFT JOIN community_installations AS installation
+           ON installation.platform='discord'
+          AND installation.external_community_id=permissions.guild_id
+        WHERE permissions.operator_id=$1
+          AND (permissions.permissions & 40::bigint) != 0
+        ORDER BY LOWER(COALESCE(
+          NULLIF(permissions.guild_name, ''),
+          NULLIF(installation.display_name, permissions.guild_id),
+          permissions.guild_id
+        )),permissions.guild_id`,
       [operatorId],
     );
     const installations = await this.connection.query(
@@ -184,19 +218,12 @@ export class PostgresIntegrationRepository implements IntegrationService {
     },
   ): Promise<void> {
     const guildId = input.guildId.trim();
-    if (!guildId || !input.pilotInviteCode.trim()) {
-      throw new TypeError("Discord installation intent fields are required");
+    if (!guildId) {
+      throw new TypeError("Discord installation guild is required");
     }
-    const hash = await crypto.subtle.digest(
-      "SHA-256",
-      new TextEncoder().encode(input.pilotInviteCode.trim()),
-    );
-    const codeHash = [...new Uint8Array(hash)].map((byte) =>
-      byte.toString(16).padStart(2, "0")
-    ).join("");
     await this.connection.transaction(async (connection) => {
       const allowed = (await connection.query(
-        "SELECT 1 FROM operator_community_roles r JOIN operator_discord_guild_permissions g ON g.operator_id=r.operator_id WHERE r.operator_id=$1 AND r.community_id=$2 AND r.role IN ('admin','owner') AND g.guild_id=$3 AND (g.permissions & 40) != 0",
+        "SELECT 1 FROM operator_community_roles r JOIN operator_discord_guild_permissions g ON g.operator_id=r.operator_id WHERE r.operator_id=$1 AND r.community_id=$2 AND r.role IN ('admin','owner') AND g.guild_id=$3 AND (g.permissions & 40::bigint) != 0",
         [input.operatorId, input.communityId, guildId],
       ))[0];
       if (!allowed) {
@@ -209,15 +236,6 @@ export class PostgresIntegrationRepository implements IntegrationService {
       if (existing && Number(existing.community_id) !== input.communityId) {
         throw new TypeError(
           "Discord guild is already linked to another community",
-        );
-      }
-      const invite = (await connection.query(
-        "UPDATE pilot_invitations SET consumed_at=CURRENT_TIMESTAMP,consumed_by_operator_id=$1 WHERE community_id=$2 AND code_hash=$3 AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP RETURNING id",
-        [input.operatorId, input.communityId, codeHash],
-      ))[0];
-      if (!invite) {
-        throw new TypeError(
-          "pilot invitation is invalid, expired, or already used",
         );
       }
       await connection.query(
@@ -243,7 +261,7 @@ export class PostgresIntegrationRepository implements IntegrationService {
   async completeDiscordIntent(state: InstallState): Promise<void> {
     await this.connection.transaction(async (connection) => {
       const consumed = (await connection.query(
-        "UPDATE discord_install_intents SET consumed_at=CURRENT_TIMESTAMP WHERE nonce=$1 AND operator_id=$2 AND community_id=$3 AND guild_id=$4 AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP RETURNING nonce",
+        "UPDATE discord_install_intents SET consumed_at=CURRENT_TIMESTAMP WHERE nonce=$1 AND operator_id=$2 AND community_id=$3 AND guild_id=$4 AND consumed_at IS NULL AND expires_at::timestamptz>CURRENT_TIMESTAMP RETURNING nonce",
         [
           state.nonce,
           Number(state.operator_id),
@@ -254,11 +272,18 @@ export class PostgresIntegrationRepository implements IntegrationService {
       if (!consumed) {
         throw new TypeError("Discord installation state was already used");
       }
+      const knownName = (await connection.query(
+        "SELECT guild_name FROM operator_discord_guild_permissions WHERE guild_id=$1 AND guild_name IS NOT NULL AND guild_name<>'' ORDER BY updated_at DESC LIMIT 1",
+        [state.guild_id ?? ""],
+      ))[0];
+      const displayName = String(knownName?.guild_name ?? "") ||
+        (state.guild_id ?? "");
       const installation = (await connection.query(
-        `INSERT INTO community_installations(community_id,platform,external_community_id,display_name,status,scopes_json,capabilities_json) VALUES ($1,'discord',$2,$2,'pending',$3,$4) ON CONFLICT(platform,external_community_id) DO UPDATE SET display_name=EXCLUDED.display_name,status=CASE WHEN community_installations.status='active' THEN 'active' ELSE 'pending' END,scopes_json=EXCLUDED.scopes_json,capabilities_json=EXCLUDED.capabilities_json,updated_at=CURRENT_TIMESTAMP RETURNING id`,
+        `INSERT INTO community_installations(community_id,platform,external_community_id,display_name,status,scopes_json,capabilities_json) VALUES ($1,'discord',$2,$3,'pending',$4,$5) ON CONFLICT(platform,external_community_id) DO UPDATE SET display_name=EXCLUDED.display_name,status=CASE WHEN community_installations.status='active' THEN 'active' ELSE 'pending' END,scopes_json=EXCLUDED.scopes_json,capabilities_json=EXCLUDED.capabilities_json,updated_at=CURRENT_TIMESTAMP RETURNING id`,
         [
           state.community_id,
           state.guild_id ?? "",
+          displayName,
           JSON.stringify(["applications.commands", "bot"]),
           JSON.stringify([
             "announcements",
@@ -352,7 +377,7 @@ export class PostgresIntegrationRepository implements IntegrationService {
     const cipher = await FernetCipher.fromKey(encryptionKey);
     return await this.connection.transaction(async (connection) => {
       const intent = (await connection.query(
-        "UPDATE twitch_install_intents SET consumed_at=CURRENT_TIMESTAMP WHERE nonce=$1 AND operator_id=$2 AND community_id=$3 AND broadcaster_login=$4 AND consumed_at IS NULL AND expires_at>CURRENT_TIMESTAMP RETURNING nonce",
+        "UPDATE twitch_install_intents SET consumed_at=CURRENT_TIMESTAMP WHERE nonce=$1 AND operator_id=$2 AND community_id=$3 AND broadcaster_login=$4 AND consumed_at IS NULL AND expires_at::timestamptz>CURRENT_TIMESTAMP RETURNING nonce",
         [
           state.nonce,
           Number(state.operator_id),
@@ -513,7 +538,7 @@ export class WebIntegrationsController {
     );
     const url = new URL(request.url);
     return new Response(
-      `<!doctype html>${
+      dashboardDocument(
         render(
           h(IntegrationsWorkspace, {
             ...data,
@@ -521,8 +546,9 @@ export class WebIntegrationsController {
             status: url.searchParams.get("status") ?? "",
             error: url.searchParams.get("error") ?? "",
           }),
-        )
-      }`,
+        ),
+        "Integrations | QBot4K",
+      ),
       { headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }
@@ -535,11 +561,10 @@ export class WebIntegrationsController {
     const form = await request.formData();
     const communityId = Number(form.get("community_id"));
     const guildId = String(form.get("guild_id") ?? "").trim();
-    const code = String(form.get("pilot_invite_code") ?? "");
     if (
       communityId !== session.communityId ||
       !this.settings.dashboardSessionSecret ||
-      !this.settings.discordOauthClientId || !guildId || !code
+      !this.settings.discordOauthClientId || !guildId
     ) {
       return new Response("Discord installation is not configured", {
         status: 503,
@@ -551,17 +576,16 @@ export class WebIntegrationsController {
         communityId,
         operatorId: Number(session.userId),
         guildId,
-        pilotInviteCode: code,
+        pilotInviteCode: "",
         state,
       });
       const url = new URL("https://discord.com/oauth2/authorize");
       url.search = new URLSearchParams({
         client_id: this.settings.discordOauthClientId,
-        redirect_uri: this.settings.discordOauthRedirectUri ??
-          `${new URL(request.url).origin}/integrations/discord/callback`,
+        redirect_uri: this.discordRedirectUri(request.url),
         response_type: "code",
         scope: "bot applications.commands",
-        permissions: "1099780156422",
+        permissions: "8",
         guild_id: guildId,
         disable_guild_select: "true",
         state: await signState(this.settings.dashboardSessionSecret, state),
@@ -596,8 +620,7 @@ export class WebIntegrationsController {
     try {
       await this.gateway.exchangeDiscord(
         url.searchParams.get("code")!,
-        this.settings.discordOauthRedirectUri ??
-          `${url.origin}/integrations/discord/callback`,
+        this.discordRedirectUri(request.url),
       );
       await this.integrations.completeDiscordIntent(state);
       return this.redirect(
@@ -636,8 +659,7 @@ export class WebIntegrationsController {
       const url = new URL("https://id.twitch.tv/oauth2/authorize");
       url.search = new URLSearchParams({
         client_id: this.settings.twitchClientId,
-        redirect_uri: this.settings.twitchOauthRedirectUri ??
-          `${new URL(request.url).origin}/integrations/twitch/callback`,
+        redirect_uri: this.twitchRedirectUri(request.url),
         response_type: "code",
         scope: scopes.join(" "),
         state: await signState(this.settings.dashboardSessionSecret, state),
@@ -678,8 +700,7 @@ export class WebIntegrationsController {
     try {
       const grant = await this.gateway.exchangeTwitch(
         url.searchParams.get("code")!,
-        this.settings.twitchOauthRedirectUri ??
-          `${url.origin}/integrations/twitch/callback`,
+        this.twitchRedirectUri(request.url),
       );
       const installationId = await this.integrations.completeTwitchIntent(
         state,
@@ -772,7 +793,32 @@ export class WebIntegrationsController {
     return session;
   }
   private origin(request: Request) {
-    return request.headers.get("origin") === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
+  }
+  private discordRedirectUri(requestUrl: string) {
+    const redirect = new URL(
+      this.settings.discordOauthRedirectUri ?? requestUrl,
+    );
+    if (!this.settings.discordOauthRedirectUri) {
+      redirect.pathname = "/integrations/discord/callback";
+      redirect.search = "";
+      redirect.hash = "";
+    } else if (redirect.pathname === "/oauth/discord/callback") {
+      redirect.pathname = "/integrations/discord/callback";
+    }
+    return redirect.toString();
+  }
+  private twitchRedirectUri(requestUrl: string) {
+    const requestOrigin = new URL(requestUrl).origin;
+    const configured = this.settings.twitchOauthRedirectUri;
+    if (!configured) return `${requestOrigin}/integrations/twitch/callback`;
+    const redirect = new URL(configured);
+    if (["localhost", "127.0.0.1"].includes(redirect.hostname)) {
+      return `${requestOrigin}/integrations/twitch/callback`;
+    }
+    redirect.search = "";
+    redirect.hash = "";
+    return redirect.toString();
   }
   private redirect(location: string) {
     return new Response(null, { status: 302, headers: { location } });

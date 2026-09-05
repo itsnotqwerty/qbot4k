@@ -102,16 +102,21 @@ export class TwitchIrcClient {
   async sendMessage(channel: string, message: string): Promise<string> {
     const normalizedChannel = channelName(channel);
     const normalizedMessage = message.trim();
-    if (
-      !normalizedChannel || !this.joinedChannels.includes(normalizedChannel)
-    ) {
-      throw new TypeError("Twitch channel is not joined");
+    if (!normalizedChannel) {
+      throw new TypeError("Twitch channel is required");
     }
     if (!normalizedMessage || /[\r\n]/u.test(normalizedMessage)) {
       throw new TypeError("Twitch message must be one non-empty IRC line");
     }
     if (!this.connection || this.status !== "ready") {
       throw new TypeError("Twitch IRC connection is not ready");
+    }
+    if (!this.joinedChannels.includes(normalizedChannel)) {
+      await this.connection.writeLine(`JOIN #${normalizedChannel}`);
+      this.joinedChannels = Object.freeze([
+        ...this.joinedChannels,
+        normalizedChannel,
+      ]);
     }
     await this.connection.writeLine(
       `PRIVMSG #${normalizedChannel} :${normalizedMessage.slice(0, 500)}`,

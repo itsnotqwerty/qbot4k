@@ -137,6 +137,37 @@ const normalizedRow = (row: DatabaseRow): DashboardItem =>
 const frozenRows = (rows: readonly DatabaseRow[]): readonly DashboardItem[] =>
   Object.freeze(rows.map(normalizedRow));
 
+async function mergeCanonicalUser(
+  connection: DatabaseConnection,
+  targetUserId: number,
+  sourceUserId: number,
+): Promise<void> {
+  if (targetUserId === sourceUserId) return;
+  const locked = await connection.query(
+    "SELECT id FROM users WHERE id=$1 FOR UPDATE",
+    [sourceUserId],
+  );
+  if (!locked.length) return;
+  await connection.query(
+    `UPDATE platform_accounts SET user_id=$1,detached_from_user_id=NULL,
+       updated_at=CURRENT_TIMESTAMP WHERE user_id=$2`,
+    [targetUserId, sourceUserId],
+  );
+  await connection.query(
+    "UPDATE messages SET user_id=$1 WHERE user_id=$2",
+    [targetUserId, sourceUserId],
+  );
+  await connection.query(
+    "UPDATE user_notes SET user_id=$1 WHERE user_id=$2",
+    [targetUserId, sourceUserId],
+  );
+  await connection.query(
+    "UPDATE reputation_events SET user_id=$1 WHERE user_id=$2",
+    [targetUserId, sourceUserId],
+  );
+  await connection.query("DELETE FROM users WHERE id=$1", [sourceUserId]);
+}
+
 export class DashboardQueryRepository implements DashboardQueryService {
   constructor(private readonly connection: DatabaseConnection) {}
 
@@ -193,8 +224,17 @@ export class DashboardQueryRepository implements DashboardQueryService {
       `SELECT u.id AS user_id, u.primary_display_name, u.current_reputation_score,
               u.candidate_flag, COUNT(DISTINCT m.platform_account_id) AS account_count,
               COUNT(DISTINCT m.id) AS message_count
-         FROM users AS u JOIN messages AS m ON m.user_id = u.id AND m.community_id = $1
-        WHERE u.primary_display_name ILIKE $2
+         FROM messages AS m
+         JOIN platform_accounts AS a ON a.id = m.platform_account_id
+         JOIN users AS u ON u.id = COALESCE(a.user_id, m.user_id)
+        WHERE m.community_id = $1
+          AND (
+            u.primary_display_name ILIKE $2
+            OR EXISTS (
+              SELECT 1 FROM platform_accounts AS p
+               WHERE p.user_id = u.id AND p.username ILIKE $2
+            )
+          )
         GROUP BY u.id ORDER BY ${order} ${direction}, LOWER(u.primary_display_name)
         LIMIT $3 OFFSET $4`,
       [
@@ -572,9 +612,10 @@ export class DashboardQueryRepository implements DashboardQueryService {
       let linkedUsernames = 0;
       let linkedAccounts = 0;
       const missingUsernames: string[] = [];
+      const mergedSourceUsers = new Set<number>();
       for (const username of usernames) {
         const matches = await connection.query(
-          `SELECT DISTINCT p.id,p.platform,p.platform_user_id
+          `SELECT DISTINCT p.id,p.platform,p.platform_user_id,p.user_id AS source_user_id
              FROM platform_accounts AS p
              LEFT JOIN users AS u ON u.id=p.user_id
             WHERE (LOWER(p.username)=LOWER($1) OR LOWER(u.primary_display_name)=LOWER($1))
@@ -589,11 +630,22 @@ export class DashboardQueryRepository implements DashboardQueryService {
           continue;
         }
         for (const account of matches) {
+          const sourceUserId = account.source_user_id === null ||
+              account.source_user_id === undefined
+            ? null
+            : Number(account.source_user_id);
           await connection.query(
             `UPDATE platform_accounts SET user_id=$1,detached_from_user_id=NULL,
                updated_at=CURRENT_TIMESTAMP WHERE id=$2`,
             [userId, Number(account.id)],
           );
+          if (
+            sourceUserId !== null && sourceUserId !== userId &&
+            !mergedSourceUsers.has(sourceUserId)
+          ) {
+            mergedSourceUsers.add(sourceUserId);
+            await mergeCanonicalUser(connection, userId, sourceUserId);
+          }
           await connection.query(
             `INSERT INTO audit_log(actor_type,actor_id,action_type,entity_type,entity_id,payload_json)
              VALUES ('operator',$1,'identity.account_linked','user',$2,$3)`,
@@ -729,8 +781,8 @@ export class DashboardQueryRepository implements DashboardQueryService {
           "webhook_acceptance_ms",
           1_000,
           await latency(
-            `SELECT GREATEST(0,EXTRACT(EPOCH FROM (ingested_at-occurred_at))*1000) AS value
-             FROM observations WHERE community_id=$1 AND ingested_at>=CURRENT_TIMESTAMP-INTERVAL '24 hours'`,
+            `SELECT GREATEST(0,EXTRACT(EPOCH FROM (ingested_at::timestamptz-occurred_at::timestamptz))*1000) AS value
+             FROM observations WHERE community_id=$1 AND ingested_at::timestamptz>=CURRENT_TIMESTAMP-INTERVAL '24 hours'`,
             [communityId],
           ),
         ),
@@ -738,9 +790,9 @@ export class DashboardQueryRepository implements DashboardQueryService {
           "event_to_alert_ms",
           10_000,
           await latency(
-            `SELECT GREATEST(0,EXTRACT(EPOCH FROM (a.created_at-o.ingested_at))*1000) AS value
+            `SELECT GREATEST(0,EXTRACT(EPOCH FROM (a.created_at::timestamptz-o.ingested_at::timestamptz))*1000) AS value
              FROM intelligence_alerts AS a JOIN observations AS o ON o.id=a.observation_id
-            WHERE a.community_id=$1 AND a.created_at>=CURRENT_TIMESTAMP-INTERVAL '24 hours'`,
+            WHERE a.community_id=$1 AND a.created_at::timestamptz>=CURRENT_TIMESTAMP-INTERVAL '24 hours'`,
             [communityId],
           ),
         ),
@@ -748,9 +800,9 @@ export class DashboardQueryRepository implements DashboardQueryService {
           "moderation_confirmation_ms",
           30_000,
           await latency(
-            `SELECT GREATEST(0,EXTRACT(EPOCH FROM (provider_confirmed_at-created_at))*1000) AS value
+            `SELECT GREATEST(0,EXTRACT(EPOCH FROM (provider_confirmed_at::timestamptz-created_at::timestamptz))*1000) AS value
              FROM moderation_actions WHERE community_id=$1 AND provider_confirmed_at IS NOT NULL
-               AND created_at>=CURRENT_TIMESTAMP-INTERVAL '24 hours'`,
+               AND created_at::timestamptz>=CURRENT_TIMESTAMP-INTERVAL '24 hours'`,
             [communityId],
           ),
         ),

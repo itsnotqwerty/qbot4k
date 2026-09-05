@@ -10,6 +10,7 @@ export interface DiscordApi {
     payload: Readonly<Record<string, unknown>>,
   ): Promise<unknown>;
   deleteMessage(channelId: string, messageId: string): Promise<unknown>;
+  getChannel(channelId: string): Promise<Record<string, unknown> | null>;
   timeoutMember(
     guildId: string,
     userId: string,
@@ -50,6 +51,18 @@ export class FetchDiscordApi implements DiscordApi {
       "DELETE",
       `/channels/${segment(channelId)}/messages/${segment(messageId)}`,
     );
+  }
+
+  async getChannel(channelId: string): Promise<Record<string, unknown> | null> {
+    try {
+      const channel = await this.request(
+        "GET",
+        `/channels/${segment(channelId)}`,
+      );
+      return record(channel);
+    } catch {
+      return null;
+    }
   }
 
   timeoutMember(

@@ -3,8 +3,10 @@ import { render } from "npm:preact-render-to-string@6.7.0";
 import { CommandsWorkspace } from "../../components/CommandsWorkspace.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
 import type { DashboardSession } from "../security/security.ts";
+import { isAllowedSameSiteOrigin } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 export interface CommandRegistry {
   list(): Promise<
@@ -53,7 +55,7 @@ export class PostgresCommandRegistry implements CommandRegistry {
       if (!response) throw new TypeError("response_template must not be empty");
       await this.connection.query(
         `INSERT INTO simple_command_definitions(command_name,response_template,enabled) VALUES ($1,$2,$3) ON CONFLICT(command_name) DO UPDATE SET response_template=EXCLUDED.response_template,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP`,
-        [name, response, Boolean(input.enabled)],
+        [name, response, input.enabled ? 1 : 0],
       );
       return `Saved simple command ${name}`;
     }
@@ -66,7 +68,7 @@ export class PostgresCommandRegistry implements CommandRegistry {
     const footer = String(input.footer_template ?? "").trim() || null;
     await this.connection.query(
       `INSERT INTO command_definitions(command_name,title,description_template,footer_template,enabled) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(command_name) DO UPDATE SET title=EXCLUDED.title,description_template=EXCLUDED.description_template,footer_template=EXCLUDED.footer_template,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP`,
-      [name, title, description, footer, Boolean(input.enabled)],
+      [name, title, description, footer, input.enabled ? 1 : 0],
     );
     return `Saved builtin command ${name}`;
   }
@@ -81,22 +83,22 @@ export class WebCommandsController {
     const session = await this.authorize(request);
     if (session instanceof Response) return session;
     return new Response(
-      `<!doctype html>${
+      dashboardDocument(
         render(
           h(CommandsWorkspace, {
             ...await this.registry.list(),
             status: new URL(request.url).searchParams.get("status") ?? "",
           }),
-        )
-      }`,
+        ),
+        "Commands | QBot4K",
+      ),
       { headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }
   async update(request: Request): Promise<Response> {
     const session = await this.authorize(request);
     if (session instanceof Response) return session;
-    const origin = request.headers.get("origin")?.replace(/\/$/u, "");
-    if (origin && origin !== new URL(request.url).origin) {
+    if (!isAllowedSameSiteOrigin(request)) {
       return new Response("Forbidden", { status: 403 });
     }
     try {

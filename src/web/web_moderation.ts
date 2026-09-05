@@ -1,11 +1,19 @@
 import { h } from "preact";
 import { render } from "npm:preact-render-to-string@6.7.0";
 import { ModerationWorkspace } from "../../components/ModerationWorkspace.tsx";
-import type { ModerationService, ReviewResolution } from "../domain/moderation.ts";
+import type {
+  ModerationService,
+  ReviewResolution,
+} from "../domain/moderation.ts";
 import type { ModerationWorkQuery } from "../domain/moderation.ts";
-import { constantTimeEqual, type DashboardSession } from "../security/security.ts";
+import {
+  constantTimeEqual,
+  type DashboardSession,
+  isAllowedSameSiteOrigin,
+} from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 type ListKind = "reviews" | "actions" | "rules";
 
@@ -39,9 +47,10 @@ export class WebModerationController {
       ),
     ]);
     return new Response(
-      `<!doctype html>${
-        render(h(ModerationWorkspace, { snapshot, work, query }))
-      }`,
+      dashboardDocument(
+        render(h(ModerationWorkspace, { snapshot, work, query })),
+        "Moderation | QBot4K",
+      ),
       {
         headers: { "content-type": "text/html; charset=utf-8" },
       },
@@ -525,7 +534,6 @@ export class WebModerationController {
   }
 
   private validOrigin(request: Request): boolean {
-    const origin = request.headers.get("origin")?.replace(/\/$/u, "");
-    return !origin || origin === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
   }
 }

@@ -1,4 +1,5 @@
 import type { DatabaseRow } from "@/src/data/database.ts";
+import { DashboardHeader } from "./DashboardHeader.tsx";
 
 export function AuditWorkspace(
   { items, query }: {
@@ -8,13 +9,7 @@ export function AuditWorkspace(
 ) {
   return (
     <div class="app-shell">
-      <header class="site-header">
-        <a class="brand" href="/dashboard">QBot4K</a>
-        <nav>
-          <a href="/dashboard">Overview</a>
-          <a href="/audit" aria-current="page">Audit</a>
-        </nav>
-      </header>
+      <DashboardHeader active="/audit" />
       <main class="page-content">
         <section class="data-heading">
           <div>
@@ -51,34 +46,45 @@ export function AuditWorkspace(
           <a href="/audit">Clear</a>
         </form>
         <div class="table-wrap">
-          <table>
+          <table class="command-table">
             <thead>
               <tr>
                 <th>Time</th>
                 <th>Actor</th>
                 <th>Action</th>
-                <th>Entity</th>
-                <th>ID</th>
-                <th>Payload</th>
+                <th>Subject</th>
+                <th>Details</th>
               </tr>
             </thead>
             <tbody>
-              {items.map((item) => (
-                <tr key={String(item.id)}>
-                  <td>{String(item.created_at)}</td>
-                  <td>
-                    {String(item.actor_type)}:{String(
-                      item.actor_id ?? "system",
-                    )}
-                  </td>
-                  <td>{String(item.action_type)}</td>
-                  <td>{String(item.entity_type)}</td>
-                  <td>{String(item.entity_id ?? "-")}</td>
-                  <td>
-                    <code>{String(item.payload_json)}</code>
-                  </td>
-                </tr>
-              ))}
+              {items.map((item) => {
+                const actorName = item.actor_id == null
+                  ? String(item.actor_type)
+                  : `${String(item.actor_type)} #${String(item.actor_id)}`;
+                const subject = [
+                  String(item.entity_type ?? ""),
+                  item.entity_id == null ? "" : `#${String(item.entity_id)}`,
+                ].filter(Boolean).join(" ");
+                return (
+                  <tr key={String(item.id)}>
+                    <td class="command-name">
+                      {new Date(String(item.created_at)).toLocaleString()}
+                    </td>
+                    <td>{actorName}</td>
+                    <td>
+                      {String(item.action_type).replaceAll(".", " / ")
+                        .replaceAll("_", " ")}
+                    </td>
+                    <td>{subject || "—"}</td>
+                    <td>
+                      <details class="audit-payload">
+                        <summary>View</summary>
+                        <code>{String(item.payload_json)}</code>
+                      </details>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

@@ -27,21 +27,24 @@ Deno.test("command templates preserve deterministic range and formatting behavio
   const selectUpper = (_lower: number, upper: number) => upper;
   assertEquals(
     formatCommandTemplate(
-      "hello {author_username} roll={5..1} idx={0..{query}}",
+      "hello ${author_username} roll=${5..1} idx=${0..${query}}",
       { author_username: "sam", query: "limit 49" },
       selectUpper,
     ),
     "hello sam roll=5 idx=49",
   );
   assertEquals(
-    formatCommandTemplate("idx={0..{query}}", { query: "oops" }, selectUpper),
+    formatCommandTemplate("idx=${0..${query}}", { query: "oops" }, selectUpper),
     "idx=0",
   );
   assertEquals(
-    formatCommandTemplate("value={0..9999999}", {}, selectUpper),
+    formatCommandTemplate("value=${0..9999999}", {}, selectUpper),
     "value=1000000",
   );
-  assertEquals(formatCommandTemplate("unknown={missing}"), "unknown={missing}");
+  assertEquals(
+    formatCommandTemplate("unknown=${missing}"),
+    "unknown=${missing}",
+  );
 });
 
 Deno.test("HTTP command macros preserve selectors aliases caching and URL queries", () => {
@@ -52,7 +55,7 @@ Deno.test("HTTP command macros preserve selectors aliases caching and URL querie
   };
   assertEquals(
     formatCommandTemplate(
-      "{GET}(https://example.test/search?q={query})[name:data.name;score:data.scores.2] {name}:{score} {GET}(https://example.test/search?q={query})[data.active]",
+      "${GET}(https://example.test/search?q=${query})[name:data.name;score:data.scores.2] ${name}:${score} ${GET}(https://example.test/search?q=${query})[data.active]",
       { query: "hello world" },
       (_lower, upper) => upper,
       response,
@@ -69,12 +72,12 @@ Deno.test("HTTP command macros preserve selectors aliases caching and URL querie
 Deno.test("HTTP command macro failures preserve alias placeholders", () => {
   assertEquals(
     formatCommandTemplate(
-      "prefix {GET}(https://example.test/fail)[name:data.name] {name}",
+      "prefix ${GET}(https://example.test/fail)[name:data.name] ${name}",
       {},
       (_lower, upper) => upper,
       () => null,
     ),
-    "prefix  {name}",
+    "prefix  ${name}",
   );
 });
 

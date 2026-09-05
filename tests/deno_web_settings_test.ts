@@ -90,7 +90,6 @@ async function fixture(role = "admin") {
       undefined,
       undefined,
       undefined,
-      undefined,
       controller,
     ).handler(),
   };

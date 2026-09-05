@@ -49,7 +49,9 @@ export class PostgresTwitchIngestionService implements TwitchIngestionService {
             WHERE lease.installation_id=installation.id
               AND lease.owner_runtime='deno' AND lease.lease_holder IS NOT NULL
               AND lease.lease_expires_at::timestamptz>CURRENT_TIMESTAMP)
-          AND LOWER(installation.external_community_id)=LOWER($1)`,
+          AND (LOWER(installation.display_name)=LOWER($1)
+            OR LOWER(installation.metadata_json::jsonb->>'broadcaster_login')=LOWER($1)
+            OR installation.external_community_id=$1)`,
       [message.channelId],
     ))[0];
     if (!installation) return null;
@@ -99,17 +101,17 @@ export class PostgresTwitchInstallationHealth
            last_verified_at=CURRENT_TIMESTAMP,reconnect_attempts=0,last_error=NULL,
            updated_at=CURRENT_TIMESTAMP
          WHERE platform='twitch' AND status IN ('pending','active')
-           AND LOWER(display_name) IN (SELECT jsonb_array_elements_text($1::jsonb))
+           AND LOWER(display_name) = ANY($1::text[])
          RETURNING id,community_id,external_community_id`,
-        [JSON.stringify(normalized)],
+        [textArray(normalized)],
       );
       await connection.query(
         `UPDATE community_installations SET
            health_status='degraded',last_health_check_at=CURRENT_TIMESTAMP,
            last_error='Channel missing from Twitch IRC joins',updated_at=CURRENT_TIMESTAMP
          WHERE platform='twitch' AND status='active'
-           AND LOWER(display_name) NOT IN (SELECT jsonb_array_elements_text($1::jsonb))`,
-        [JSON.stringify(normalized)],
+           AND NOT (LOWER(display_name) = ANY($1::text[]))`,
+        [textArray(normalized)],
       );
       for (const installation of verified) {
         await connection.query(
@@ -132,10 +134,17 @@ export class PostgresTwitchInstallationHealth
       `UPDATE community_installations SET
          health_status='degraded',last_health_check_at=CURRENT_TIMESTAMP,
          reconnect_attempts=reconnect_attempts+1,last_error=$1,updated_at=CURRENT_TIMESTAMP
-       WHERE platform='twitch' AND status='active'`,
+       WHERE platform='twitch' AND status IN ('pending','active','degraded')`,
       [error.slice(0, 2000)],
     );
   }
+}
+
+function textArray(values: readonly string[]): string {
+  const escaped = values.map((value) =>
+    `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
+  );
+  return `{${escaped.join(",")}}`;
 }
 
 function integer(value: unknown, name: string): number {

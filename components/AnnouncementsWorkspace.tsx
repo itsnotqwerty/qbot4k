@@ -1,4 +1,5 @@
 import type { DatabaseRow } from "@/src/data/database.ts";
+import { DashboardHeader } from "./DashboardHeader.tsx";
 
 export function AnnouncementsWorkspace({
   community,
@@ -15,13 +16,7 @@ export function AnnouncementsWorkspace({
 }) {
   return (
     <div class="app-shell">
-      <header class="site-header">
-        <a class="brand" href="/dashboard">QBot4K</a>
-        <nav>
-          <a href="/dashboard">Overview</a>
-          <a href="/announcements" aria-current="page">Announcements</a>
-        </nav>
-      </header>
+      <DashboardHeader active="/announcements" />
       <main class="page-content">
         <section class="data-heading">
           <div>

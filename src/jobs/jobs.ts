@@ -30,6 +30,7 @@ export interface ProcessingJobStore {
   claim(
     stage: ProcessingStage,
     workerId: string,
+    jobTypes?: readonly string[],
   ): Promise<ProcessingJob | null>;
   complete(jobId: number, workerId: string): Promise<void>;
   renewLease(
@@ -108,9 +109,13 @@ export class PostgresProcessingJobRepository implements ProcessingJobStore {
   async claim(
     stage: ProcessingStage,
     workerId: string,
+    jobTypes?: readonly string[],
   ): Promise<ProcessingJob | null> {
     const normalizedStage = stage.trim().toLocaleLowerCase();
     const normalizedWorkerId = workerId.trim();
+    const typeFilter = (jobTypes ?? []).map((type) =>
+      type.trim().toLocaleLowerCase()
+    ).filter(Boolean);
     if (!isProcessingStage(normalizedStage)) {
       throw new TypeError("stage must be either 'analysis' or 'action'");
     }
@@ -126,6 +131,7 @@ export class PostgresProcessingJobRepository implements ProcessingJobStore {
            SELECT DISTINCT community_id
              FROM processing_jobs
             WHERE stage=$1 AND community_id IS NOT NULL
+              AND ($3::text[] IS NULL OR job_type = ANY($3::text[]))
               AND EXISTS (
                 SELECT 1 FROM processing_job_ownership AS ownership
                  WHERE ownership.job_type=processing_jobs.job_type
@@ -144,6 +150,7 @@ export class PostgresProcessingJobRepository implements ProcessingJobStore {
            SELECT id,community_id
              FROM processing_jobs
             WHERE stage=$1
+              AND ($3::text[] IS NULL OR job_type = ANY($3::text[]))
               AND EXISTS (
                 SELECT 1 FROM processing_job_ownership AS ownership
                  WHERE ownership.job_type=processing_jobs.job_type
@@ -165,7 +172,11 @@ export class PostgresProcessingJobRepository implements ProcessingJobStore {
            FROM candidate
           WHERE job.id=candidate.id
         RETURNING job.*`,
-        [normalizedStage, normalizedWorkerId],
+        [
+          normalizedStage,
+          normalizedWorkerId,
+          typeFilter.length ? `{${typeFilter.join(",")}}` : null,
+        ],
       );
       if (!rows[0]) return null;
       const job = decodeJob(rows[0]);
@@ -434,6 +445,10 @@ export class JobRegistry {
     return this;
   }
 
+  jobTypes(): readonly string[] {
+    return Object.freeze([...this.handlers.keys()]);
+  }
+
   async dispatch(job: ProcessingJob): Promise<void> {
     const handler = this.handlers.get(job.jobType.toLocaleLowerCase());
     if (!handler) {
@@ -456,7 +471,11 @@ export class ProcessingWorker {
   ) {}
 
   async processNext(): Promise<boolean> {
-    const job = await this.store.claim(this.stage, this.workerId);
+    const job = await this.store.claim(
+      this.stage,
+      this.workerId,
+      this.registry.jobTypes(),
+    );
     if (!job) return false;
     const leaseController = new AbortController();
     let leaseFailure: unknown;

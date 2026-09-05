@@ -3,8 +3,10 @@ import { render } from "npm:preact-render-to-string@6.7.0";
 import { OnboardingWorkspace } from "../../components/OnboardingWorkspace.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
 import type { DashboardSession } from "../security/security.ts";
+import { isAllowedSameSiteOrigin } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 export interface OnboardingSnapshot {
   readonly installations: readonly DatabaseRow[];
@@ -379,15 +381,16 @@ export class WebOnboardingController {
     if (session instanceof Response) return session;
     const snapshot = await this.onboarding.snapshot(session.communityId!);
     return new Response(
-      `<!doctype html>${
+      dashboardDocument(
         render(
           h(OnboardingWorkspace, {
             ...snapshot,
             canManage: roleAllows(session.role, "admin.manage"),
             status: new URL(request.url).searchParams.get("status") ?? "",
           }),
-        )
-      }`,
+        ),
+        "Onboarding | QBot4K",
+      ),
       { headers: { "content-type": "text/html; charset=utf-8" } },
     );
   }
@@ -495,7 +498,6 @@ export class WebOnboardingController {
     return session;
   }
   private validOrigin(request: Request) {
-    const origin = request.headers.get("origin")?.replace(/\/$/u, "");
-    return !origin || origin === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
   }
 }

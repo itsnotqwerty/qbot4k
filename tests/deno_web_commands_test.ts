@@ -1,7 +1,10 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import { createApp } from "../main.ts";
 import { createSessionCookie } from "../src/security/security.ts";
-import { type OperatorAuthStore, WebAuthController } from "../src/web/web_auth.ts";
+import {
+  type OperatorAuthStore,
+  WebAuthController,
+} from "../src/web/web_auth.ts";
 import {
   type CommandRegistry,
   WebCommandsController,
@@ -90,6 +93,8 @@ Deno.test("commands page is admin-only and renders no-JavaScript forms", async (
   const html = await response.text();
   assertEquals(html.includes("Command menu"), true);
   assertEquals(html.includes('action="/commands"'), true);
+  assertEquals(html.includes('href="/styles.css"'), true);
+  assertEquals(html.includes('href="/integrations"'), true);
   const viewer = await fixture("viewer");
   assertEquals(
     (await viewer.handler(

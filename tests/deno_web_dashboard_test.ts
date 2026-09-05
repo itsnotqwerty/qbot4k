@@ -1,7 +1,10 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import { createApp } from "../main.ts";
 import { createSessionCookie } from "../src/security/security.ts";
-import { type OperatorAuthStore, WebAuthController } from "../src/web/web_auth.ts";
+import {
+  type OperatorAuthStore,
+  WebAuthController,
+} from "../src/web/web_auth.ts";
 import {
   type DashboardOperations,
   WebDashboardController,
@@ -81,7 +84,9 @@ class FakeQueries implements DashboardQueryService {
   linkUser(): Promise<"linked"> {
     return Promise.resolve("linked");
   }
-  linkUsersByName(): Promise<import("../src/web/web_queries.ts").UserLinkResult> {
+  linkUsersByName(): Promise<
+    import("../src/web/web_queries.ts").UserLinkResult
+  > {
     return Promise.resolve({
       userId: 4,
       linkedUsernames: 1,
@@ -244,10 +249,11 @@ Deno.test("DF3 dashboard HTML routes share tenant-scoped query services", async 
       response.headers.get("content-type"),
       "text/html; charset=utf-8",
     );
-    assertEquals(
-      (await response.text()).includes("Dashboard navigation"),
-      true,
-    );
+    const html = await response.text();
+    assertEquals(html.includes("Dashboard navigation"), true);
+    assertEquals(html.includes('href="/styles.css"'), true);
+    assertEquals(html.includes('href="/commands"'), true);
+    assertEquals(html.includes('href="/integrations"'), true);
   }
   assertEquals(queries.calls, [
     "overview:7",

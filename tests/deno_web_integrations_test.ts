@@ -10,7 +10,12 @@ import type {
 import { WebIntegrationsController } from "../src/web/web_integrations.ts";
 
 const secret = "integration-test-secret";
-async function fixture(role = "admin", eventsubConfigured = false) {
+async function fixture(
+  role = "admin",
+  eventsubConfigured = false,
+  discordRedirectUri = "http://localhost/integrations/discord/callback",
+  twitchRedirectUri = "http://localhost/integrations/twitch/callback",
+) {
   const calls: unknown[][] = [];
   const store: OperatorAuthStore = {
     completeLogin: () => Promise.reject(new Error("unused")),
@@ -77,10 +82,10 @@ async function fixture(role = "admin", eventsubConfigured = false) {
     dashboardSessionSecret: secret,
     discordOauthClientId: "discord-client",
     discordOauthClientSecret: "discord-secret",
-    discordOauthRedirectUri: "http://localhost/integrations/discord/callback",
+    discordOauthRedirectUri: discordRedirectUri,
     twitchClientId: "twitch-client",
     twitchClientSecret: "twitch-secret",
-    twitchOauthRedirectUri: "http://localhost/integrations/twitch/callback",
+    twitchOauthRedirectUri: twitchRedirectUri,
     credentialEncryptionKey: "unused-in-fake",
     twitchEventsubSecret: eventsubConfigured ? "0123456789abcdef" : null,
     twitchEventsubCallbackUrl: eventsubConfigured
@@ -122,7 +127,6 @@ async function fixture(role = "admin", eventsubConfigured = false) {
       undefined,
       undefined,
       undefined,
-      undefined,
       controller,
     ).handler(),
   };
@@ -136,6 +140,9 @@ Deno.test("integration links persist tenant-bound reviewed intents", async () =>
   const html = await page.text();
   assertEquals(page.status, 200);
   assertEquals(html.includes('action="/integrations/discord/link"'), true);
+  assertEquals(html.includes('href="/styles.css"'), true);
+  assertEquals(html.includes("Add QBot4K to server"), true);
+  assertEquals(html.includes("Connect Twitch channel"), true);
   const response = await app.handler(
     new Request("http://localhost/integrations/twitch/link", {
       method: "POST",
@@ -152,6 +159,101 @@ Deno.test("integration links persist tenant-bound reviewed intents", async () =>
   assertEquals(location.hostname, "id.twitch.tv");
   assertEquals(location.searchParams.get("scope"), "moderator:read:followers");
   assertEquals((app.calls[0]?.[1] as { communityId: number }).communityId, 7);
+});
+
+Deno.test("proxied link posts accept forwarded origin headers", async () => {
+  const app = await fixture();
+  const proxiedHeaders = {
+    ...app.headers,
+    origin: "https://qbot4k.dev",
+    host: "qbot4k.dev",
+    "x-forwarded-proto": "https",
+    "content-type": "application/x-www-form-urlencoded",
+  };
+  const twitch = await app.handler(
+    new Request("http://127.0.0.1:8080/integrations/twitch/link", {
+      method: "POST",
+      headers: proxiedHeaders,
+      body: "broadcaster_login=Channel&scope=moderator%3Aread%3Afollowers",
+    }),
+  );
+  assertEquals(twitch.status, 302);
+  const discord = await app.handler(
+    new Request("http://127.0.0.1:8080/integrations/discord/link", {
+      method: "POST",
+      headers: proxiedHeaders,
+      body: "community_id=7&guild_id=123",
+    }),
+  );
+  assertEquals(discord.status, 302);
+});
+
+Deno.test("link posts accept null origin from same-site form navigation", async () => {
+  const app = await fixture();
+  const response = await app.handler(
+    new Request("https://qbot4k.dev/integrations/discord/link", {
+      method: "POST",
+      headers: {
+        ...app.headers,
+        origin: "null",
+        "sec-fetch-site": "same-origin",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: "community_id=7&guild_id=123",
+    }),
+  );
+  assertEquals(response.status, 302);
+});
+
+Deno.test("Discord installation uses its callback when login OAuth is configured", async () => {
+  const app = await fixture(
+    "admin",
+    false,
+    "https://qbot4k.dev/oauth/discord/callback",
+  );
+  const response = await app.handler(
+    new Request("http://localhost/integrations/discord/link", {
+      method: "POST",
+      headers: {
+        ...app.headers,
+        origin: "http://localhost",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: "community_id=7&guild_id=123",
+    }),
+  );
+  assertEquals(response.status, 302);
+  const location = new URL(response.headers.get("location")!);
+  assertEquals(
+    location.searchParams.get("redirect_uri"),
+    "https://qbot4k.dev/integrations/discord/callback",
+  );
+});
+
+Deno.test("Twitch link ignores stale localhost callback configuration", async () => {
+  const app = await fixture(
+    "admin",
+    false,
+    undefined,
+    "http://localhost/integrations/twitch/callback",
+  );
+  const response = await app.handler(
+    new Request("https://qbot4k.dev/integrations/twitch/link", {
+      method: "POST",
+      headers: {
+        ...app.headers,
+        origin: "https://qbot4k.dev",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: "broadcaster_login=channel&scope=moderator%3Aread%3Afollowers",
+    }),
+  );
+  assertEquals(response.status, 302);
+  const location = new URL(response.headers.get("location")!);
+  assertEquals(
+    location.searchParams.get("redirect_uri"),
+    "https://qbot4k.dev/integrations/twitch/callback",
+  );
 });
 
 Deno.test("integration revocation requires exact confirmation and admin role", async () => {

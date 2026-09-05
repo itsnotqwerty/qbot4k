@@ -39,9 +39,10 @@ export type HttpTemplateResponse = (
   url: string,
 ) => string | null;
 
-const RANDOM_RANGE_PATTERN = /\{(-?\d+|\{query\})\.\.(-?\d+|\{query\})\}/gu;
+const RANDOM_RANGE_PATTERN =
+  /\$\{(-?\d+|\$?\{query\}|query)\.\.(-?\d+|\$?\{query\}|query)\}/gu;
 const HTTP_TEMPLATE_CALL_PATTERN =
-  /\{(GET|POST|PUT|DELETE)\}\((https?:\/\/[^\s)]+)\)(?:\[([^\]]+)\])?/giu;
+  /\$\{(GET|POST|PUT|DELETE)\}\((https?:\/\/[^\s)]+)\)(?:\[([^\]]+)\])?/giu;
 const HTTP_SELECTOR_ALIAS_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const SANITIZED_RANGE_MIN = -1_000_000;
 const SANITIZED_RANGE_MAX = 1_000_000;
@@ -110,7 +111,7 @@ export function resolveHttpTemplateCalls(
         if (!selector.includes(":")) continue;
         const alias = selector.split(":", 1)[0].trim();
         if (alias && HTTP_SELECTOR_ALIAS_PATTERN.test(alias)) {
-          values[alias] ??= `{${alias}}`;
+          values[alias] ??= `\${${alias}}`;
         }
       }
       const cacheKey = `${method}\u0000${url}`;
@@ -184,7 +185,7 @@ export function substituteHttpUrlTemplate(
 ): string {
   const query = String(values.query ?? "").trim();
   return urlTemplate.replaceAll(
-    "{query}",
+    "${query}",
     encodeURIComponent(query).replaceAll("%20", "+"),
   );
 }
@@ -277,11 +278,12 @@ function resolveRangeBound(
   rawBound: string,
   values: CommandTemplateValues,
 ): number {
-  if (rawBound.trim() === "{query}") {
+  const normalized = rawBound.trim().replace(/^\$?\{(.+)\}$/u, "$1");
+  if (normalized === "query") {
     const match = String(values.query ?? "").match(/-?\d+/u);
     return clampRange(match ? Number.parseInt(match[0], 10) : 0);
   }
-  return clampRange(Number.parseInt(rawBound, 10));
+  return clampRange(Number.parseInt(normalized, 10));
 }
 
 function clampRange(value: number): number {
@@ -320,7 +322,7 @@ function formatValues(
     escapedRight,
   );
   const formatted = protectedTemplate.replace(
-    /\{([^{}]+)\}/gu,
+    /\$\{([^{}]+)\}/gu,
     (_match, key: string) => {
       if (!(key in values)) {
         throw new TypeError(
@@ -330,7 +332,9 @@ function formatValues(
       return String(values[key]);
     },
   );
-  if (/[{}]/u.test(formatted)) throw new TypeError("invalid command template");
+  if (/\$\{[^}]*$/u.test(formatted)) {
+    throw new TypeError("invalid command template");
+  }
   return formatted.replaceAll(escapedLeft, "{").replaceAll(escapedRight, "}");
 }
 

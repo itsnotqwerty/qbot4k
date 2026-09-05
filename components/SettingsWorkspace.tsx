@@ -1,4 +1,5 @@
 import type { SettingsSnapshot } from "@/src/web/web_settings.ts";
+import { DashboardHeader } from "./DashboardHeader.tsx";
 
 export function SettingsWorkspace({
   community,
@@ -21,13 +22,7 @@ export function SettingsWorkspace({
     Boolean(row[key]);
   return (
     <div class="app-shell">
-      <header class="site-header">
-        <a class="brand" href="/dashboard">QBot4K</a>
-        <nav>
-          <a href="/dashboard">Overview</a>
-          <a href="/settings" aria-current="page">Settings</a>
-        </nav>
-      </header>
+      <DashboardHeader active="/settings" />
       <main class="page-content">
         <section class="data-heading">
           <div>
@@ -40,133 +35,324 @@ export function SettingsWorkspace({
           </div>
         </section>
         {status ? <p class="status-banner">{status}</p> : null}
+
         <form method="post" action="/settings">
-          <h2>Profile and locale</h2>
-          <input
-            name="name"
-            required
-            maxLength={120}
-            value={text(community, "name")}
-          />
-          <input
-            name="locale"
-            required
-            maxLength={35}
-            value={text(community, "locale")}
-          />
-          <input name="timezone" required value={text(community, "timezone")} />
-          <label>
-            <input
-              type="checkbox"
-              name="notifications_enabled"
-              value="1"
-              checked={checked(community, "notifications_enabled")}
-            />{" "}
-            Enable notifications
-          </label>
-          <textarea name="description" maxLength={1000}>
-            {text(community, "description")}
-          </textarea>
-          <textarea name="guidelines" maxLength={10000}>
-            {text(community, "guidelines")}
-          </textarea>
-          <h2>Retention and anti-abuse policy</h2>
-          <input
-            type="number"
-            name="message_retention_days"
-            min="1"
-            max="3650"
-            value={text(policy, "message_retention_days")}
-            required
-          />
-          <input
-            type="number"
-            name="analytics_retention_days"
-            min="1"
-            max="3650"
-            value={text(policy, "analytics_retention_days")}
-            required
-          />
-          <select name="anti_abuse_enforcement_mode">
-            <option
-              value="shadow"
-              selected={policy.anti_abuse_enforcement_mode === "shadow"}
-            >
-              Shadow
-            </option>
-            <option
-              value="enforce"
-              selected={policy.anti_abuse_enforcement_mode === "enforce"}
-            >
-              Enforce
-            </option>
-          </select>
-          <label>
-            <input
-              type="checkbox"
-              name="anti_abuse_enabled"
-              value="1"
-              checked={checked(policy, "anti_abuse_enabled")}
-            />{" "}
-            Enable anti-abuse controls
-          </label>
-          {[
-            ["message_burst_limit", 2, 100],
-            ["message_burst_window_seconds", 1, 300],
-            ["mention_limit", 1, 100],
-            ["join_raid_limit", 2, 1000],
-            ["join_raid_window_seconds", 1, 3600],
-          ].map(([name, min, max]) => (
-            <input
-              type="number"
-              name={String(name)}
-              min={String(min)}
-              max={String(max)}
-              value={text(policy, String(name))}
-              required
-            />
-          ))}
-          <button type="submit">Save settings</button>
+          <section class="command-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="section-label">Community</p>
+                <h2>Profile and locale</h2>
+              </div>
+              <p>Identity, language, timezone, and member-facing text.</p>
+            </div>
+            <div class="settings-form">
+              <label>
+                Community name
+                <input
+                  name="name"
+                  required
+                  maxLength={120}
+                  value={text(community, "name")}
+                />
+              </label>
+              <label>
+                Locale
+                <input
+                  name="locale"
+                  required
+                  maxLength={35}
+                  value={text(community, "locale")}
+                />
+              </label>
+              <label>
+                Timezone
+                <input
+                  name="timezone"
+                  required
+                  value={text(community, "timezone")}
+                />
+              </label>
+              <label>
+                Description
+                <textarea name="description" maxLength={1000}>
+                  {text(community, "description")}
+                </textarea>
+              </label>
+              <label>
+                Guidelines
+                <textarea name="guidelines" maxLength={10000}>
+                  {text(community, "guidelines")}
+                </textarea>
+              </label>
+              <label class="toggle">
+                <input
+                  type="checkbox"
+                  name="notifications_enabled"
+                  value="1"
+                  checked={checked(community, "notifications_enabled")}
+                />
+                <span>Enable notifications</span>
+              </label>
+            </div>
+          </section>
+
+          <section class="command-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="section-label">Safety</p>
+                <h2>Retention and anti-abuse policy</h2>
+              </div>
+              <p>Data retention windows and automated abuse controls.</p>
+            </div>
+            <div class="settings-form">
+              <label>
+                Message retention (days)
+                <input
+                  type="number"
+                  name="message_retention_days"
+                  min="1"
+                  max="3650"
+                  value={text(policy, "message_retention_days")}
+                  required
+                />
+              </label>
+              <label>
+                Analytics retention (days)
+                <input
+                  type="number"
+                  name="analytics_retention_days"
+                  min="1"
+                  max="3650"
+                  value={text(policy, "analytics_retention_days")}
+                  required
+                />
+              </label>
+              <label>
+                Enforcement mode
+                <select name="anti_abuse_enforcement_mode">
+                  <option
+                    value="shadow"
+                    selected={policy.anti_abuse_enforcement_mode === "shadow"}
+                  >
+                    Shadow
+                  </option>
+                  <option
+                    value="enforce"
+                    selected={policy.anti_abuse_enforcement_mode === "enforce"}
+                  >
+                    Enforce
+                  </option>
+                </select>
+              </label>
+              <label>
+                Message burst limit
+                <input
+                  type="number"
+                  name="message_burst_limit"
+                  min="2"
+                  max="100"
+                  value={text(policy, "message_burst_limit")}
+                  required
+                />
+              </label>
+              <label>
+                Burst window (seconds)
+                <input
+                  type="number"
+                  name="message_burst_window_seconds"
+                  min="1"
+                  max="300"
+                  value={text(policy, "message_burst_window_seconds")}
+                  required
+                />
+              </label>
+              <label>
+                Mention limit
+                <input
+                  type="number"
+                  name="mention_limit"
+                  min="1"
+                  max="100"
+                  value={text(policy, "mention_limit")}
+                  required
+                />
+              </label>
+              <label>
+                Join raid limit
+                <input
+                  type="number"
+                  name="join_raid_limit"
+                  min="2"
+                  max="1000"
+                  value={text(policy, "join_raid_limit")}
+                  required
+                />
+              </label>
+              <label>
+                Raid window (seconds)
+                <input
+                  type="number"
+                  name="join_raid_window_seconds"
+                  min="1"
+                  max="3600"
+                  value={text(policy, "join_raid_window_seconds")}
+                  required
+                />
+              </label>
+              <label class="toggle">
+                <input
+                  type="checkbox"
+                  name="anti_abuse_enabled"
+                  value="1"
+                  checked={checked(policy, "anti_abuse_enabled")}
+                />
+                <span>Enable anti-abuse controls</span>
+              </label>
+            </div>
+            <div class="settings-actions">
+              <button type="submit">Save all settings</button>
+            </div>
+          </section>
         </form>
-        <section>
-          <h2>Integrations</h2>
-          {installations.map((item) => (
-            <p>
-              {text(item, "platform")}: {text(item, "display_name")}{" "}
-              ({text(item, "health_status")})
-            </p>
-          ))}
+
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Providers</p>
+              <h2>Integrations</h2>
+            </div>
+            <p>Connected Discord servers and Twitch channels.</p>
+          </div>
+          {installations.length === 0
+            ? <p class="empty-state">No integrations connected.</p>
+            : (
+              <div class="table-wrap">
+                <table class="command-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Platform</th>
+                      <th scope="col">Name</th>
+                      <th scope="col">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {installations.map((item) => (
+                      <tr>
+                        <td>{text(item, "platform")}</td>
+                        <td class="command-name">
+                          {text(item, "display_name")}
+                        </td>
+                        <td>{text(item, "health_status")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           {canManageIntegrations
-            ? <a href="/integrations">Manage integrations</a>
+            ? (
+              <p>
+                <a href="/integrations" class="text-link">
+                  Manage integrations
+                </a>
+              </p>
+            )
             : null}
         </section>
-        <section>
-          <h2>Notification destinations</h2>
-          {destinations.map((item) => (
-            <p>{text(item, "name")}: {text(item, "minimum_severity")}</p>
-          ))}
+
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Alerts</p>
+              <h2>Notification destinations</h2>
+            </div>
+            <p>Where high-severity alerts are delivered.</p>
+          </div>
+          {destinations.length === 0
+            ? (
+              <p class="empty-state">
+                No notification destinations configured.
+              </p>
+            )
+            : (
+              <div class="table-wrap">
+                <table class="command-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">Name</th>
+                      <th scope="col">Type</th>
+                      <th scope="col">Minimum severity</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {destinations.map((item) => (
+                      <tr>
+                        <td>{text(item, "name")}</td>
+                        <td>{text(item, "destination_type")}</td>
+                        <td>{text(item, "minimum_severity")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
         </section>
+
         {canManageOperators
           ? (
-            <section>
-              <h2>Operators</h2>
-              {operators.map((item) => (
-                <p>{text(item, "discord_username")}: {text(item, "role")}</p>
-              ))}
-              <h3>Pending invitations</h3>
-              {invitations.map((item) => (
-                <p>
-                  {text(item, "target_discord_user_id")}:{" "}
-                  {text(item, "invited_role")}
-                </p>
-              ))}
-              <form method="post" action="/settings/operators/invite">
+            <section class="command-panel">
+              <div class="panel-heading">
+                <div>
+                  <p class="section-label">Access</p>
+                  <h2>Operators</h2>
+                </div>
+                <p>People with dashboard access to this community.</p>
+              </div>
+              {operators.length === 0
+                ? <p class="empty-state">No operators.</p>
+                : (
+                  <div class="table-wrap">
+                    <table class="command-table">
+                      <thead>
+                        <tr>
+                          <th scope="col">Operator</th>
+                          <th scope="col">Role</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {operators.map((item) => (
+                          <tr>
+                            <td>{text(item, "discord_username")}</td>
+                            <td>{text(item, "role")}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              {invitations.length > 0 && (
+                <>
+                  <h3>Pending invitations</h3>
+                  {invitations.map((item) => (
+                    <p>
+                      {text(item, "target_discord_user_id")}:{" "}
+                      {text(item, "invited_role")}
+                    </p>
+                  ))}
+                </>
+              )}
+              <form
+                method="post"
+                action="/settings/operators/invite"
+                class="command-new"
+              >
                 <input
                   name="discord_user_id"
                   required
                   placeholder="Discord user ID"
+                  aria-label="Discord user ID"
                 />
-                <select name="role">
+                <select name="role" aria-label="Role">
                   <option value="viewer">Viewer</option>
                   <option value="analyst">Analyst</option>
                   <option value="moderator">Moderator</option>
@@ -178,6 +364,7 @@ export function SettingsWorkspace({
                   min="1"
                   max="720"
                   value="72"
+                  aria-label="Expires in hours"
                 />
                 <button type="submit">Invite operator</button>
               </form>

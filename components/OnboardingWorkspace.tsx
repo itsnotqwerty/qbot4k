@@ -1,4 +1,5 @@
 import type { OnboardingSnapshot } from "@/src/web/web_onboarding.ts";
+import { DashboardHeader } from "./DashboardHeader.tsx";
 
 export function OnboardingWorkspace(
   { installations, settings, members, resources, canManage, status }:
@@ -10,13 +11,7 @@ export function OnboardingWorkspace(
   const checked = (name: string) => Boolean(settings?.[name]);
   return (
     <div class="app-shell">
-      <header class="site-header">
-        <a class="brand" href="/dashboard">QBot4K</a>
-        <nav>
-          <a href="/dashboard">Overview</a>
-          <a href="/onboarding" aria-current="page">Onboarding</a>
-        </nav>
-      </header>
+      <DashboardHeader active="/onboarding" />
       <main class="page-content">
         <section class="data-heading">
           <div>

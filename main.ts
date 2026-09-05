@@ -9,7 +9,6 @@ import type { WebModerationController } from "./src/web/web_moderation.ts";
 import type { WebCommandsController } from "./src/web/web_commands.ts";
 import type { WebAuditController } from "./src/web/web_audit.ts";
 import type { WebAnnouncementsController } from "./src/web/web_announcements.ts";
-import type { WebOnboardingController } from "./src/web/web_onboarding.ts";
 import type { WebSettingsController } from "./src/web/web_settings.ts";
 import type { WebIntegrationsController } from "./src/web/web_integrations.ts";
 import type { WebLiveOpsController } from "./src/web/web_live_ops.ts";
@@ -25,7 +24,6 @@ export function createApp(
   commands?: WebCommandsController,
   audit?: WebAuditController,
   announcements?: WebAnnouncementsController,
-  onboarding?: WebOnboardingController,
   settings?: WebSettingsController,
   integrations?: WebIntegrationsController,
   liveOps?: WebLiveOpsController,
@@ -35,7 +33,10 @@ export function createApp(
   const stylesheet = () =>
     Deno.readTextFile("static/styles.css").then((css) =>
       new Response(css, {
-        headers: { "content-type": "text/css; charset=utf-8" },
+        headers: {
+          "cache-control": "no-cache, no-store, max-age=0, must-revalidate",
+          "content-type": "text/css; charset=utf-8",
+        },
       })
     );
   const health = (context: Context<unknown>): Promise<Response> =>
@@ -362,26 +363,6 @@ export function createApp(
           ),
       );
   }
-  if (onboarding) {
-    app.get("/onboarding", (context) => onboarding.page(context.req))
-      .post("/onboarding", (context) => onboarding.configure(context.req))
-      .post(
-        "/onboarding/verify",
-        (context) => onboarding.verify(context.req),
-      )
-      .post(
-        "/onboarding/resources",
-        (context) => onboarding.saveResource(context.req),
-      )
-      .post(
-        "/onboarding/resources/:resourceId/delete",
-        (context) =>
-          onboarding.deleteResource(
-            context.req,
-            Number(context.params.resourceId),
-          ),
-      );
-  }
   if (settings) {
     app.get("/settings", (context) => settings.page(context.req))
       .post("/settings", (context) => settings.update(context.req))
@@ -404,7 +385,13 @@ export function createApp(
       );
   }
   if (integrations) {
+    const backToIntegrations = () =>
+      new Response(null, {
+        status: 302,
+        headers: { location: "/integrations" },
+      });
     app.get("/integrations", (context) => integrations.page(context.req))
+      .get("/integrations/discord/link", backToIntegrations)
       .post(
         "/integrations/discord/link",
         (context) => integrations.discordLink(context.req),
@@ -413,12 +400,17 @@ export function createApp(
         "/integrations/discord/callback",
         (context) => integrations.discordCallback(context.req),
       )
+      .get("/integrations/twitch/link", backToIntegrations)
       .post(
         "/integrations/twitch/link",
         (context) => integrations.twitchLink(context.req),
       )
       .get(
         "/integrations/twitch/callback",
+        (context) => integrations.twitchCallback(context.req),
+      )
+      .get(
+        "/oauth/twitch/callback",
         (context) => integrations.twitchCallback(context.req),
       )
       .post(

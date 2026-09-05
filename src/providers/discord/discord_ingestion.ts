@@ -30,7 +30,32 @@ export class PostgresDiscordIngestionService
   constructor(
     private readonly connection: DatabaseConnection,
     private readonly collector: ObservationCollector,
+    private readonly channelName?: (
+      channelId: string,
+    ) => Promise<{ name: string; type: number } | null>,
   ) {}
+
+  private async ensureChannel(channelId: string, guildId: string | null) {
+    if (!this.channelName) return;
+    try {
+      const known = (await this.connection.query(
+        "SELECT 1 FROM discord_channels WHERE channel_id=$1",
+        [channelId],
+      ))[0];
+      if (known) return;
+      const channel = await this.channelName(channelId);
+      if (!channel) return;
+      await this.connection.query(
+        `INSERT INTO discord_channels(channel_id, guild_id, channel_name, channel_type)
+         VALUES ($1,$2,$3,$4)
+         ON CONFLICT(channel_id) DO UPDATE SET
+           channel_name=EXCLUDED.channel_name, updated_at=CURRENT_TIMESTAMP`,
+        [channelId, guildId ?? "", channel.name, channel.type],
+      );
+    } catch {
+      // Channel name resolution is best-effort and must not block ingestion.
+    }
+  }
 
   async ingest(
     eventName: string,
@@ -50,6 +75,10 @@ export class PostgresDiscordIngestionService
       if (message.metadata.author_is_bot === true && !tenant.allowBotMessages) {
         return null;
       }
+      await this.ensureChannel(
+        message.channelId,
+        message.guildOrChannelContext,
+      );
       return await this.collector.collect(observationFromMessage(
         new NormalizedMessage({
           platform: message.platform,
@@ -116,10 +145,9 @@ export class PostgresDiscordInstallationHealth
            last_verified_at=CURRENT_TIMESTAMP,reconnect_attempts=0,
            last_error=NULL,updated_at=CURRENT_TIMESTAMP
          WHERE platform='discord' AND status IN ('pending','active')
-           AND external_community_id IN
-             (SELECT jsonb_array_elements_text($1::jsonb))
+           AND external_community_id = ANY($1::text[])
          RETURNING id,community_id,external_community_id`,
-        [JSON.stringify(guildIds)],
+        [textArray(guildIds)],
       );
       await connection.query(
         `UPDATE community_installations SET
@@ -127,9 +155,8 @@ export class PostgresDiscordInstallationHealth
            reconnect_attempts=0,last_error='Guild missing from Discord READY',
            updated_at=CURRENT_TIMESTAMP
          WHERE platform='discord' AND status='active'
-           AND external_community_id NOT IN
-             (SELECT jsonb_array_elements_text($1::jsonb))`,
-        [JSON.stringify(guildIds)],
+           AND NOT (external_community_id = ANY($1::text[]))`,
+        [textArray(guildIds)],
       );
       for (const installation of verified) {
         await connection.query(
@@ -165,6 +192,14 @@ function record(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function textArray(values: readonly string[]): string {
+  return `{${
+    values.map((value) =>
+      `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`
+    ).join(",")
+  }}`;
 }
 
 function text(value: unknown): string {

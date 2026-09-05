@@ -7,6 +7,7 @@ import {
   TenantQuotaExceededError,
 } from "../domain/observations.ts";
 import { verifyEventsubSignature } from "../security/security.ts";
+import { isAllowedSameSiteOrigin } from "../security/security.ts";
 import type { WebAuthController } from "../web/web_auth.ts";
 import { roleAllows } from "../web/web_dashboard.ts";
 
@@ -410,8 +411,8 @@ export class MachineIngestionController {
     | { communityId: number; payload: Readonly<Record<string, unknown>> }
     | Response
   > {
-    const origin = request.headers.get("origin")?.replace(/\/$/u, "");
-    if (origin && origin !== new URL(request.url).origin) {
+    const origin = request.headers.get("origin");
+    if (origin && origin !== "null" && !isAllowedSameSiteOrigin(request)) {
       return jsonError("origin_mismatch", 403);
     }
     const body = await boundedBody(request);

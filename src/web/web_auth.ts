@@ -4,6 +4,7 @@ import {
   createOauthState,
   createSessionCookie,
   type DashboardSession,
+  isAllowedSameSiteOrigin,
   parseSessionCookie,
   verifyOauthState,
 } from "../security/security.ts";
@@ -13,6 +14,8 @@ export interface DiscordIdentity {
   readonly username: string;
   readonly guildIds: readonly string[];
   readonly permissions: Readonly<Record<string, string>>;
+  readonly guildNames: Readonly<Record<string, string>>;
+  readonly ownedGuildIds: readonly string[];
 }
 
 export interface OperatorMembership {
@@ -215,7 +218,11 @@ export class WebAuthController {
         sessionCookie(await createSessionCookie(secret, session), secure),
         clearedCookie("qbot4k_oauth_state", secure),
       ]);
-    } catch {
+    } catch (error) {
+      console.error(
+        "Discord OAuth callback failed:",
+        error instanceof Error ? error.message : "unknown error",
+      );
       return text("Discord OAuth failed", 502);
     }
   }
@@ -342,8 +349,7 @@ export class WebAuthController {
   }
 
   private validOrigin(request: Request): boolean {
-    const origin = request.headers.get("origin")?.replace(/\/$/u, "");
-    return !origin || origin === requestOrigin(request);
+    return isAllowedSameSiteOrigin(request);
   }
 }
 
@@ -436,6 +442,16 @@ export function createDiscordOAuthProvider(
             String(guild.permissions ?? ""),
           ]),
         ),
+        guildNames: Object.fromEntries(
+          guilds.map((guild) => [
+            String(guild.id ?? "").trim(),
+            String(guild.name ?? guild.id ?? "").trim(),
+          ]).filter(([guildId]) => Boolean(guildId)),
+        ),
+        ownedGuildIds: guilds
+          .filter((guild) => guild.owner === true)
+          .map((guild) => String(guild.id ?? "").trim())
+          .filter(Boolean),
       };
     },
   };

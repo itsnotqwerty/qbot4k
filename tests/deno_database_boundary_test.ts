@@ -128,6 +128,43 @@ Deno.test("operator community switching binds membership and audit scope atomica
   );
 });
 
+Deno.test("operator login casts legacy invitation expiry timestamps", async () => {
+  const connection = new FakeConnection();
+  connection.rowQueue = [
+    [],
+    [{ id: 42, status: "active", session_version: 1 }],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [{ status: "active", session_version: 1 }],
+    [{ id: 1, name: "Default", slug: "default", role: "owner" }],
+  ];
+  const repository = new OperatorAuthRepository(connection);
+
+  await repository.completeLogin({
+    userId: "9001",
+    username: "Operator",
+    guildIds: ["guild-1"],
+    permissions: {},
+    guildNames: { "guild-1": "Alpha Guild" },
+    ownedGuildIds: [],
+  }, "admin");
+
+  const invitationQueries = connection.queries.filter((query) =>
+    query.sql.includes("operator_invitations")
+  );
+  assertEquals(invitationQueries.length, 2);
+  assertEquals(
+    invitationQueries.every((query) =>
+      query.sql.includes("expires_at::timestamptz")
+    ),
+    true,
+  );
+});
+
 Deno.test("dashboard user queries bind tenant input and whitelist sorting", async () => {
   const connection = new FakeConnection();
   connection.rows = [{
@@ -152,7 +189,86 @@ Deno.test("dashboard user queries bind tenant input and whitelist sorting", asyn
   assertEquals(users[0].candidate_flag, false);
   assertEquals(connection.queries[0].parameters, [7, "%Ada%", 25, 0]);
   assertEquals(connection.queries[0].sql.includes("m.community_id = $1"), true);
+  assertEquals(
+    connection.queries[0].sql.includes("COALESCE(a.user_id, m.user_id)"),
+    true,
+  );
+  assertEquals(
+    connection.queries[0].sql.includes("p.username ILIKE $2"),
+    true,
+  );
+  assertEquals(connection.queries[0].sql.includes("m.user_id = u.id"), false);
   assertEquals(connection.queries[0].sql.includes("DROP TABLE"), false);
+});
+
+Deno.test("linking a secondary user merges their records into the primary", async () => {
+  const connection = new FakeConnection();
+  connection.rowQueue = [
+    [{ ok: 1 }],
+    [{
+      id: 20,
+      platform: "twitch",
+      platform_user_id: "bob",
+      source_user_id: 8,
+    }],
+    [],
+    [{ id: 8 }],
+    [],
+    [],
+    [],
+    [],
+    [],
+    [],
+  ];
+  const result = await new DashboardQueryRepository(connection).linkUsersByName(
+    7,
+    42,
+    4,
+    "any",
+    ["bob"],
+  );
+
+  assertEquals(result?.userId, 4);
+  assertEquals(result?.linkedUsernames, 1);
+  assertEquals(result?.linkedAccounts, 1);
+  assertEquals(connection.transactionOutcome, "committed");
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("UPDATE messages SET user_id=$1 WHERE user_id=$2") &&
+      query.parameters[0] === 4 && query.parameters[1] === 8
+    ),
+    true,
+  );
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("UPDATE user_notes SET user_id=$1 WHERE user_id=$2") &&
+      query.parameters[0] === 4 && query.parameters[1] === 8
+    ),
+    true,
+  );
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes(
+        "UPDATE reputation_events SET user_id=$1 WHERE user_id=$2",
+      ) && query.parameters[0] === 4 && query.parameters[1] === 8
+    ),
+    true,
+  );
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("UPDATE platform_accounts") &&
+      query.sql.includes("WHERE user_id=$2") &&
+      query.parameters[0] === 4 && query.parameters[1] === 8
+    ),
+    true,
+  );
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("DELETE FROM users WHERE id=$1") &&
+      query.parameters[0] === 8
+    ),
+    true,
+  );
 });
 
 Deno.test("review resolution creates one bounded provider action and audit atomically", async () => {

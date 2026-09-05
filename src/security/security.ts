@@ -366,3 +366,31 @@ export function verifyRequestOrigin(
   return expectedCsrfToken === undefined ||
     constantTimeEqual(headers.get("x-csrf-token") ?? "", expectedCsrfToken);
 }
+
+/**
+ * Same-site mutation guard for browser form posts behind a reverse proxy.
+ *
+ * Browsers legitimately send no Origin header, or "null", on some same-site
+ * form navigations; those carry Sec-Fetch-Site and session cookies, so we
+ * accept them unless they are explicitly cross-site. A present, non-null
+ * Origin must match the externally visible origin, reconstructed from
+ * X-Forwarded-Proto/Host when behind a proxy.
+ */
+export function isAllowedSameSiteOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  if (!origin) return true;
+  if (origin === "null") {
+    return request.headers.get("sec-fetch-site") !== "cross-site";
+  }
+  const url = new URL(request.url);
+  const forwardedProto = request.headers.get("x-forwarded-proto")
+    ?.split(",")[0]?.trim();
+  const forwardedHost = request.headers.get("x-forwarded-host")
+    ?.split(",")[0]?.trim() ?? request.headers.get("host")?.trim();
+  const expected = forwardedProto || forwardedHost
+    ? `${forwardedProto || url.protocol.slice(0, -1)}://${
+      forwardedHost || url.host
+    }`
+    : url.origin;
+  return origin.replace(/\/$/u, "") === expected;
+}

@@ -1,5 +1,12 @@
-import { AppSettings, SERVICE_ROLES, type ServiceRole } from "./src/core/config.ts";
-import { type DatabaseHealthSource, PostgresDatabase } from "./src/data/database.ts";
+import {
+  AppSettings,
+  SERVICE_ROLES,
+  type ServiceRole,
+} from "./src/core/config.ts";
+import {
+  type DatabaseHealthSource,
+  PostgresDatabase,
+} from "./src/data/database.ts";
 import { RoleHealthMonitor } from "./src/core/health.ts";
 import { ShutdownController } from "./src/core/lifecycle.ts";
 import { StructuredLogger } from "./src/core/logging.ts";
@@ -13,7 +20,6 @@ import { WebModerationController } from "./src/web/web_moderation.ts";
 import { WebCommandsController } from "./src/web/web_commands.ts";
 import { WebAuditController } from "./src/web/web_audit.ts";
 import { WebAnnouncementsController } from "./src/web/web_announcements.ts";
-import { WebOnboardingController } from "./src/web/web_onboarding.ts";
 import { WebSettingsController } from "./src/web/web_settings.ts";
 import {
   FetchIntegrationOAuthGateway,
@@ -32,6 +38,8 @@ import {
   MESSAGE_ANALYSIS_JOB_TYPE,
   type MessageAnalysisShadowRunner,
 } from "./src/jobs/message_analysis.ts";
+import { SOCIAL_SCORE_JOB_TYPE } from "./src/domain/score_materialization.ts";
+import { STREAM_SESSION_JOB_TYPES } from "./src/jobs/stream_sessions.ts";
 import {
   DiscordGatewayClient,
   NativeDiscordGatewayTransport,
@@ -47,7 +55,11 @@ import {
   FetchTwitchModerationApi,
   TWITCH_MODERATION_JOB_TYPE,
 } from "./src/providers/twitch/twitch_actions.ts";
-import { NativeTwitchIrcTransport, TwitchIrcClient } from "./src/providers/twitch/twitch_irc.ts";
+import { TWITCH_MESSAGE_JOB_TYPE } from "./src/providers/twitch/twitch_messages.ts";
+import {
+  NativeTwitchIrcTransport,
+  TwitchIrcClient,
+} from "./src/providers/twitch/twitch_irc.ts";
 import { TwitchAnnouncementSender } from "./src/providers/twitch/twitch_announcements.ts";
 import type { AnnouncementDispatchService } from "./src/jobs/announcement_dispatch.ts";
 import type { TwitchStreamPollReport } from "./src/providers/twitch/twitch_stream_polling.ts";
@@ -374,10 +386,6 @@ export class WebRoleService implements RoleService {
       auth,
       this.database.announcementService(),
     );
-    const onboarding = new WebOnboardingController(
-      auth,
-      this.database.onboardingService(),
-    );
     const webSettings = new WebSettingsController(
       auth,
       this.database.settingsService(),
@@ -434,7 +442,6 @@ export class WebRoleService implements RoleService {
       commands,
       audit,
       announcements,
-      onboarding,
       webSettings,
       integrations,
       liveOps,
@@ -493,7 +500,10 @@ function parseArguments(args: readonly string[]): {
 
 export async function main(args = Deno.args): Promise<void> {
   const parsed = parseArguments(args);
-  const settings = AppSettings.fromEnv(undefined, { envFile: parsed.envFile });
+  const settings = AppSettings.fromEnv(undefined, {
+    envFile: parsed.envFile,
+    role: parsed.role,
+  });
   const tokenStore = parsed.envFile ? new TokenStore(parsed.envFile) : null;
   if (!settings.databasePath.startsWith("postgres")) {
     throw new TypeError("Deno runtime requires PostgreSQL");
@@ -508,6 +518,15 @@ export async function main(args = Deno.args): Promise<void> {
     database as DatabaseHealthSource,
     parsed.role,
   );
+  // Prefer the stored broadcaster credential for Twitch when no static bot
+  // token is configured, so the OAuth-linked channel drives ingestion.
+  const twitchStoredTokens = parsed.role === "twitch" &&
+      !settings.twitchBotToken?.trim() && settings.credentialEncryptionKey
+    ? await database.twitchInstallationTokens(
+      settings.credentialEncryptionKey,
+      settings.twitchChannels[0],
+    )
+    : null;
   const service = parsed.role === "web"
     ? new WebRoleService(settings, monitor, database, tokenStore)
     : parsed.role === "jobs"
@@ -532,10 +551,27 @@ export async function main(args = Deno.args): Promise<void> {
     ? new AnalysisRoleService([
       new ProcessingWorkerPool(
         database.processingJobStore(),
-        new JobRegistry().register(
-          MESSAGE_ANALYSIS_JOB_TYPE,
-          database.messageAnalysisHandler(settings.moderationShadowMode),
-        ),
+        new JobRegistry()
+          .register(
+            MESSAGE_ANALYSIS_JOB_TYPE,
+            database.messageAnalysisHandler(settings.moderationShadowMode),
+          )
+          .register(
+            SOCIAL_SCORE_JOB_TYPE,
+            database.socialScoreHandler(),
+          )
+          .register(
+            STREAM_SESSION_JOB_TYPES[0],
+            database.streamSessionHandler(),
+          )
+          .register(
+            STREAM_SESSION_JOB_TYPES[1],
+            database.streamSessionHandler(),
+          )
+          .register(
+            STREAM_SESSION_JOB_TYPES[2],
+            database.streamSessionHandler(),
+          ),
         "analysis",
         `analysis-${Deno.pid}`,
         2,
@@ -563,7 +599,9 @@ export async function main(args = Deno.args): Promise<void> {
       new DiscordGatewayClient(
         settings.discordBotToken!,
         new NativeDiscordGatewayTransport(),
-        database.discordIngestionService(),
+        database.discordIngestionService(
+          new FetchDiscordApi(settings.discordBotToken!),
+        ),
         5_000,
         settings.discordGuildIds,
         database.discordInstallationHealth(),
@@ -595,8 +633,11 @@ export async function main(args = Deno.args): Promise<void> {
     : parsed.role === "twitch"
     ? (() => {
       const tokens = new TwitchTokenManager({
-        initialAccessToken: settings.twitchBotToken!,
-        refreshToken: settings.twitchRefreshToken,
+        initialAccessToken: settings.twitchBotToken?.trim() ||
+          twitchStoredTokens?.accessToken || "",
+        refreshToken: settings.twitchBotToken?.trim()
+          ? settings.twitchRefreshToken
+          : twitchStoredTokens?.refreshToken ?? settings.twitchRefreshToken,
         clientId: settings.twitchClientId,
         clientSecret: settings.twitchClientSecret,
         onTokenRefresh: (accessToken, refreshToken) =>
@@ -637,6 +678,9 @@ export async function main(args = Deno.args): Promise<void> {
             database.twitchModerationHandler(
               new FetchTwitchModerationApi(tokens),
             ),
+          ).register(
+            TWITCH_MESSAGE_JOB_TYPE,
+            database.twitchMessageHandler(irc),
           ),
           "action",
           `twitch-action-${Deno.pid}`,

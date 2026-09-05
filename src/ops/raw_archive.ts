@@ -63,11 +63,12 @@ export class PostgresRawArchiveRepository implements RawArchiveService {
         const archiveId = positiveInteger(row.id, "archive_id");
         const communityId = positiveInteger(row.community_id, "community_id");
         const receivedAt = String(row.received_at);
-        const date = receivedAt.slice(0, 10).split("-");
-        if (
-          date.length !== 3 ||
-          Number.isNaN(new Date(receivedAt.replace(" ", "T")).getTime())
-        ) throw new TypeError("raw archive received_at is invalid");
+        const parsedAt = new Date(receivedAt);
+        if (Number.isNaN(parsedAt.getTime())) {
+          throw new TypeError("raw archive received_at is invalid");
+        }
+        const iso = parsedAt.toISOString();
+        const date = [iso.slice(0, 4), iso.slice(5, 7), iso.slice(8, 10)];
         let payload: unknown;
         try {
           payload = JSON.parse(String(row.payload_json) || "{}");

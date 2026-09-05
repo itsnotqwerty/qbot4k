@@ -104,7 +104,6 @@ function fixture(options: { apiAuthorized?: boolean } = {}) {
     undefined,
     undefined,
     undefined,
-    undefined,
     controller,
   ).handler();
   return { calls, observations, handler };

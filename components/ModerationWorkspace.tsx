@@ -3,6 +3,7 @@ import type {
   ModerationWorkQuery,
   ModerationWorkResult,
 } from "@/src/domain/moderation.ts";
+import { DashboardHeader } from "./DashboardHeader.tsx";
 
 export function ModerationWorkspace(
   { snapshot, work, query }: {
@@ -25,13 +26,7 @@ export function ModerationWorkspace(
     `/moderation?${new URLSearchParams({ ...filters, page: String(page) })}`;
   return (
     <div class="app-shell">
-      <header class="site-header">
-        <a class="brand" href="/dashboard">QBot4K</a>
-        <nav aria-label="Dashboard navigation">
-          <a href="/dashboard">Overview</a>
-          <a href="/moderation" aria-current="page">Moderation</a>
-        </nav>
-      </header>
+      <DashboardHeader active="/moderation" />
       <main class="page-content">
         <section class="data-heading">
           <div>
@@ -42,8 +37,17 @@ export function ModerationWorkspace(
             </p>
           </div>
         </section>
-        <section>
-          <h2>Work queue</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Moderation</p>
+              <h2>Work queue</h2>
+            </div>
+            <p>
+              Adjudicate open reviews, reports, and appeals. Assign work and
+              track provider-confirmed outcomes.
+            </p>
+          </div>
           <nav class="row-actions" aria-label="Work queue views">
             {["unassigned", "mine", "escalated", "appeals", "resolved", "all"]
               .map((name) => (
@@ -101,8 +105,15 @@ export function ModerationWorkspace(
             </select>
             <button type="submit">Apply filters</button>
           </form>
+          {work.items.length === 0
+            ? (
+              <p class="empty-state">
+                No {query.queue ?? "unassigned"} work. The queue is clear.
+              </p>
+            )
+            : null}
           <div class="table-wrap">
-            <table>
+            <table class="command-table">
               <thead>
                 <tr>
                   <th>Work</th>
@@ -160,8 +171,14 @@ export function ModerationWorkspace(
               : null}
           </nav>
         </section>
-        <section>
-          <h2>Open reviews</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Findings</p>
+              <h2>Open reviews</h2>
+            </div>
+            <p>Confirm or dismiss flagged content and apply an action.</p>
+          </div>
           {snapshot.reviews.map((review) => (
             <article class="moderation-item" key={String(review.review_id)}>
               <div>
@@ -207,8 +224,13 @@ export function ModerationWorkspace(
             ? <p class="empty-state">No open reviews.</p>
             : null}
         </section>
-        <section>
-          <h2>Saved filters</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Shortcuts</p>
+              <h2>Saved filters</h2>
+            </div>
+          </div>
           <div class="row-actions">
             {snapshot.savedFilters.map((filter) => (
               <a
@@ -236,22 +258,17 @@ export function ModerationWorkspace(
             <button type="submit">Save current filter</button>
           </form>
         </section>
-        <section class="moderation-columns">
-          <div>
-            <h2>Member reports</h2>
-            <p>{snapshot.reports.length} open</p>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Enforcement</p>
+              <h2>Bulk action</h2>
+            </div>
+            <p>
+              Apply one action to multiple accounts. Permanent bans require the
+              exact confirmation phrase.
+            </p>
           </div>
-          <div>
-            <h2>Sanction appeals</h2>
-            <p>{snapshot.appeals.length} open</p>
-          </div>
-          <div>
-            <h2>Rules</h2>
-            <p>{snapshot.rules.length} configured</p>
-          </div>
-        </section>
-        <section>
-          <h2>Bulk action</h2>
           <form method="post" action="/moderation/bulk">
             <input
               name="target_platform_account_ids"
@@ -279,8 +296,14 @@ export function ModerationWorkspace(
             <button type="submit">Queue action</button>
           </form>
         </section>
-        <section>
-          <h2>Member reports</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Reports</p>
+              <h2>Member reports</h2>
+            </div>
+            <p>{snapshot.reports.length} open</p>
+          </div>
           {snapshot.reports.map((item) => (
             <article class="moderation-item" key={String(item.item_id)}>
               <div>
@@ -302,8 +325,14 @@ export function ModerationWorkspace(
             </article>
           ))}
         </section>
-        <section>
-          <h2>Sanction appeals</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Appeals</p>
+              <h2>Sanction appeals</h2>
+            </div>
+            <p>{snapshot.appeals.length} open</p>
+          </div>
           {snapshot.appeals.map((item) => (
             <article class="moderation-item" key={String(item.item_id)}>
               <div>
@@ -329,10 +358,16 @@ export function ModerationWorkspace(
             </article>
           ))}
         </section>
-        <section>
-          <h2>Provider actions</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Delivery</p>
+              <h2>Provider actions</h2>
+            </div>
+            <p>Track Discord and Twitch confirmation of queued actions.</p>
+          </div>
           <div class="table-wrap">
-            <table>
+            <table class="command-table">
               <thead>
                 <tr>
                   <th>Target</th>
@@ -365,8 +400,14 @@ export function ModerationWorkspace(
             ? <p class="empty-state">No provider actions yet.</p>
             : null}
         </section>
-        <section>
-          <h2>Active rules</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Policy</p>
+              <h2>Active rules</h2>
+            </div>
+            <p>{snapshot.rules.length} configured</p>
+          </div>
           <form method="post" action="/moderation/rules/drafts">
             <input name="name" required placeholder="Rule name" />
             <select name="rule_type">
@@ -439,8 +480,14 @@ export function ModerationWorkspace(
             </table>
           </div>
         </section>
-        <section>
-          <h2>Rule versions</h2>
+        <section class="command-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-label">Versions</p>
+              <h2>Rule versions</h2>
+            </div>
+            <p>Test, publish, or roll back rule changes.</p>
+          </div>
           {snapshot.ruleVersions.map((version) => (
             <article class="moderation-item" key={String(version.version_id)}>
               <div>

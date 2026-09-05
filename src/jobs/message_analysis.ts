@@ -12,6 +12,12 @@ import {
   type ModerationRule,
 } from "../domain/moderation_rules.ts";
 import { consumeTenantQuota } from "../domain/quota.ts";
+import { PostgresCommandExecutionRepository } from "../domain/command_execution.ts";
+import {
+  scoreDeltaForMessage,
+  scoreDeltaForModeration,
+} from "../domain/scoring.ts";
+import { PostgresSocialScoreRepository } from "../domain/score_materialization.ts";
 
 export const MESSAGE_ANALYSIS_JOB_TYPE = "analyze.message.created";
 
@@ -202,7 +208,39 @@ export class PostgresMessageAnalysisRepository {
           platform: message.platform,
           shadow,
         });
+        const moderationDelta = scoreDeltaForModeration({
+          severity: finding.severity,
+          actionType: finding.autoEnforceAction,
+          reasonCode: finding.reasonCode,
+        });
+        await connection.query(
+          `INSERT INTO reputation_events(user_id,source_type,source_id,delta,reason_code)
+           VALUES ($1,'moderation',$2,$3,$4)`,
+          [userId, messageId, moderationDelta[0], moderationDelta[1]],
+        );
       }
+      const messageDelta = scoreDeltaForMessage(message.contentRaw);
+      if (messageDelta) {
+        await connection.query(
+          `INSERT INTO reputation_events(user_id,source_type,source_id,delta,reason_code)
+           VALUES ($1,'message',$2,$3,$4)`,
+          [userId, messageId, messageDelta[0], messageDelta[1]],
+        );
+      }
+      await new PostgresCommandExecutionRepository(connection).execute({
+        observationId,
+        communityId: job.communityId,
+        platform: message.platform,
+        channelId: message.channelId,
+        contentRaw: message.contentRaw,
+        username: message.username,
+        isModerator: message.isModerator,
+        roleNames: message.roleNames,
+      });
+      await new PostgresSocialScoreRepository(connection).enqueue(
+        userId,
+        `message:${messageId}`,
+      );
       await persistContent(
         connection,
         job.communityId,

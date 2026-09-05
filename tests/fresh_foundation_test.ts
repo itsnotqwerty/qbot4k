@@ -35,6 +35,10 @@ Deno.test("Fresh foundation serves the homepage through the app handler", async 
     stylesheet.headers.get("content-type"),
     "text/css; charset=utf-8",
   );
+  assertEquals(
+    stylesheet.headers.get("cache-control"),
+    "no-cache, no-store, max-age=0, must-revalidate",
+  );
 });
 
 Deno.test("Fresh shell renders core navigation without JavaScript", async () => {

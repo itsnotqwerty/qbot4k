@@ -367,14 +367,14 @@ export class OperatorAuthRepository implements OperatorAuthStore {
       await connection.query(
         `UPDATE operator_invitations SET status = 'expired'
           WHERE target_discord_user_id = $1 AND status = 'pending'
-            AND expires_at <= CURRENT_TIMESTAMP`,
+            AND expires_at::timestamptz <= CURRENT_TIMESTAMP`,
         [identity.userId],
       );
       const invitations = await connection.query(
         `SELECT id, community_id, invited_role
            FROM operator_invitations
           WHERE target_discord_user_id = $1 AND status = 'pending'
-            AND expires_at > CURRENT_TIMESTAMP ORDER BY id`,
+            AND expires_at::timestamptz > CURRENT_TIMESTAMP ORDER BY id`,
         [identity.userId],
       );
       for (const invitation of invitations) {
@@ -413,17 +413,25 @@ export class OperatorAuthRepository implements OperatorAuthStore {
         "DELETE FROM operator_discord_guild_permissions WHERE operator_id = $1",
         [operatorId],
       );
-      const recordedPermissions: Record<string, number> = {};
+      const recordedPermissions: Record<string, string> = {};
+      const ownedGuilds = new Set(identity.ownedGuildIds);
       for (
         const [guildId, rawPermissions] of Object.entries(identity.permissions)
       ) {
-        const permissions = Number(rawPermissions);
-        if (!guildId.trim() || !Number.isInteger(permissions)) continue;
-        recordedPermissions[guildId.trim()] = permissions;
+        const id = guildId.trim();
+        if (!id || !/^\d+$/u.test(String(rawPermissions).trim())) continue;
+        let permissions = BigInt(String(rawPermissions).trim());
+        if (ownedGuilds.has(id)) permissions |= 8n;
+        recordedPermissions[id] = permissions.toString();
         await connection.query(
-          `INSERT INTO operator_discord_guild_permissions(operator_id, guild_id, permissions)
-           VALUES ($1, $2, $3)`,
-          [operatorId, guildId.trim(), permissions],
+          `INSERT INTO operator_discord_guild_permissions(operator_id, guild_id, guild_name, permissions)
+           VALUES ($1, $2, $3, $4::bigint)`,
+          [
+            operatorId,
+            id,
+            identity.guildNames[id] ?? id,
+            permissions.toString(),
+          ],
         );
       }
       await this.audit(

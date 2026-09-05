@@ -1,7 +1,15 @@
+import { h } from "preact";
+import { render } from "npm:preact-render-to-string@6.7.0";
+import { DashboardHeader } from "../../components/DashboardHeader.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
-import { constantTimeEqual, type DashboardSession } from "../security/security.ts";
+import {
+  constantTimeEqual,
+  type DashboardSession,
+  isAllowedSameSiteOrigin,
+} from "../security/security.ts";
 import { roleAllows } from "../security/permissions.ts";
 import { WebAuthController } from "./web_auth.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 export type IntelligenceItem = Readonly<Record<string, unknown>>;
 
@@ -537,11 +545,14 @@ export class WebIntelligenceController {
     const rows = data.alerts.map((item) =>
       `<li>${escapeHtml(item.severity)}: ${escapeHtml(item.title)}</li>`
     ).join("");
-    return html(
-      `<!doctype html><html><body><main><h1>Intelligence workspace</h1>
+    return html(dashboardDocument(
+      `<div class="app-shell">${
+        render(h(DashboardHeader, { active: "/intelligence" }))
+      }<main class="page-content"><section class="data-heading"><div><p class="eyebrow">Intelligence</p><h1>Intelligence workspace</h1><p class="lede">Investigate alerts, cases, relationships, and reports.</p></div></section>
       <form method="get" action="/intelligence"><input name="alert_q"><select name="severity"><option value="">All severities</option></select><button>Filter alerts</button></form>
-      <ul>${rows}</ul><form method="post" action="/intelligence/reports/generate"><select name="report_type"><option value="daily_summary">Daily summary</option><option value="entity_profile">Entity profile</option></select><input name="user_id" type="number"><button>Generate report</button></form></main></body></html>`,
-    );
+      <ul>${rows}</ul><form method="post" action="/intelligence/reports/generate"><select name="report_type"><option value="daily_summary">Daily summary</option><option value="entity_profile">Entity profile</option></select><input name="user_id" type="number"><button>Generate report</button></form></main></div>`,
+      "Intelligence | QBot4K",
+    ));
   }
 
   async api(request: Request): Promise<Response> {
@@ -584,12 +595,13 @@ export class WebIntelligenceController {
           : new Response("Case not found", { status: 404 });
       }
       if (api) return Response.json(detail);
-      return html(
-        `<!doctype html><html><body><main><h1>${
-          escapeHtml(detail.case.title)
-        }</h1>
-        <form method="post" action="/intelligence/cases/${caseId}/action"><input name="action" value="add_note" type="hidden"><input name="body"><button>Add note</button></form></main></body></html>`,
-      );
+      return html(dashboardDocument(
+        `<div class="app-shell">${
+          render(h(DashboardHeader, { active: "/intelligence" }))
+        }<main class="page-content"><h1>${escapeHtml(detail.case.title)}</h1>
+        <form method="post" action="/intelligence/cases/${caseId}/action"><input name="action" value="add_note" type="hidden"><input name="body"><button>Add note</button></form></main></div>`,
+        "Intelligence case | QBot4K",
+      ));
     } catch (error) {
       return Response.json({ error: message(error) }, { status: 400 });
     }
@@ -754,9 +766,7 @@ export class WebIntelligenceController {
   }
 
   private validOrigin(request: Request): boolean {
-    const origin = request.headers.get("origin");
-    return origin === null ||
-      constantTimeEqual(origin, new URL(request.url).origin);
+    return isAllowedSameSiteOrigin(request);
   }
 }
 

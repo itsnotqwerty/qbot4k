@@ -1,6 +1,9 @@
 import { assertEquals } from "jsr:@std/assert@1.0.14";
 import { createApp } from "../main.ts";
-import { createOauthState, createSessionCookie } from "../src/security/security.ts";
+import {
+  createOauthState,
+  createSessionCookie,
+} from "../src/security/security.ts";
 import {
   determineOperatorRole,
   type DiscordIdentity,
@@ -22,6 +25,8 @@ const identity: DiscordIdentity = {
   username: "Operator",
   guildIds: ["guild-1"],
   permissions: { "guild-1": "8" },
+  guildNames: { "guild-1": "Alpha Guild" },
+  ownedGuildIds: [],
 };
 const memberships: readonly OperatorMembership[] = [
   { id: 7, name: "Alpha", slug: "alpha", role: "owner" },

@@ -293,7 +293,7 @@ export class AppSettings implements AppSettingsValues {
 
   static fromEnv(
     env?: Environment,
-    options: { envFile?: string } = {},
+    options: { envFile?: string; role?: ServiceRole } = {},
   ): AppSettings {
     const envMap: Record<string, string> = env
       ? { ...env }
@@ -314,11 +314,11 @@ export class AppSettings implements AppSettingsValues {
     const requested = parseCsv(
       envMap.QBOT_ENABLED_SERVICES || "web,jobs,analysis",
     );
-    const enabledServices =
+    const fleetServices =
       (requested.length
         ? requested
         : ["web", "jobs", "analysis"]) as ServiceRole[];
-    const unknown = enabledServices.filter((service) =>
+    const unknown = fleetServices.filter((service) =>
       !SERVICE_ROLES.includes(service)
     );
     if (unknown.length) {
@@ -329,14 +329,16 @@ export class AppSettings implements AppSettingsValues {
       );
     }
     if (
-      enabledServices.some((service) =>
+      fleetServices.some((service) =>
         service === "discord" || service === "twitch"
-      ) && !enabledServices.includes("analysis")
+      ) && !fleetServices.includes("analysis")
     ) {
       throw new ConfigError(
         "analysis service is required when a collection service is enabled",
       );
     }
+    const enabledServices =
+      (options.role ? [options.role] : fleetServices) as ServiceRole[];
     const logLevel = (envMap.QBOT_LOG_LEVEL || "INFO")
       .toLocaleUpperCase() as LogLevel;
     if (!["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"].includes(logLevel)) {
@@ -526,9 +528,13 @@ export class AppSettings implements AppSettingsValues {
       }
     }
     if (settings.enabledServices.includes("twitch")) {
-      if (!settings.twitchBotToken) {
+      // A static bot token is optional when a stored broadcaster credential
+      // from the OAuth flow is available to drive ingestion.
+      if (
+        !settings.twitchBotToken && !settings.credentialEncryptionKey
+      ) {
         throw new ConfigError(
-          "QBOT_TWITCH_BOT_TOKEN is required when twitch service is enabled",
+          "QBOT_TWITCH_BOT_TOKEN or a stored Twitch credential (QBOT_CREDENTIAL_ENCRYPTION_KEY with a linked channel) is required when twitch service is enabled",
         );
       }
       if (!settings.twitchJoinCommandChannel) {

@@ -140,7 +140,7 @@ export class PostgresAnalyticsRepository implements AnalyticsRefreshService {
              'Entity is a high-influence bridge (' || ROUND(influence_score::numeric,3) || ').',
              LEAST(0.95,influence_score),'graph-bridge:' || community_id || ':' || user_id,$2,$2
            FROM community_graph_metrics
-          WHERE community_id=$1 AND is_bridge AND influence_score>=0.45
+          WHERE community_id=$1 AND is_bridge=1 AND influence_score>=0.45
          ON CONFLICT(dedupe_key) DO UPDATE SET summary=excluded.summary,
            confidence=excluded.confidence,updated_at=excluded.updated_at`,
         [communityId, timestamp],
@@ -153,7 +153,7 @@ export class PostgresAnalyticsRepository implements AnalyticsRefreshService {
              resolved_at=$2,updated_at=$2
            WHERE community_id=$1 AND alert_type=$3
              AND status IN ('open','acknowledged','suppressed')
-             AND updated_at<$2::timestamptz`,
+             AND updated_at::timestamptz<$2::timestamptz`,
           [communityId, timestamp, alertType],
         );
       }
@@ -268,7 +268,7 @@ export class PostgresAnalyticsRepository implements AnalyticsRefreshService {
 
   async refreshLiveStreamCohorts(): Promise<number> {
     const sessions = await this.connection.query(
-      "SELECT id,community_id,started_at,COALESCE(ended_at,CURRENT_TIMESTAMP) AS ended_at FROM stream_sessions WHERE status='live' ORDER BY id",
+      "SELECT id,community_id,started_at,COALESCE(ended_at::timestamptz,CURRENT_TIMESTAMP) AS ended_at FROM stream_sessions WHERE status='live' ORDER BY id",
     );
     for (const session of sessions) {
       const sessionId = requirePositiveInteger(session.id, "streamSession.id");

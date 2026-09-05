@@ -2,10 +2,11 @@ import { h } from "preact";
 import { render } from "npm:preact-render-to-string@6.7.0";
 import { SettingsWorkspace } from "../../components/SettingsWorkspace.tsx";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
-import { constantTimeEqual } from "../security/security.ts";
+import { constantTimeEqual, isAllowedSameSiteOrigin } from "../security/security.ts";
 import type { DashboardSession } from "../security/security.ts";
 import { WebAuthController } from "./web_auth.ts";
 import { roleAllows } from "./web_dashboard.ts";
+import { dashboardDocument } from "./web_document.ts";
 
 export interface SettingsSnapshot {
   readonly community: DatabaseRow;
@@ -400,7 +401,7 @@ export class WebSettingsController {
     try {
       const snapshot = await this.settings.snapshot(session.communityId!);
       return new Response(
-        `<!doctype html>${
+        dashboardDocument(
           render(h(SettingsWorkspace, {
             ...snapshot,
             canManageOperators: roleAllows(session.role, "operators.manage"),
@@ -409,8 +410,9 @@ export class WebSettingsController {
               "integrations.manage",
             ),
             status: new URL(request.url).searchParams.get("status") ?? "",
-          }))
-        }`,
+          })),
+          "Settings | QBot4K",
+        ),
         { headers: { "content-type": "text/html; charset=utf-8" } },
       );
     } catch (error) {
@@ -529,7 +531,7 @@ export class WebSettingsController {
     return session;
   }
   private validOrigin(request: Request) {
-    return request.headers.get("origin") === new URL(request.url).origin;
+    return isAllowedSameSiteOrigin(request);
   }
   private redirect(location: string) {
     return new Response(null, { status: 302, headers: { location } });
