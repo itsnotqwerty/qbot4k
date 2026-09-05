@@ -448,7 +448,7 @@ export class WebRoleService implements RoleService {
       this.database.observationCollector(),
       this.settings,
     );
-    const handler = createApp(
+    const freshApp = createApp(
       this.monitor,
       auth,
       this.settings,
@@ -462,7 +462,10 @@ export class WebRoleService implements RoleService {
       liveOps,
       machineIngestion,
       intelligence,
-    ).handler();
+    );
+    const { attachProdBuildCache } = await import("./main.ts");
+    await attachProdBuildCache(freshApp);
+    const handler = freshApp.handler();
     const shadowHandler = this.settings.shadowReadUpstreamUrl
       ? createShadowReadHandler(
         handler,
