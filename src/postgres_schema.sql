@@ -92,11 +92,21 @@ CREATE TABLE IF NOT EXISTS metrics_rollups (
 CREATE TABLE IF NOT EXISTS service_reliability_buckets (
     service_name TEXT NOT NULL,
     bucket_start TEXT NOT NULL,
+    observer TEXT NOT NULL DEFAULT '',
     is_up INTEGER NOT NULL,
     status TEXT NOT NULL,
     recorded_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP::text),
-    PRIMARY KEY(service_name, bucket_start)
+    PRIMARY KEY(service_name, bucket_start, observer)
 );
+
+-- Migrate pre-observer tables: widen the primary key so multiple roles can
+-- record their view of the same service/minute bucket.
+ALTER TABLE service_reliability_buckets
+    ADD COLUMN IF NOT EXISTS observer TEXT NOT NULL DEFAULT '';
+ALTER TABLE service_reliability_buckets
+    DROP CONSTRAINT IF EXISTS service_reliability_buckets_pkey;
+ALTER TABLE service_reliability_buckets
+    ADD PRIMARY KEY(service_name, bucket_start, observer);
 
 CREATE TABLE IF NOT EXISTS role_heartbeats (
     role TEXT PRIMARY KEY,

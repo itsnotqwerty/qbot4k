@@ -58,7 +58,9 @@ const initialReviews: Review[] = [
 ];
 
 function ModerationDemo() {
-  const resolved = useSignal<{ id: number; resolution: string; action: string }[]>(
+  const resolved = useSignal<
+    { id: number; resolution: string; action: string }[]
+  >(
     [],
   );
   const resolution = useSignal("confirmed");
@@ -121,7 +123,11 @@ function ModerationDemo() {
             if (!review) return;
             resolved.value = [
               ...resolved.value,
-              { id: review.id, resolution: resolution.value, action: action.value },
+              {
+                id: review.id,
+                resolution: resolution.value,
+                action: action.value,
+              },
             ];
             active.value = null;
           }}
@@ -317,7 +323,9 @@ function LiveOpsDemo() {
             <tr>
               <td class="demo-user">twitch / qbot4k_live</td>
               <td>Community night — raids welcome</td>
-              <td><Chip tone="ok">live</Chip></td>
+              <td>
+                <Chip tone="ok">live</Chip>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -368,7 +376,8 @@ function LiveOpsDemo() {
               Raid surge — 41 joins in 10 minutes, 27 matching redirect links
             </p>
             <p class="demo-evidence">
-              Escalation destination: #mod-alerts webhook · minimum severity high
+              Escalation destination: #mod-alerts webhook · minimum severity
+              high
             </p>
             <button type="button" onClick={() => incidentOpen.value = false}>
               Resolve incident
@@ -407,7 +416,8 @@ function CommandsDemo() {
     },
     {
       name: "socials",
-      template: "VODs → https://youtube.example · Clips → https://clips.example",
+      template:
+        "VODs → https://youtube.example · Clips → https://clips.example",
       enabled: false,
     },
   ]);

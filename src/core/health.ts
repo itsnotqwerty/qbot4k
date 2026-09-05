@@ -31,6 +31,62 @@ export interface RoleHeartbeatStore {
   >;
 }
 
+export interface ReliabilityBucket {
+  readonly bucketStart: string;
+  readonly isUp: boolean;
+  readonly status: string;
+  readonly observer: string;
+}
+
+export interface ReliabilityStore {
+  recordBucket(
+    service: string,
+    bucketStart: string,
+    observer: string,
+    isUp: boolean,
+    status: string,
+  ): Promise<void>;
+  buckets(
+    service: string,
+    sinceIso: string,
+  ): Promise<readonly ReliabilityBucket[]>;
+}
+
+export interface StatusStore extends RoleHeartbeatStore, ReliabilityStore {}
+
+/**
+ * Snapshot the monitor into durable per-minute reliability buckets. Each role
+ * writes one bucket per service per minute, keyed by (service, bucket_start,
+ * observer): itself from its live status, peers from heartbeat freshness, so a
+ * dead role is still recorded as down by surviving roles. Minutes with no
+ * surviving observer surface as gaps on the status page and count against
+ * availability.
+ */
+export async function recordReliabilityBuckets(
+  monitor: RoleHealthMonitor,
+  store: ReliabilityStore,
+  now = new Date(),
+): Promise<void> {
+  const snapshot = await monitor.snapshot(now);
+  const minuteMs = 60_000;
+  const bucketStart = new Date(
+    Math.floor(now.valueOf() / minuteMs) * minuteMs,
+  ).toISOString();
+  await Promise.all(
+    Object.entries(snapshot.services).map(([service, status]) => {
+      const up = status !== "disabled" &&
+        (status === "ready" || status === "degraded");
+      return store.recordBucket(
+        service,
+        bucketStart,
+        monitor.role,
+        up,
+        status === "disabled" ? "unknown" : status,
+      );
+    }),
+  );
+}
+
 const HEARTBEAT_STALE_SECONDS = 120;
 
 export class RoleHealthMonitor {

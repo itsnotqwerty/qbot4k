@@ -88,84 +88,149 @@ export function legalPage(
   );
 }
 
-interface ServiceStatus {
+interface StatusServiceMeta {
+  readonly role: string;
   readonly name: string;
   readonly description: string;
-  readonly seed: number;
-  readonly incidents: readonly { day: number; minutes: number; note: string }[];
 }
 
 const STATUS_WINDOW_DAYS = 90;
 
-const services: readonly ServiceStatus[] = [
+const statusServices: readonly StatusServiceMeta[] = [
   {
+    role: "web",
     name: "Web dashboard",
     description: "Operator workspaces and session authentication",
-    seed: 11,
-    incidents: [{ day: 63, minutes: 14, note: "Deploy rollback caused brief 5xx spike" }],
   },
   {
+    role: "discord",
     name: "Discord ingestion",
     description: "Gateway events, commands, and provider confirmations",
-    seed: 23,
-    incidents: [
-      { day: 41, minutes: 32, note: "Upstream Discord gateway outage" },
-      { day: 12, minutes: 6, note: "Shard reconnect storm after maintenance" },
-    ],
   },
   {
+    role: "twitch",
     name: "Twitch live ops",
     description: "EventSub ingestion and stream-state automation",
-    seed: 37,
-    incidents: [{ day: 55, minutes: 21, note: "EventSub subscription renewals delayed" }],
   },
   {
-    name: "Moderation engine",
-    description: "Review queue, sanctions, and evidence capture",
-    seed: 51,
-    incidents: [],
+    role: "analysis",
+    name: "Moderation analysis",
+    description: "Signals, content analysis, and intelligence alerts",
   },
   {
-    name: "Data layer",
-    description: "Tenant storage, audit log, and backups",
-    seed: 77,
-    incidents: [{ day: 78, minutes: 9, note: "Backup verification window extended" }],
+    role: "jobs",
+    name: "Background jobs",
+    description: "Maintenance, retention, backups, and dispatch workers",
   },
 ];
 
-/** Deterministic PRNG so daily indicators are stable between renders. */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a |= 0;
-    a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+interface DaySummary {
+  date: string;
+  observed: number;
+  up: number;
+  degraded: number;
 }
 
-function uptimeStrip(service: ServiceStatus): { html: string; uptime: number } {
-  const rand = mulberry32(service.seed);
-  const incidentDays = new Map(service.incidents.map((i) => [i.day, i]));
-  let down = 0;
-  let cells = "";
-  for (let day = STATUS_WINDOW_DAYS; day >= 1; day--) {
-    const incident = incidentDays.get(day);
-    // Small chance of a transient degraded day not recorded as an incident.
-    const degraded = !incident && rand() < 0.015;
-    const cls = incident ? "down" : degraded ? "degraded" : "up";
-    if (incident) down += incident.minutes;
-    if (degraded) down += 3;
-    const label = incident
-      ? `${day}d ago: ${incident.minutes}m downtime`
-      : degraded
-      ? `${day}d ago: minor degradation`
-      : `${day}d ago: operational`;
-    cells += `<span class="strip-cell ${cls}" title="${label}" aria-label="${label}"></span>`;
+/** Collapse per-minute buckets (possibly from multiple observers) into days. */
+function summarizeDays(
+  buckets: readonly import("../core/health.ts").ReliabilityBucket[],
+  now: Date,
+): DaySummary[] {
+  const byMinute = new Map<
+    string,
+    { up: number; total: number; degraded: number }
+  >();
+  for (const b of buckets) {
+    const key = b.bucketStart.slice(0, 16);
+    const entry = byMinute.get(key) ?? { up: 0, total: 0, degraded: 0 };
+    entry.total += 1;
+    if (b.isUp) entry.up += 1;
+    if (b.status === "degraded") entry.degraded += 1;
+    byMinute.set(key, entry);
   }
-  const uptime = (1 - down / (STATUS_WINDOW_DAYS * 24 * 60)) * 100;
-  return { html: cells, uptime };
+  const byDay = new Map<string, DaySummary & { minutes: number }>();
+  for (const [minute, entry] of byMinute) {
+    const day = minute.slice(0, 10);
+    const d = byDay.get(day) ?? {
+      date: day,
+      observed: 0,
+      up: 0,
+      degraded: 0,
+      minutes: 0,
+    };
+    d.minutes += 1;
+    d.observed += entry.total;
+    d.up += entry.up;
+    d.degraded += entry.degraded;
+    byDay.set(day, d);
+  }
+  const days: DaySummary[] = [];
+  for (let i = STATUS_WINDOW_DAYS - 1; i >= 0; i--) {
+    const date = new Date(now.valueOf() - i * 86_400_000)
+      .toISOString().slice(0, 10);
+    days.push(
+      byDay.get(date) ?? { date, observed: 0, up: 0, degraded: 0 },
+    );
+  }
+  return days;
+}
+
+interface DowntimeEvent {
+  readonly service: string;
+  readonly start: Date;
+  readonly minutes: number;
+  readonly status: string;
+  readonly ongoing: boolean;
+}
+
+/** Group consecutive down minutes (any observer reported down) into events. */
+function downtimeEvents(
+  service: string,
+  buckets: readonly import("../core/health.ts").ReliabilityBucket[],
+  now: Date,
+): DowntimeEvent[] {
+  const downMinutes = new Map<number, string>();
+  for (const b of buckets) {
+    if (b.isUp) continue;
+    const t = new Date(b.bucketStart).valueOf();
+    // Keep the most severe-looking status for the note.
+    if (b.status === "down" || !downMinutes.has(t)) {
+      downMinutes.set(t, b.status);
+    }
+  }
+  const times = [...downMinutes.keys()].sort((a, b) => a - b);
+  const events: DowntimeEvent[] = [];
+  let start = -1;
+  let prev = -1;
+  let worst = "down";
+  for (const t of times) {
+    if (start < 0 || t - prev > 60_000) {
+      if (start >= 0) {
+        events.push({
+          service,
+          start: new Date(start),
+          minutes: Math.round((prev - start) / 60_000) + 1,
+          status: worst,
+          ongoing: false,
+        });
+      }
+      start = t;
+      worst = downMinutes.get(t) ?? "down";
+    } else if (downMinutes.get(t) === "down") {
+      worst = "down";
+    }
+    prev = t;
+  }
+  if (start >= 0) {
+    events.push({
+      service,
+      start: new Date(start),
+      minutes: Math.round((prev - start) / 60_000) + 1,
+      status: worst,
+      ongoing: now.valueOf() - prev < 5 * 60_000,
+    });
+  }
+  return events;
 }
 
 /** Convert an uptime percentage into an approximate sigma reliability level. */
@@ -179,42 +244,114 @@ function sigmaLevel(uptime: number): { label: string; cls: string } {
   return { label: "<3σ", cls: "sigma-low" };
 }
 
-export function statusPage(): Response {
-  const generated = new Date().toISOString().slice(0, 10);
-  const rows = services.map((service) => {
-    const { html, uptime } = uptimeStrip(service);
-    const sigma = sigmaLevel(uptime);
-    const state = service.incidents.some((i) => i.day <= 1) ? "Degraded" : "Operational";
-    const stateCls = state === "Operational" ? "chip chip-ok" : "chip chip-warn";
+const dayLabel = (date: string, d: DaySummary): string => {
+  if (d.observed === 0) return `${date}: no data`;
+  const pct = ((d.up / d.observed) * 100).toFixed(1);
+  return `${date}: ${pct}% available (${d.observed} observations)`;
+};
+
+export async function statusPage(
+  store?: import("../core/health.ts").StatusStore,
+): Promise<Response> {
+  const now = new Date();
+  const generated = now.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  const since = new Date(now.valueOf() - STATUS_WINDOW_DAYS * 86_400_000)
+    .toISOString();
+  const current: Record<string, { status: string; updatedAt: string }> = store
+    ? await store.roleHeartbeats().catch(() => ({}))
+    : {};
+
+  const allEvents: DowntimeEvent[] = [];
+  const rows = (await Promise.all(statusServices.map(async (meta) => {
+    const buckets = store
+      ? await store.buckets(meta.role, since).catch(() => [])
+      : [];
+    const days = summarizeDays(buckets, now);
+    let observed = 0;
+    let up = 0;
+    const cells = days.map((d) => {
+      observed += d.observed;
+      up += d.up;
+      const cls = d.observed === 0
+        ? "nodata"
+        : d.up === 0
+        ? "down"
+        : d.up < d.observed
+        ? "degraded"
+        : d.degraded > 0
+        ? "degraded"
+        : "up";
+      const label = dayLabel(d.date, d);
+      return `<span class="strip-cell ${cls}" title="${label}" aria-label="${label}"></span>`;
+    }).join("");
+    const uptime = observed > 0 ? (up / observed) * 100 : null;
+    const sigma = uptime === null
+      ? { label: "no data", cls: "sigma-low" }
+      : sigmaLevel(uptime);
+    allEvents.push(...downtimeEvents(meta.name, buckets, now));
+
+    const heartbeat = current[meta.role];
+    const ageSeconds = heartbeat
+      ? (now.valueOf() - new Date(heartbeat.updatedAt).valueOf()) / 1000
+      : Infinity;
+    const live = heartbeat && ageSeconds <= 120;
+    const liveStatus = live ? heartbeat.status : heartbeat ? "down" : "unknown";
+    const liveCls = liveStatus === "ready"
+      ? "chip chip-ok"
+      : liveStatus === "degraded" || liveStatus === "unknown"
+      ? "chip chip-warn"
+      : "chip chip-danger";
+
     return `<article class="status-service">
 <header class="status-service-head">
-<div><h2>${service.name}</h2><p>${service.description}</p></div>
-<span class="${stateCls}">${state}</span>
+<div><h2>${meta.name}</h2><p>${meta.description}</p></div>
+<span class="${liveCls}">${liveStatus}</span>
 </header>
-<div class="uptime-strip" role="img" aria-label="${STATUS_WINDOW_DAYS}-day availability for ${service.name}">${html}</div>
+<div class="uptime-strip" role="img" aria-label="${STATUS_WINDOW_DAYS}-day availability for ${meta.name}">${cells}</div>
 <footer class="status-service-foot">
-<span class="num">${uptime.toFixed(3)}% uptime · ${STATUS_WINDOW_DAYS} days</span>
-<span class="sigma-badge ${sigma.cls}" title="Reliability level derived from ${STATUS_WINDOW_DAYS}-day availability">${sigma.label} reliability</span>
+<span class="num">${
+      uptime === null
+        ? `no observations yet · ${STATUS_WINDOW_DAYS} days`
+        : `${
+          uptime.toFixed(3)
+        }% uptime · ${observed.toLocaleString()} observations · ${STATUS_WINDOW_DAYS} days`
+    }</span>
+<span class="sigma-badge ${sigma.cls}" title="Reliability level derived from recorded availability over the rolling window">${sigma.label} reliability</span>
 </footer>
 </article>`;
+  }))).join("\n");
+
+  allEvents.sort((a, b) => b.start.valueOf() - a.start.valueOf());
+  const events = allEvents.slice(0, 25).map((e) => {
+    const ago = Math.max(
+      1,
+      Math.round((now.valueOf() - e.start.valueOf()) / 60_000),
+    );
+    const when = ago >= 1440
+      ? `${Math.round(ago / 1440)}d ago`
+      : ago >= 60
+      ? `${Math.round(ago / 60)}h ago`
+      : `${ago}m ago`;
+    return `<li class="downtime-event">
+<div class="downtime-when"><span class="num">${e.minutes}m</span><span>${when}</span></div>
+<div><strong>${e.service}</strong><p>Recorded status: ${e.status} · started ${
+      e.start.toISOString().replace("T", " ").slice(0, 16)
+    } UTC</p></div>
+<span class="chip ${e.ongoing ? "chip-danger" : "chip-ok"}">${
+      e.ongoing ? "Ongoing" : "Resolved"
+    }</span>
+</li>`;
   }).join("\n");
 
-  const events = services
-    .flatMap((s) => s.incidents.map((i) => ({ service: s.name, ...i })))
-    .sort((a, b) => a.day - b.day)
-    .map((e) =>
-      `<li class="downtime-event">
-<div class="downtime-when"><span class="num">${e.minutes}m</span><span>${e.day} days ago</span></div>
-<div><strong>${e.service}</strong><p>${e.note}</p></div>
-<span class="chip chip-ok">Resolved</span>
-</li>`
-    ).join("\n");
+  const eventsHtml = allEvents.length === 0
+    ? `<p class="status-note">No downtime recorded in the window. Events appear here when an observer records a service as down or stale.</p>`
+    : `<ul class="downtime-list">${events}</ul>`;
 
   return new Response(
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Status | QBot4K</title><link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status" aria-current="page">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><div class="data-heading"><div><p class="eyebrow">Service status</p><h1>Status</h1><p class="lede">Rolling ${STATUS_WINDOW_DAYS}-day availability across core services. Generated ${generated}. Live probes: <a class="text-link" href="/health/ready">/health/ready</a></p></div></div>
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Status | QBot4K</title><link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status" aria-current="page">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><div class="data-heading"><div><p class="eyebrow">Service status</p><h1>Status</h1><p class="lede">Recorded per-minute availability from every running service role, rolled up over ${STATUS_WINDOW_DAYS} days. Generated ${generated}. Live probes: <a class="text-link" href="/health/ready">/health/ready</a></p></div></div>
 <section class="status-grid" aria-label="Services">${rows}</section>
-<section aria-labelledby="downtime-title"><h2 id="downtime-title">Downtime events</h2><ul class="downtime-list">${events}</ul></section>
-<p class="status-note">Sigma reliability levels: 3σ ≈ 93.32%, 4σ ≈ 99.38%, 5σ ≈ 99.977%, 6σ ≈ 99.9997% availability over the rolling window.</p>
+<section aria-labelledby="downtime-title"><h2 id="downtime-title">Downtime events</h2>${eventsHtml}</section>
+<p class="status-note">Each minute, every service role records its own status and its view of peers (via heartbeats) into service_reliability_buckets. A minute with no observation at all means no role was alive to record it and counts as unavailable. Sigma reliability levels: 3σ ≈ 93.32%, 4σ ≈ 99.38%, 5σ ≈ 99.977%, 6σ ≈ 99.9997% availability over the rolling window.</p>
 </main><footer><span>QBot4K</span><a href="/">Home</a></footer></div></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
   );

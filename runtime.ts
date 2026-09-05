@@ -81,6 +81,7 @@ export interface RoleRuntimeOptions {
   readonly once?: boolean;
   readonly writeSnapshot?: (snapshot: unknown) => void;
   readonly onReady?: () => void;
+  readonly reliabilityStore?: import("./src/core/health.ts").ReliabilityStore;
 }
 
 export async function runRole(
@@ -96,6 +97,7 @@ export async function runRole(
   }
   lifecycle.install();
   let heartbeat: ReturnType<typeof setInterval> | null = null;
+  let reliability: ReturnType<typeof setInterval> | null = null;
   try {
     await service.start(lifecycle.abortController.signal);
     monitor.setStatus("ready");
@@ -103,6 +105,18 @@ export async function runRole(
     heartbeat = setInterval(() => {
       void monitor.recordHeartbeat();
     }, 15_000);
+    const reliabilityStore = options.reliabilityStore;
+    if (reliabilityStore) {
+      const { recordReliabilityBuckets } = await import(
+        "./src/core/health.ts"
+      );
+      const record = () =>
+        recordReliabilityBuckets(monitor, reliabilityStore).catch(() => {
+          // Reliability recording is best-effort and must not fail the role.
+        });
+      await record();
+      reliability = setInterval(record, 60_000);
+    }
     options.onReady?.();
     if (options.once) {
       options.writeSnapshot?.(await monitor.snapshot());
@@ -111,10 +125,19 @@ export async function runRole(
     await lifecycle.wait();
   } finally {
     if (heartbeat) clearInterval(heartbeat);
+    if (reliability) clearInterval(reliability);
     monitor.setStatus("stopping");
     await service.stop();
     monitor.setStatus("down");
     await monitor.recordHeartbeat();
+    if (options.reliabilityStore) {
+      const { recordReliabilityBuckets } = await import(
+        "./src/core/health.ts"
+      );
+      await recordReliabilityBuckets(monitor, options.reliabilityStore).catch(
+        () => {},
+      );
+    }
     lifecycle.dispose();
   }
 }
@@ -462,6 +485,7 @@ export class WebRoleService implements RoleService {
       liveOps,
       machineIngestion,
       intelligence,
+      this.database,
     );
     const { attachProdBuildCache } = await import("./main.ts");
     await attachProdBuildCache(freshApp);
@@ -719,6 +743,7 @@ export async function main(args = Deno.args): Promise<void> {
       once: parsed.once,
       writeSnapshot: (snapshot) => console.log(JSON.stringify(snapshot)),
       onReady: () => logger.info("role ready", { role: parsed.role }),
+      reliabilityStore: database,
     });
   } finally {
     await database.close();

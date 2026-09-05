@@ -1,5 +1,6 @@
 import postgres from "postgres";
 import { TenantContext } from "../core/contexts.ts";
+import type { ReliabilityBucket } from "../core/health.ts";
 import { FernetCipher } from "../security/fernet.ts";
 import { OperatorAuthRepository, ScopedRepository } from "./repository.ts";
 import type { OperatorAuthStore } from "../web/web_auth.ts";
@@ -323,6 +324,46 @@ export class PostgresDatabase {
         ]),
       ),
     );
+  }
+
+  async recordBucket(
+    service: string,
+    bucketStart: string,
+    observer: string,
+    isUp: boolean,
+    status: string,
+  ): Promise<void> {
+    await this.withConnection((connection) =>
+      connection.query(
+        `INSERT INTO service_reliability_buckets(
+           service_name, bucket_start, observer, is_up, status)
+         VALUES ($1,$2,$3,$4,$5)
+         ON CONFLICT(service_name, bucket_start, observer) DO UPDATE SET
+           is_up=EXCLUDED.is_up, status=EXCLUDED.status`,
+        [service, bucketStart, observer, isUp ? 1 : 0, status],
+      ).then(() => undefined)
+    );
+  }
+
+  async buckets(
+    service: string,
+    sinceIso: string,
+  ): Promise<readonly ReliabilityBucket[]> {
+    const rows = await this.withConnection((connection) =>
+      connection.query(
+        `SELECT bucket_start, observer, is_up, status
+           FROM service_reliability_buckets
+          WHERE service_name=$1 AND bucket_start::timestamptz >= $2::timestamptz
+          ORDER BY bucket_start`,
+        [service, sinceIso],
+      )
+    );
+    return rows.map((row) => ({
+      bucketStart: String(row.bucket_start),
+      observer: String(row.observer),
+      isUp: Number(row.is_up) === 1,
+      status: String(row.status),
+    }));
   }
 
   async health(): Promise<DatabaseHealth> {
