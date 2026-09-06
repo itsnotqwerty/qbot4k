@@ -34,7 +34,9 @@ const embedMeta = (
     `<meta name="twitter:title" content="${pageTitle}">` +
     `<meta name="twitter:description" content="${description}">` +
     `<meta name="twitter:image" content="${image}">` +
-    `<link rel="icon" href="/og-card.svg" type="image/svg+xml">`;
+    `<link rel="icon" href="/favicon.svg" type="image/svg+xml">` +
+    `<link rel="alternate icon" href="/favicon.ico" sizes="16x16 32x32">` +
+    `<link rel="apple-touch-icon" href="/apple-touch-icon.png">`;
 };
 
 export function legalPage(

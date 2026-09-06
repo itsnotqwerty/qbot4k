@@ -28,7 +28,9 @@ export default function App({ Component, url }: PageProps) {
         <meta name="twitter:title" content="QBot4K" />
         <meta name="twitter:description" content={DESCRIPTION} />
         <meta name="twitter:image" content={`${canonical}/og-card.png`} />
-        <link rel="icon" href="/og-card.svg" type="image/svg+xml" />
+        <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+        <link rel="alternate icon" href="/favicon.ico" sizes="16x16 32x32" />
+        <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
         <link rel="stylesheet" href="/styles.css" />
       </head>
       <body>
