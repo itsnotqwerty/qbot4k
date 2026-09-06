@@ -285,12 +285,15 @@ export async function statusPage(
       return `<span class="strip-cell ${cls}" title="${label}" aria-label="${label}"></span>`;
     }).join("");
     const uptime = observed > 0 ? (up / observed) * 100 : null;
+    const heartbeat = current[meta.role];
+    const staleSchema = uptime === null && heartbeat !== undefined;
     const sigma = uptime === null
-      ? { label: "no data", cls: "sigma-low" }
+      ? staleSchema
+        ? { label: "not recording", cls: "sigma-low" }
+        : { label: "no data", cls: "sigma-low" }
       : sigmaLevel(uptime);
     allEvents.push(...downtimeEvents(meta.name, buckets, now));
 
-    const heartbeat = current[meta.role];
     const ageSeconds = heartbeat
       ? (now.valueOf() - new Date(heartbeat.updatedAt).valueOf()) / 1000
       : Infinity;
@@ -311,7 +314,9 @@ export async function statusPage(
 <footer class="status-service-foot">
 <span class="num">${
       uptime === null
-        ? `no observations yet · ${STATUS_WINDOW_DAYS} days`
+        ? staleSchema
+          ? `service is live but not recording — run deno task migrate on the deployment`
+          : `no observations yet · ${STATUS_WINDOW_DAYS} days`
         : `${
           uptime.toFixed(3)
         }% uptime · ${observed.toLocaleString()} observations · ${STATUS_WINDOW_DAYS} days`

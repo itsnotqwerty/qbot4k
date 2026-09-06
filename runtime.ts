@@ -82,6 +82,7 @@ export interface RoleRuntimeOptions {
   readonly writeSnapshot?: (snapshot: unknown) => void;
   readonly onReady?: () => void;
   readonly reliabilityStore?: import("./src/core/health.ts").ReliabilityStore;
+  readonly logger?: StructuredLogger;
 }
 
 export async function runRole(
@@ -110,9 +111,18 @@ export async function runRole(
       const { recordReliabilityBuckets } = await import(
         "./src/core/health.ts"
       );
+      let reliabilityFailures = 0;
       const record = () =>
-        recordReliabilityBuckets(monitor, reliabilityStore).catch(() => {
-          // Reliability recording is best-effort and must not fail the role.
+        recordReliabilityBuckets(monitor, reliabilityStore).catch((error) => {
+          // Best-effort, but log the first few failures so a stale schema
+          // (e.g. missing observer column) is diagnosable instead of silent.
+          reliabilityFailures += 1;
+          if (reliabilityFailures <= 3) {
+            (options.logger ?? console).error(
+              "reliability bucket recording failed",
+              error,
+            );
+          }
         });
       await record();
       reliability = setInterval(record, 60_000);
@@ -744,6 +754,7 @@ export async function main(args = Deno.args): Promise<void> {
       writeSnapshot: (snapshot) => console.log(JSON.stringify(snapshot)),
       onReady: () => logger.info("role ready", { role: parsed.role }),
       reliabilityStore: database,
+      logger,
     });
   } finally {
     await database.close();
