@@ -12,9 +12,35 @@ const escapeHtml = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 
+const SITE_DESCRIPTION =
+  "The first real community intelligence platform for streamers — moderation command, explainable signals, and live ops across Discord and Twitch, with evidence before action.";
+
+const embedMeta = (
+  pageTitle: string,
+  description: string,
+  origin: string,
+): string => {
+  const image = `${origin}/og-card.png`;
+  return `<meta name="description" content="${description}">` +
+    `<meta property="og:type" content="website">` +
+    `<meta property="og:site_name" content="QBot4K">` +
+    `<meta property="og:title" content="${pageTitle}">` +
+    `<meta property="og:description" content="${description}">` +
+    `<meta property="og:url" content="${origin}">` +
+    `<meta property="og:image" content="${image}">` +
+    `<meta property="og:image:width" content="1200">` +
+    `<meta property="og:image:height" content="630">` +
+    `<meta name="twitter:card" content="summary_large_image">` +
+    `<meta name="twitter:title" content="${pageTitle}">` +
+    `<meta name="twitter:description" content="${description}">` +
+    `<meta name="twitter:image" content="${image}">` +
+    `<link rel="icon" href="/og-card.svg" type="image/svg+xml">`;
+};
+
 export function legalPage(
   kind: "privacy" | "terms",
   settings?: LegalSettings,
+  origin = "",
 ): Response {
   const organization = escapeHtml(
     settings?.legalOrganizationName || "QBot4K",
@@ -83,7 +109,9 @@ export function legalPage(
 <h2>12. General</h2>
 <p>If any provision is unenforceable, the remainder stays in effect. Failure to enforce a provision is not a waiver. You may not assign these Terms without our consent; we may assign them in connection with a reorganization or sale of the service. These Terms, together with the privacy policy, are the entire agreement. Questions: ${contact}.</p>`;
   return new Response(
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title} | QBot4K</title><link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><article class="legal-page"><p class="eyebrow">Legal</p><h1>${title}</h1><p class="lede">Effective ${effectiveDate}</p>${content}</article></main><footer><span>${organization}</span><a href="/">Home</a></footer></div></body></html>`,
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${title} | QBot4K</title>${
+      embedMeta(`${title} | QBot4K`, SITE_DESCRIPTION, origin)
+    }<link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><article class="legal-page"><p class="eyebrow">Legal</p><h1>${title}</h1><p class="lede">Effective ${effectiveDate}</p>${content}</article></main><footer><span>${organization}</span><a href="/">Home</a></footer></div></body></html>`,
     { headers: { "content-type": "text/html; charset=utf-8" } },
   );
 }
@@ -252,6 +280,7 @@ const dayLabel = (date: string, d: DaySummary): string => {
 
 export async function statusPage(
   store?: import("../core/health.ts").StatusStore,
+  origin = "",
 ): Promise<Response> {
   const now = new Date();
   const generated = now.toISOString().replace("T", " ").slice(0, 16) + " UTC";
@@ -353,7 +382,13 @@ export async function statusPage(
     : `<ul class="downtime-list">${events}</ul>`;
 
   return new Response(
-    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Status | QBot4K</title><link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status" aria-current="page">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><div class="data-heading"><div><p class="eyebrow">Service status</p><h1>Status</h1><p class="lede">Recorded per-minute availability from every running service role, rolled up over ${STATUS_WINDOW_DAYS} days. Generated ${generated}. Live probes: <a class="text-link" href="/health/ready">/health/ready</a></p></div></div>
+    `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Status | QBot4K</title>${
+      embedMeta(
+        "Status | QBot4K",
+        "Recorded per-minute availability and downtime events for every QBot4K service role.",
+        origin,
+      )
+    }<link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status" aria-current="page">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><div class="data-heading"><div><p class="eyebrow">Service status</p><h1>Status</h1><p class="lede">Recorded per-minute availability from every running service role, rolled up over ${STATUS_WINDOW_DAYS} days. Generated ${generated}. Live probes: <a class="text-link" href="/health/ready">/health/ready</a></p></div></div>
 <section class="status-grid" aria-label="Services">${rows}</section>
 <section aria-labelledby="downtime-title"><h2 id="downtime-title">Downtime events</h2>${eventsHtml}</section>
 <p class="status-note">Each minute, every service role records its own status and its view of peers (via heartbeats) into service_reliability_buckets. A minute with no observation at all means no role was alive to record it and counts as unavailable. Sigma reliability levels: 3σ ≈ 93.32%, 4σ ≈ 99.38%, 5σ ≈ 99.977%, 6σ ≈ 99.9997% availability over the rolling window.</p>

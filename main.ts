@@ -78,6 +78,32 @@ export async function attachProdBuildCache(app: App<unknown>): Promise<void> {
       immutable: true,
     });
   }
+  // Files in static/ are served verbatim (skipping styles.css, which has its
+  // own no-cache route).
+  const staticContentTypes: Record<string, string> = {
+    ".png": "image/png",
+    ".svg": "image/svg+xml",
+    ".ico": "image/x-icon",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".txt": "text/plain; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
+  };
+  try {
+    for await (const entry of Deno.readDir("static")) {
+      if (!entry.isFile || entry.name === "styles.css") continue;
+      const dot = entry.name.lastIndexOf(".");
+      const ext = dot >= 0 ? entry.name.slice(dot) : "";
+      staticFiles.set(`/${entry.name}`, {
+        filePath: `../static/${entry.name}`,
+        contentType: staticContentTypes[ext] ?? "application/octet-stream",
+        hash: null,
+        immutable: false,
+      });
+    }
+  } catch {
+    // No static directory — nothing to serve.
+  }
   const snapshot = {
     version: "prod",
     islands,
@@ -131,9 +157,20 @@ export function createApp(
     .get("/health", health)
     .get("/health/live", health)
     .get("/health/ready", health)
-    .get("/status", () => statusPage(statusStore))
-    .get("/privacy", () => legalPage("privacy", legalSettings))
-    .get("/terms", () => legalPage("terms", legalSettings));
+    .get(
+      "/status",
+      (context) => statusPage(statusStore, new URL(context.req.url).origin),
+    )
+    .get(
+      "/privacy",
+      (context) =>
+        legalPage("privacy", legalSettings, new URL(context.req.url).origin),
+    )
+    .get(
+      "/terms",
+      (context) =>
+        legalPage("terms", legalSettings, new URL(context.req.url).origin),
+    );
   if (auth) {
     app
       .get("/login", (context) => auth.login(context.req))
