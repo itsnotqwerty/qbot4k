@@ -6,6 +6,12 @@ content and temporal behavior, builds entity relationships, generates
 explainable alerts, and gives operators searchable investigations and case
 workflows.
 
+## Open Beta
+
+There is a free and open beta of QBot4K hosted at [qbot4k.dev](https://qbot4k.dev).
+The service will only be free as long as the beta is ongoing. As the service becomes
+more mature, a price will be set on monthly usage.
+
 ## Current scope
 
 - Live Discord messages, edits, deletes, membership, role, reaction, and
