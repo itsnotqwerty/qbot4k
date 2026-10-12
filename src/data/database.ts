@@ -1,6 +1,6 @@
 import postgres from "postgres";
 import { TenantContext } from "../core/contexts.ts";
-import type { ReliabilityBucket } from "../core/health.ts";
+import type { ReliabilityBucket, ReliabilitySummary } from "../core/health.ts";
 import { FernetCipher } from "../security/fernet.ts";
 import { OperatorAuthRepository, ScopedRepository } from "./repository.ts";
 import type { OperatorAuthStore } from "../web/web_auth.ts";
@@ -247,9 +247,73 @@ class PostgresConnection implements DatabaseConnection {
   }
 }
 
+export async function readReliabilitySummary(
+  connection: DatabaseConnection,
+  service: string,
+  sinceIso: string,
+  nowIso: string,
+): Promise<ReliabilitySummary> {
+  const rows = await connection.query(
+    `WITH observations AS MATERIALIZED (
+      SELECT bucket_start AS minute, is_up, status
+         FROM service_reliability_buckets
+        WHERE service_name=$1
+          AND bucket_start >= $2
+          AND bucket_start <= $3
+     ), days AS (
+      SELECT left(minute, 10) AS date,
+              count(*) AS observed,
+              count(*) FILTER (WHERE is_up=1) AS up,
+              count(*) FILTER (WHERE status='degraded') AS degraded
+         FROM observations GROUP BY 1
+     ), down_minutes AS (
+      SELECT minute::timestamptz AS minute,
+              CASE WHEN bool_or(status='down') THEN 'down'
+                   ELSE min(status) END AS status
+         FROM observations WHERE is_up<>1 GROUP BY observations.minute
+     ), streaks AS (
+       SELECT minute, status,
+              minute - row_number() OVER (ORDER BY minute) * interval '1 minute' AS streak
+         FROM down_minutes
+     ), events AS (
+       SELECT min(minute) AS start, count(*) AS minutes,
+              CASE WHEN bool_or(status='down') THEN 'down'
+                   ELSE min(status) END AS status,
+              max(minute) > $3::timestamptz - interval '5 minutes' AS ongoing
+         FROM streaks GROUP BY streak ORDER BY start DESC LIMIT 25
+     )
+     SELECT 'day' AS kind, date, observed, up, degraded,
+            NULL::text AS start, NULL::bigint AS minutes,
+            NULL::text AS status, NULL::boolean AS ongoing FROM days
+     UNION ALL
+     SELECT 'event', NULL, 0, 0, 0,
+            to_char(start AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+            minutes, status, ongoing FROM events`,
+    [service, sinceIso, nowIso],
+  );
+  return {
+    days: rows.filter((row) => row.kind === "day").map((row) => ({
+      date: String(row.date),
+      observed: Number(row.observed),
+      up: Number(row.up),
+      degraded: Number(row.degraded),
+    })),
+    downtime: rows.filter((row) => row.kind === "event").map((row) => ({
+      start: String(row.start),
+      minutes: Number(row.minutes),
+      status: String(row.status),
+      ongoing: row.ongoing === true,
+    })),
+  };
+}
+
 export class PostgresDatabase {
   private readonly pool: PostgresSql;
   private readonly healthTarget: string;
+  private readonly statusSummaries = new Map<string, {
+    expiresAt: number;
+    result: Promise<ReliabilitySummary>;
+  }>();
 
   constructor(databaseUrl: string, options: { maxConnections?: number } = {}) {
     if (
@@ -364,6 +428,44 @@ export class PostgresDatabase {
       isUp: Number(row.is_up) === 1,
       status: String(row.status),
     }));
+  }
+
+  async statusSummary(
+    service: string,
+    sinceIso: string,
+    nowIso: string,
+  ): Promise<ReliabilitySummary> {
+    const now = Date.now();
+    for (const [key, entry] of this.statusSummaries) {
+      if (entry.expiresAt <= now) this.statusSummaries.delete(key);
+    }
+    const key = JSON.stringify([
+      service,
+      sinceIso.slice(0, 16),
+      nowIso.slice(0, 16),
+    ]);
+    const cached = this.statusSummaries.get(key);
+    if (cached) return await cached.result;
+    const result = this.withConnection((connection) =>
+      connection.transaction(async (transaction) => {
+        await transaction.query("SET LOCAL statement_timeout = '5s'");
+        return await readReliabilitySummary(
+          transaction,
+          service,
+          sinceIso,
+          nowIso,
+        );
+      })
+    );
+    this.statusSummaries.set(key, { expiresAt: now + 15000, result });
+    try {
+      return await result;
+    } catch (error) {
+      if (this.statusSummaries.get(key)?.result === result) {
+        this.statusSummaries.delete(key);
+      }
+      throw error;
+    }
   }
 
   async health(): Promise<DatabaseHealth> {

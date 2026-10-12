@@ -1,6 +1,7 @@
 {
   "nodeModulesDir": "manual",
   "tasks": {
+    "test:status": "deno test --allow-env --allow-net=127.0.0.1:5432,localhost:5432 tests/deno_status_page_test.ts tests/deno_status_postgres_test.ts tests/deno_health_test.ts",
     "fmt": "deno fmt --check deno.json main.ts runtime.ts cli.ts client.ts database_transfer.ts backup_restore.ts cutover_monitor.ts cutover_preflight.ts vite.config.ts playwright.config.ts components/ routes/ islands/ src/**/*.ts tests/*.ts tests/browser/",
     "lint": "deno lint .",
     "typecheck": "deno check main.ts runtime.ts cli.ts client.ts database_transfer.ts backup_restore.ts cutover_monitor.ts cutover_preflight.ts vite.config.ts playwright.config.ts components/*.tsx routes/*.tsx islands/*.tsx src/**/*.ts tests/*.ts tests/browser/*.ts",

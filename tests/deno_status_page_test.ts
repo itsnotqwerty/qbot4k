@@ -55,7 +55,7 @@ const fakeHealth = (): DatabaseHealth => ({
   backend: "postgresql",
   tableCount: 1,
   integrity: "ok",
-  schemaVersion: "1",
+  schemaVersion: 1,
 });
 
 Deno.test("reliability recorder writes one bucket per service with observer", async () => {
@@ -117,4 +117,78 @@ Deno.test("status page degrades gracefully without a store", async () => {
   const html = await (await statusPage()).text();
   assertStringIncludes(html, "no observations yet");
   assertStringIncludes(html, 'chip chip-warn">unknown');
+});
+
+Deno.test("status page uses bounded summaries instead of raw history", async () => {
+  const now = new Date();
+  const store: StatusStore = Object.assign(new FakeStore(), {
+    buckets: () => {
+      throw new Error("Raw history must not be loaded");
+    },
+    statusSummary: () =>
+      Promise.resolve({
+        days: [{
+          date: now.toISOString().slice(0, 10),
+          observed: 400000,
+          up: 300000,
+          degraded: 0,
+        }],
+        downtime: [{
+          start: now.toISOString(),
+          minutes: 3,
+          status: "down",
+          ongoing: true,
+        }],
+      }),
+  });
+  const html = await (await statusPage(store)).text();
+  assertStringIncludes(html, "75.000% uptime");
+  assertStringIncludes(html, "400,000 observations");
+  assertStringIncludes(html, "Recorded status: down");
+  assertStringIncludes(html, "Ongoing");
+});
+
+Deno.test("status page responds when a store read never settles", async () => {
+  for (const stalledRead of ["roleHeartbeats", "buckets"] as const) {
+    const store = new FakeStore();
+    store[stalledRead] = () => new Promise<never>(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const response = await Promise.race([
+        statusPage(store),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), 2500);
+        }),
+      ]);
+      assertEquals(response instanceof Response, true, stalledRead);
+      const html = await response!.text();
+      assertStringIncludes(html, "temporarily unavailable");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+});
+
+Deno.test("status page returns when telemetry reads never settle", async () => {
+  const store = new FakeStore();
+  store.roleHeartbeats = () => new Promise(() => {});
+  store.buckets = () => new Promise(() => {});
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const response = await Promise.race([
+      statusPage(store),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(
+          () => reject(new Error("Status page exceeded its response budget")),
+          3000,
+        );
+      }),
+    ]);
+    const html = await response.text();
+    assertStringIncludes(html, "Status data is temporarily unavailable");
+    assertEquals(html.includes("No downtime recorded in the window"), false);
+    assertEquals(html.includes("run deno task migrate"), false);
+  } finally {
+    clearTimeout(deadline);
+  }
 });

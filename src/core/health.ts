@@ -52,7 +52,28 @@ export interface ReliabilityStore {
   ): Promise<readonly ReliabilityBucket[]>;
 }
 
-export interface StatusStore extends RoleHeartbeatStore, ReliabilityStore {}
+export interface ReliabilitySummary {
+  readonly days: readonly {
+    date: string;
+    observed: number;
+    up: number;
+    degraded: number;
+  }[];
+  readonly downtime: readonly {
+    start: string;
+    minutes: number;
+    status: string;
+    ongoing: boolean;
+  }[];
+}
+
+export interface StatusStore extends RoleHeartbeatStore, ReliabilityStore {
+  statusSummary?(
+    service: string,
+    sinceIso: string,
+    nowIso: string,
+  ): Promise<ReliabilitySummary>;
+}
 
 /**
  * Snapshot the monitor into durable per-minute reliability buckets. Each role

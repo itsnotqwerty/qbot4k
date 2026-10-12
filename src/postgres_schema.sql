@@ -1791,6 +1791,8 @@ CREATE INDEX IF NOT EXISTS idx_twitch_live_announcements_lookup
     ON twitch_live_announcements(twitch_channel_name, twitch_stream_id, discord_guild_id);
 CREATE INDEX IF NOT EXISTS idx_service_reliability_buckets_lookup
     ON service_reliability_buckets(service_name, bucket_start);
+CREATE INDEX IF NOT EXISTS idx_service_reliability_buckets_status
+    ON service_reliability_buckets(service_name, bucket_start) INCLUDE (is_up, status);
 
 
 

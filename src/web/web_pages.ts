@@ -194,6 +194,14 @@ function summarizeDays(
     d.degraded += entry.degraded;
     byDay.set(day, d);
   }
+  return fillStatusDays([...byDay.values()], now);
+}
+
+function fillStatusDays(
+  recorded: readonly DaySummary[],
+  now: Date,
+): DaySummary[] {
+  const byDay = new Map(recorded.map((day) => [day.date, day]));
   const days: DaySummary[] = [];
   for (let i = STATUS_WINDOW_DAYS - 1; i >= 0; i--) {
     const date = new Date(now.valueOf() - i * 86_400_000)
@@ -288,16 +296,55 @@ export async function statusPage(
   const generated = now.toISOString().replace("T", " ").slice(0, 16) + " UTC";
   const since = new Date(now.valueOf() - STATUS_WINDOW_DAYS * 86_400_000)
     .toISOString();
+  const deadline = Date.now() + (store?.statusSummary ? 7500 : 1500);
+  let unavailable = false;
+  let historyUnavailable = false;
+  const readStatus = async <T>(
+    read: () => Promise<T>,
+  ): Promise<T | undefined> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        unavailable = true;
+        return undefined;
+      }
+      const result = await Promise.race([
+        Promise.resolve().then(read).catch(() => undefined),
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), remaining);
+        }),
+      ]);
+      if (result === undefined) unavailable = true;
+      return result;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const current: Record<string, { status: string; updatedAt: string }> = store
-    ? await store.roleHeartbeats().catch(() => ({}))
+    ? await readStatus(() => store.roleHeartbeats()) ?? {}
     : {};
 
   const allEvents: DowntimeEvent[] = [];
   const rows = (await Promise.all(statusServices.map(async (meta) => {
-    const buckets = store
-      ? await store.buckets(meta.role, since).catch(() => [])
-      : [];
-    const days = summarizeDays(buckets, now);
+    const recorded = store
+      ? await readStatus(async () => {
+        if (store.statusSummary) {
+          return await store.statusSummary(meta.role, since, now.toISOString());
+        }
+        const buckets = await store.buckets(meta.role, since);
+        return {
+          days: summarizeDays(buckets, now),
+          downtime: downtimeEvents(meta.name, buckets, now).map((event) => ({
+            ...event,
+            start: event.start.toISOString(),
+          })),
+        };
+      })
+      : { days: [], downtime: [] };
+    const missingHistory = recorded === undefined;
+    if (missingHistory) historyUnavailable = true;
+    const days = fillStatusDays(recorded?.days ?? [], now);
     let observed = 0;
     let up = 0;
     const cells = days.map((d) => {
@@ -317,13 +364,20 @@ export async function statusPage(
     }).join("");
     const uptime = observed > 0 ? (up / observed) * 100 : null;
     const heartbeat = current[meta.role];
-    const staleSchema = uptime === null && heartbeat !== undefined;
+    const staleSchema = !missingHistory && uptime === null &&
+      heartbeat !== undefined;
     const sigma = uptime === null
       ? staleSchema
         ? { label: "not recording", cls: "sigma-low" }
         : { label: "no data", cls: "sigma-low" }
       : sigmaLevel(uptime);
-    allEvents.push(...downtimeEvents(meta.name, buckets, now));
+    for (const event of recorded?.downtime ?? []) {
+      allEvents.push({
+        ...event,
+        service: meta.name,
+        start: new Date(event.start),
+      });
+    }
 
     const ageSeconds = heartbeat
       ? (now.valueOf() - new Date(heartbeat.updatedAt).valueOf()) / 1000
@@ -345,7 +399,9 @@ export async function statusPage(
 <footer class="status-service-foot">
 <span class="num">${
       uptime === null
-        ? staleSchema
+        ? missingHistory
+          ? "History temporarily unavailable"
+          : staleSchema
           ? `service is live but not recording — run deno task migrate on the deployment`
           : `no observations yet · ${STATUS_WINDOW_DAYS} days`
         : `${
@@ -379,7 +435,9 @@ export async function statusPage(
 </li>`;
   }).join("\n");
 
-  const eventsHtml = allEvents.length === 0
+  const eventsHtml = historyUnavailable && allEvents.length === 0
+    ? `<p class="status-note">Downtime history is temporarily unavailable. No conclusion about availability can be drawn from missing data.</p>`
+    : allEvents.length === 0
     ? `<p class="status-note">No downtime recorded in the window. Events appear here when an observer records a service as down or stale.</p>`
     : `<ul class="downtime-list">${events}</ul>`;
 
@@ -391,6 +449,11 @@ export async function statusPage(
         origin,
       )
     }<link rel="stylesheet" href="/styles.css"></head><body><div class="app-shell"><header class="site-header"><a class="brand" href="/">QBot4K</a><nav aria-label="Primary navigation"><a href="/">Home</a><a href="/status" aria-current="page">Status</a><a href="/privacy">Privacy</a><a href="/terms">Terms</a></nav></header><main class="page-content"><div class="data-heading"><div><p class="eyebrow">Service status</p><h1>Status</h1><p class="lede">Recorded per-minute availability from every running service role, rolled up over ${STATUS_WINDOW_DAYS} days. Generated ${generated}. Live probes: <a class="text-link" href="/health/ready">/health/ready</a></p></div></div>
+${
+      unavailable
+        ? '<p class="status-note" role="status">Status data is temporarily unavailable. Displayed observations may be incomplete; please try again shortly.</p>'
+        : ""
+    }
 <section class="status-grid" aria-label="Services">${rows}</section>
 <section aria-labelledby="downtime-title"><h2 id="downtime-title">Downtime events</h2>${eventsHtml}</section>
 <p class="status-note">Each minute, every service role records its own status and its view of peers (via heartbeats) into service_reliability_buckets. A minute with no observation at all means no role was alive to record it and counts as unavailable. Sigma reliability levels: 3σ ≈ 93.32%, 4σ ≈ 99.38%, 5σ ≈ 99.977%, 6σ ≈ 99.9997% availability over the rolling window.</p>
