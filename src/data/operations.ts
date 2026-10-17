@@ -36,6 +36,10 @@ export const MIGRATION_NAMES = Object.freeze([
   "tenant slo samples",
   "tenant quotas and fair jobs",
   "provider installation ownership leases",
+  "organization billing ownership and access grants",
+  "community-scoped custom commands",
+  "Stripe checkout and durable webhook reconciliation",
+  "Verified backer imports claims and fulfillment queue",
 ]);
 
 export interface AuditCheck {

@@ -123,6 +123,42 @@ Deno.test("lease renewal is bounded and requires active worker ownership", async
   );
 });
 
+Deno.test("unpaid leased work is deferred before dispatch without consuming retries", async () => {
+  const connection = new FakeConnection([[{ id: 7 }]]);
+  assertEquals(
+    await new PostgresProcessingJobRepository(connection).deferUnpaid(
+      7,
+      "worker-1",
+    ),
+    true,
+  );
+  assertEquals(
+    connection.calls[0].sql.includes(
+      "NOT qbot_community_has_access(community_id)",
+    ),
+    true,
+  );
+  assertEquals(
+    connection.calls[0].sql.includes("attempts=GREATEST(attempts-1,0)"),
+    true,
+  );
+  let dispatched = false;
+  const store = {
+    claim: () => Promise.resolve({ id: 7, jobType: "fixture" }),
+    deferUnpaid: () => Promise.resolve(true),
+  } as unknown as ProcessingJobStore;
+  const registry = new JobRegistry().register("fixture", () => {
+    dispatched = true;
+    return Promise.resolve();
+  });
+  assertEquals(
+    await new ProcessingWorker(store, registry, "analysis", "worker-1")
+      .processNext(),
+    true,
+  );
+  assertEquals(dispatched, false);
+});
+
 Deno.test("retry exhausts attempts into a permanent failed state", async () => {
   const retrying = new FakeConnection([[{ attempts: 2, max_attempts: 5 }], [{
     id: 7,

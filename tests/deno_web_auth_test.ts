@@ -127,6 +127,7 @@ Deno.test("both Discord callback paths create a tenant-scoped session", async ()
         `https://qbot.example${path}?code=code-1&state=${
           encodeURIComponent(state)
         }`,
+        { headers: { cookie: `qbot4k_oauth_state=${state}` } },
       ),
     );
     assertEquals(response.status, 302);
@@ -163,9 +164,73 @@ Deno.test("Discord callback rejects invalid state and unauthorized guilds", asyn
       `https://qbot.example/oauth/discord/callback?code=code-1&state=${
         encodeURIComponent(state)
       }`,
+      { headers: { cookie: `qbot4k_oauth_state=${state}` } },
     ),
   );
   assertEquals(denied.status, 403);
+  assertEquals(store.logins, []);
+});
+
+Deno.test("customer signup issues only an account session outside operator guilds", async () => {
+  const store = new FakeOperatorStore();
+  store.completeLogin = (received, role) => {
+    store.logins.push(`${received.userId}:${role}`);
+    return Promise.resolve({
+      operatorId: 42,
+      status: "active",
+      sessionVersion: 3,
+      memberships: [],
+    });
+  };
+  const auth = new WebAuthController(
+    { ...settings, customerSignupEnabled: true },
+    { authenticate: () => Promise.resolve({ ...identity, guildIds: [] }) },
+    store,
+    () => now,
+  );
+  const state = await createOauthState(settings.dashboardSessionSecret);
+  const response = await auth.callback(
+    new Request(
+      `https://qbot.example/oauth/discord/callback?code=code&state=${state}`,
+      {
+        headers: { cookie: `qbot4k_oauth_state=${state}` },
+      },
+    ),
+  );
+  assertEquals(response.headers.get("location"), "/account");
+  assertEquals(store.logins, ["9001:viewer"]);
+  const session = await auth.readSession(
+    new Request("https://qbot.example/account", {
+      headers: {
+        cookie: `qbot4k_session=${cookieFrom(response, "qbot4k_session")}`,
+      },
+    }),
+  );
+  assertEquals(session?.communityId, null);
+  assertEquals(session?.role, "viewer");
+});
+
+Deno.test("OAuth callback requires a signed state bound to the browser cookie", async () => {
+  const { handler, store } = fixture();
+  const state = await createOauthState(settings.dashboardSessionSecret);
+  for (const cookie of ["", "qbot4k_oauth_state=other"]) {
+    const response = await handler(
+      new Request(
+        `https://qbot.example/oauth/discord/callback?code=code&state=${state}`,
+        { headers: { cookie } },
+      ),
+    );
+    assertEquals(response.status, 400);
+  }
+  const forged = await handler(
+    new Request(
+      "https://qbot.example/oauth/discord/callback?code=code&state=forged",
+      {
+        headers: { cookie: "qbot4k_oauth_state=forged" },
+      },
+    ),
+  );
+  assertEquals(forged.status, 400);
   assertEquals(store.logins, []);
 });
 
@@ -244,6 +309,67 @@ Deno.test("dashboard and community switch enforce the signed tenant session", as
     }),
   );
   assertEquals(originMismatch.status, 403);
+});
+
+Deno.test("account-only sessions cannot authorize community dashboards", async () => {
+  const auth = new WebAuthController(
+    settings,
+    { authenticate: () => Promise.resolve(identity) },
+    new FakeOperatorStore(),
+    () => now,
+  );
+  const cookie = await createSessionCookie(settings.dashboardSessionSecret, {
+    userId: "42",
+    username: "Customer",
+    role: "viewer",
+    communityId: null,
+    expiresAt: "2026-01-02T15:04:05.000Z",
+    sessionVersion: 3,
+  });
+  const request = new Request("https://qbot.example/account", {
+    headers: { cookie: `qbot4k_session=${cookie}` },
+  });
+  assertEquals((await auth.accountSession(request))?.userId, "42");
+  assertEquals(await auth.authorizedSession(request), null);
+});
+
+Deno.test("community switching rejects revoked and disabled account sessions", async () => {
+  for (
+    const account of [
+      { status: "active", sessionVersion: 4, memberships },
+      { status: "disabled", sessionVersion: 3, memberships },
+    ]
+  ) {
+    const store = new FakeOperatorStore();
+    store.resolveSession = () => Promise.resolve(account);
+    const auth = new WebAuthController(
+      settings,
+      { authenticate: () => Promise.resolve(identity) },
+      store,
+      () => now,
+    );
+    const cookie = await createSessionCookie(settings.dashboardSessionSecret, {
+      userId: "42",
+      username: "Operator",
+      role: "owner",
+      communityId: 7,
+      expiresAt: "2026-01-02T15:04:05.000Z",
+      sessionVersion: 3,
+    });
+    const response = await auth.switchCommunity(
+      new Request("https://qbot.example/community/switch", {
+        method: "POST",
+        headers: {
+          cookie: `qbot4k_session=${cookie}`,
+          origin: "https://qbot.example",
+        },
+        body: new URLSearchParams({ community_id: "8" }),
+      }),
+    );
+    assertEquals(response.status, 302);
+    assertEquals(response.headers.get("location"), "/login");
+    assertEquals(store.switches, []);
+  }
 });
 
 Deno.test("logout audits the operator and clears the session", async () => {

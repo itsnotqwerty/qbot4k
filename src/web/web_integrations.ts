@@ -3,6 +3,7 @@ import { render } from "npm:preact-render-to-string@6.7.0";
 import { IntegrationsWorkspace } from "../../components/IntegrationsWorkspace.tsx";
 import type { AppSettingsValues } from "../core/config.ts";
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
+import { BILLING_CATALOG } from "../domain/billing.ts";
 import { FernetCipher } from "../security/fernet.ts";
 import {
   constantTimeEqual,
@@ -173,6 +174,59 @@ export class FetchIntegrationOAuthGateway implements IntegrationOAuthGateway {
 
 export class PostgresIntegrationRepository implements IntegrationService {
   constructor(private readonly connection: DatabaseConnection) {}
+  private async enforceInstallationPolicy(
+    connection: DatabaseConnection,
+    communityId: number,
+    operatorId: number,
+    platform: "discord" | "twitch",
+    externalId: string,
+    broadcasterLogin: string | null = null,
+  ): Promise<void> {
+    const [community] = await connection.query(
+      "SELECT id FROM communities WHERE id=$1 AND status='active' FOR UPDATE",
+      [communityId],
+    );
+    if (!community) throw new TypeError("Active community required");
+    const [operator] = await connection.query(
+      `SELECT EXISTS (
+         SELECT 1 FROM platform_staff_roles staff
+         WHERE staff.operator_id=account.id AND staff.role IN ('support','billing','admin')
+       ) AS is_staff
+       FROM operator_accounts account
+       JOIN operator_community_roles membership ON membership.operator_id=account.id
+       WHERE account.id=$1 AND account.status='active'
+         AND membership.community_id=$2 AND membership.role IN ('admin','owner')`,
+      [operatorId, communityId],
+    );
+    if (!operator) throw new TypeError("Installation is not authorized");
+    if (platform === "discord") {
+      const [permission] = await connection.query(
+        `SELECT 1 FROM operator_discord_guild_permissions
+         WHERE operator_id=$1 AND guild_id=$2 AND (permissions & 40::bigint) != 0`,
+        [operatorId, externalId],
+      );
+      if (!permission) {
+        throw new TypeError("Discord installation is not authorized");
+      }
+    }
+    if (operator.is_staff === true) return;
+    const [usage] = await connection.query(
+      `SELECT COUNT(*) AS installation_count FROM community_installations
+       WHERE community_id=$1 AND platform=$2 AND status<>'revoked'
+         AND NOT (external_community_id=$3 OR
+           ($4::text IS NOT NULL AND COALESCE(metadata_json::jsonb->>'broadcaster_login','')=$4))`,
+      [communityId, platform, externalId, broadcasterLogin],
+    );
+    const count = Number(usage?.installation_count);
+    const limit = BILLING_CATALOG.installationLimits[platform];
+    if (!Number.isSafeInteger(count) || count < 0 || count >= limit) {
+      throw new TypeError(
+        `Community connection limit reached: ${limit} ${
+          platform === "twitch" ? "Twitch channel" : "Discord servers"
+        }.`,
+      );
+    }
+  }
   async snapshot(
     communityId: number,
     operatorId: number,
@@ -229,6 +283,13 @@ export class PostgresIntegrationRepository implements IntegrationService {
       if (!allowed) {
         throw new TypeError("Discord installation is not authorized");
       }
+      await this.enforceInstallationPolicy(
+        connection,
+        input.communityId,
+        input.operatorId,
+        "discord",
+        guildId,
+      );
       const existing = (await connection.query(
         "SELECT community_id FROM community_installations WHERE platform='discord' AND external_community_id=$1",
         [guildId],
@@ -260,6 +321,13 @@ export class PostgresIntegrationRepository implements IntegrationService {
   }
   async completeDiscordIntent(state: InstallState): Promise<void> {
     await this.connection.transaction(async (connection) => {
+      await this.enforceInstallationPolicy(
+        connection,
+        state.community_id,
+        Number(state.operator_id),
+        "discord",
+        state.guild_id ?? "",
+      );
       const consumed = (await connection.query(
         "UPDATE discord_install_intents SET consumed_at=CURRENT_TIMESTAMP WHERE nonce=$1 AND operator_id=$2 AND community_id=$3 AND guild_id=$4 AND consumed_at IS NULL AND expires_at::timestamptz>CURRENT_TIMESTAMP RETURNING nonce",
         [
@@ -279,7 +347,7 @@ export class PostgresIntegrationRepository implements IntegrationService {
       const displayName = String(knownName?.guild_name ?? "") ||
         (state.guild_id ?? "");
       const installation = (await connection.query(
-        `INSERT INTO community_installations(community_id,platform,external_community_id,display_name,status,scopes_json,capabilities_json) VALUES ($1,'discord',$2,$3,'pending',$4,$5) ON CONFLICT(platform,external_community_id) DO UPDATE SET display_name=EXCLUDED.display_name,status=CASE WHEN community_installations.status='active' THEN 'active' ELSE 'pending' END,scopes_json=EXCLUDED.scopes_json,capabilities_json=EXCLUDED.capabilities_json,updated_at=CURRENT_TIMESTAMP RETURNING id`,
+        `INSERT INTO community_installations(community_id,platform,external_community_id,display_name,status,scopes_json,capabilities_json) VALUES ($1,'discord',$2,$3,'pending',$4,$5) ON CONFLICT(platform,external_community_id) DO UPDATE SET display_name=EXCLUDED.display_name,status=CASE WHEN community_installations.status='active' THEN 'active' ELSE 'pending' END,scopes_json=EXCLUDED.scopes_json,capabilities_json=EXCLUDED.capabilities_json,updated_at=CURRENT_TIMESTAMP WHERE community_installations.community_id=EXCLUDED.community_id RETURNING id`,
         [
           state.community_id,
           state.guild_id ?? "",
@@ -293,6 +361,11 @@ export class PostgresIntegrationRepository implements IntegrationService {
           ]),
         ],
       ))[0];
+      if (!installation) {
+        throw new TypeError(
+          "Discord guild is already linked to another community",
+        );
+      }
       await this.audit(
         connection,
         Number(state.operator_id),
@@ -328,6 +401,14 @@ export class PostgresIntegrationRepository implements IntegrationService {
       if (!allowed) {
         throw new TypeError("Twitch installation is not authorized");
       }
+      await this.enforceInstallationPolicy(
+        connection,
+        input.communityId,
+        input.operatorId,
+        "twitch",
+        login,
+        login,
+      );
       const existing = (await connection.query(
         "SELECT community_id FROM community_installations WHERE platform='twitch' AND (external_community_id=$1 OR metadata_json::jsonb->>'broadcaster_login'=$1)",
         [login],
@@ -376,6 +457,13 @@ export class PostgresIntegrationRepository implements IntegrationService {
     }
     const cipher = await FernetCipher.fromKey(encryptionKey);
     return await this.connection.transaction(async (connection) => {
+      await this.enforceInstallationPolicy(
+        connection,
+        state.community_id,
+        Number(state.operator_id),
+        "twitch",
+        grant.broadcasterId,
+      );
       const intent = (await connection.query(
         "UPDATE twitch_install_intents SET consumed_at=CURRENT_TIMESTAMP WHERE nonce=$1 AND operator_id=$2 AND community_id=$3 AND broadcaster_login=$4 AND consumed_at IS NULL AND expires_at::timestamptz>CURRENT_TIMESTAMP RETURNING nonce",
         [
@@ -396,7 +484,7 @@ export class PostgresIntegrationRepository implements IntegrationService {
         moderation_mode: "shadow",
       };
       const installation = (await connection.query(
-        `INSERT INTO community_installations(community_id,platform,external_community_id,display_name,status,scopes_json,metadata_json,capabilities_json,health_status,last_error) VALUES ($1,'twitch',$2,$3,'pending',$4,$5,$6,$7,$8) ON CONFLICT(platform,external_community_id) DO UPDATE SET display_name=EXCLUDED.display_name,status='pending',scopes_json=EXCLUDED.scopes_json,metadata_json=EXCLUDED.metadata_json,capabilities_json=EXCLUDED.capabilities_json,health_status=EXCLUDED.health_status,last_error=EXCLUDED.last_error,updated_at=CURRENT_TIMESTAMP RETURNING id`,
+        `INSERT INTO community_installations(community_id,platform,external_community_id,display_name,status,scopes_json,metadata_json,capabilities_json,health_status,last_error) VALUES ($1,'twitch',$2,$3,'pending',$4,$5,$6,$7,$8) ON CONFLICT(platform,external_community_id) DO UPDATE SET display_name=EXCLUDED.display_name,status='pending',scopes_json=EXCLUDED.scopes_json,metadata_json=EXCLUDED.metadata_json,capabilities_json=EXCLUDED.capabilities_json,health_status=EXCLUDED.health_status,last_error=EXCLUDED.last_error,updated_at=CURRENT_TIMESTAMP WHERE community_installations.community_id=EXCLUDED.community_id RETURNING id`,
         [
           state.community_id,
           grant.broadcasterId,
@@ -415,6 +503,11 @@ export class PostgresIntegrationRepository implements IntegrationService {
             : "EventSub callback is not configured; configure it and reconnect Twitch.",
         ],
       ))[0];
+      if (!installation) {
+        throw new TypeError(
+          "Twitch broadcaster is already linked to another community",
+        );
+      }
       const installationId = Number(installation.id);
       await connection.query(
         `INSERT INTO installation_runtime_leases(installation_id,owner_runtime)

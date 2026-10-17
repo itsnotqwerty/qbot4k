@@ -20,10 +20,14 @@ export interface LogRecord {
 export type LogSink = (record: LogRecord) => void;
 
 const SENSITIVE_KEY =
-  /(?:authorization|cookie|credential|password|passwd|secret|token|api[_-]?key)/iu;
+  /(?:authorization|cookie|credential|password|passwd|secret|token|api[_-]?key|claim[_-]?(?:code|hash|nonce))/iu;
 
 function redactText(value: string): string {
   return value
+    .replace(
+      /\b(?:(?:sk|rk)_(?:test|live)_[A-Za-z0-9]+|whsec_[A-Za-z0-9]+|re_[A-Za-z0-9_-]+)\b/gu,
+      "[REDACTED]",
+    )
     .replace(/\b(Bearer|Bot)\s+[^\s,;]+/giu, "$1 [REDACTED]")
     .replace(
       /\b(postgres(?:ql)?:\/\/)[^\s/@]+(?::[^\s/@]*)?@/giu,

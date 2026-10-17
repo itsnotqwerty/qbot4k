@@ -14,7 +14,9 @@ const secret = "commands-test-secret";
 
 class FakeCommands implements CommandRegistry {
   inputs: Readonly<Record<string, string | boolean>>[] = [];
-  list() {
+  communities: number[] = [];
+  list(communityId: number) {
+    this.communities.push(communityId);
     return Promise.resolve({
       builtins: [{
         command_name: "help",
@@ -26,7 +28,11 @@ class FakeCommands implements CommandRegistry {
       simple: [],
     });
   }
-  update(input: Readonly<Record<string, string | boolean>>) {
+  update(
+    communityId: number,
+    input: Readonly<Record<string, string | boolean>>,
+  ) {
+    this.communities.push(communityId);
     this.inputs.push(input);
     if (String(input.command_name).toLocaleLowerCase() === "alias") {
       throw new TypeError("alias is reserved");
@@ -37,8 +43,9 @@ class FakeCommands implements CommandRegistry {
   }
 }
 
-async function fixture(role: string) {
+async function fixture(role: string, platformAdmin = false) {
   const store: OperatorAuthStore = {
+    isPlatformAdmin: () => Promise.resolve(platformAdmin),
     completeLogin: () => Promise.reject(new Error("not used")),
     switchCommunity: () => Promise.resolve(null),
     auditLogout: () => Promise.resolve(),
@@ -95,6 +102,8 @@ Deno.test("commands page is admin-only and renders no-JavaScript forms", async (
   assertEquals(html.includes('action="/commands"'), true);
   assertEquals(html.includes('href="/styles.css"'), true);
   assertEquals(html.includes('href="/integrations"'), true);
+  assertEquals(html.includes('value="builtin"'), false);
+  assertEquals(admin.registry.communities, [7]);
   const viewer = await fixture("viewer");
   assertEquals(
     (await viewer.handler(
@@ -115,7 +124,7 @@ Deno.test("commands form saves normalized simple commands and preserves redirect
         origin: "http://localhost",
       },
       body:
-        "record_type=simple&command_name=Website&response_template=Visit+us&enabled=1",
+        "record_type=simple&command_name=Website&response_template=Visit+us&enabled=1&community_id=999",
     }),
   );
   assertEquals(response.status, 302);
@@ -124,4 +133,28 @@ Deno.test("commands form saves normalized simple commands and preserves redirect
     "/commands?status=Saved%20simple%20command%20website",
   );
   assertEquals(registry.inputs[0].enabled, true);
+  assertEquals(registry.communities, [7]);
+});
+
+Deno.test("community owners cannot edit shared builtins but platform admins can", async () => {
+  for (const platformAdmin of [false, true]) {
+    const { handler, headers, registry } = await fixture(
+      "owner",
+      platformAdmin,
+    );
+    const response = await handler(
+      new Request("http://localhost/commands", {
+        method: "POST",
+        headers: {
+          ...headers,
+          origin: "http://localhost",
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body:
+          "record_type=builtin&command_name=help&title=Help&description_template=Hello&enabled=1",
+      }),
+    );
+    assertEquals(response.status, platformAdmin ? 302 : 403);
+    assertEquals(registry.inputs.length, platformAdmin ? 1 : 0);
+  }
 });

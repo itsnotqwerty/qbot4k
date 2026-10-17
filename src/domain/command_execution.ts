@@ -121,8 +121,14 @@ export class PostgresCommandExecutionRepository {
     arguments_: readonly string[],
     input: CommandMessageInput,
   ): Promise<CommandReply | null> {
-    if (!input.isModerator && !hasOperatorRole(input.roleNames)) {
-      return card("Commands", "Command management requires moderator access.");
+    if (
+      !input.isModerator && !hasOperatorRole(input.roleNames) &&
+      !await this.hasOwnerAccess(input)
+    ) {
+      return card(
+        "Commands",
+        "Command management requires owner or moderator access.",
+      );
     }
     if (name === "addcom" || name === "editcom") {
       const commandName = normalizeCustomCommandName(arguments_[0] ?? "");
@@ -133,7 +139,7 @@ export class PostgresCommandExecutionRepository {
           `Usage: !${name} <command> <response>`,
         );
       }
-      const existing = await this.simpleCommand(commandName);
+      const existing = await this.simpleCommand(input.communityId, commandName);
       if (name === "addcom" && existing) {
         return card("Commands", `!${commandName} already exists.`);
       }
@@ -142,12 +148,12 @@ export class PostgresCommandExecutionRepository {
       }
       await this.connection.query(
         `INSERT INTO simple_command_definitions(
-           command_name,response_template,enabled
-         ) VALUES ($1,$2,1)
-         ON CONFLICT(command_name) DO UPDATE SET
+           community_id,command_name,response_template,enabled
+         ) VALUES ($1,$2,$3,1)
+         ON CONFLICT(community_id,command_name) DO UPDATE SET
            response_template=EXCLUDED.response_template,enabled=1,
            updated_at=CURRENT_TIMESTAMP`,
-        [commandName, response],
+        [input.communityId, commandName, response],
       );
       return card(
         "Commands",
@@ -158,8 +164,8 @@ export class PostgresCommandExecutionRepository {
       const commandName = normalizeCustomCommandName(arguments_[0] ?? "");
       if (!commandName) return card("Commands", "Usage: !delcom <command>");
       const deleted = await this.connection.query(
-        "DELETE FROM simple_command_definitions WHERE command_name=$1 RETURNING command_name",
-        [commandName],
+        "DELETE FROM simple_command_definitions WHERE community_id=$1 AND command_name=$2 RETURNING command_name",
+        [input.communityId, commandName],
       );
       return card(
         "Commands",
@@ -177,11 +183,17 @@ export class PostgresCommandExecutionRepository {
       if (aliasName === targetName) {
         return card("Commands", "A command cannot alias itself.");
       }
-      const existingAlias = await this.simpleCommand(aliasName);
+      const existingAlias = await this.simpleCommand(
+        input.communityId,
+        aliasName,
+      );
       if (existingAlias) {
         return card("Commands", `!${aliasName} already exists.`);
       }
-      const target = await this.resolveAnyCommand(targetName);
+      const target = await this.resolveAnyCommand(
+        input.communityId,
+        targetName,
+      );
       if (!target) {
         return card("Commands", `!${targetName} does not exist.`);
       }
@@ -193,12 +205,12 @@ export class PostgresCommandExecutionRepository {
       }
       await this.connection.query(
         `INSERT INTO simple_command_definitions(
-           command_name,response_template,enabled
-         ) VALUES ($1,$2,1)
-         ON CONFLICT(command_name) DO UPDATE SET
+           community_id,command_name,response_template,enabled
+         ) VALUES ($1,$2,$3,1)
+         ON CONFLICT(community_id,command_name) DO UPDATE SET
            response_template=EXCLUDED.response_template,enabled=1,
            updated_at=CURRENT_TIMESTAMP`,
-        [aliasName, `${ALIAS_PREFIX}${targetName}`],
+        [input.communityId, aliasName, `${ALIAS_PREFIX}${targetName}`],
       );
       return card("Commands", `Aliased !${aliasName} to !${targetName}.`);
     }
@@ -232,7 +244,10 @@ export class PostgresCommandExecutionRepository {
     const seen = new Set<string>([commandName]);
     // Follow simple-command aliases (up to a few hops) to their target.
     for (let hop = 0; hop < 5; hop += 1) {
-      const aliasTarget = await this.aliasTarget(commandName);
+      const aliasTarget = await this.aliasTarget(
+        input.communityId,
+        commandName,
+      );
       if (!aliasTarget) break;
       if (seen.has(aliasTarget)) return null;
       seen.add(aliasTarget);
@@ -284,7 +299,7 @@ export class PostgresCommandExecutionRepository {
         textOnly: input.platform === "twitch",
       };
     }
-    const simple = await this.simpleCommand(commandName);
+    const simple = await this.simpleCommand(input.communityId, commandName);
     if (simple) {
       if (!input.httpResponse) {
         await this.prefetchHttpMacros(
@@ -310,17 +325,50 @@ export class PostgresCommandExecutionRepository {
     return null;
   }
 
-  private async simpleCommand(commandName: string) {
+  private async hasOwnerAccess(input: CommandMessageInput): Promise<boolean> {
+    if (input.platform !== "discord") return false;
+    const rows = await this.connection.query(
+      `SELECT 1 AS allowed
+         FROM observations AS observation
+         JOIN platform_accounts AS actor ON actor.id=observation.actor_platform_account_id
+         JOIN operator_accounts AS operator ON operator.discord_user_id=actor.platform_user_id
+         JOIN communities AS community ON community.id=observation.community_id
+         JOIN workspaces AS workspace ON workspace.id=community.workspace_id
+         JOIN organizations AS organization ON organization.id=workspace.organization_id
+        WHERE observation.id=$1 AND observation.community_id=$2
+          AND observation.platform='discord' AND actor.platform='discord'
+          AND operator.status='active' AND community.status='active'
+          AND organization.status='active'
+          AND (
+            EXISTS (SELECT 1 FROM organization_operator_roles AS membership
+              WHERE membership.organization_id=organization.id
+                AND membership.operator_id=operator.id AND membership.role='owner')
+            OR EXISTS (SELECT 1 FROM operator_community_roles AS membership
+              WHERE membership.community_id=community.id
+                AND membership.operator_id=operator.id AND membership.role='owner')
+          )
+          AND NOT EXISTS (SELECT 1 FROM operator_permission_overrides AS override
+            WHERE override.community_id=community.id AND override.operator_id=operator.id
+              AND override.permission='commands.manage' AND override.decision='deny')`,
+      [input.observationId, input.communityId],
+    );
+    return rows.length > 0;
+  }
+
+  private async simpleCommand(communityId: number, commandName: string) {
     return (await this.connection.query(
       `SELECT response_template FROM simple_command_definitions
-        WHERE command_name=$1 AND enabled=1`,
-      [commandName],
+        WHERE community_id=$1 AND command_name=$2 AND enabled=1`,
+      [communityId, commandName],
     ))[0];
   }
 
   // Returns the alias target name when the command is an alias, else null.
-  private async aliasTarget(commandName: string): Promise<string | null> {
-    const row = await this.simpleCommand(commandName);
+  private async aliasTarget(
+    communityId: number,
+    commandName: string,
+  ): Promise<string | null> {
+    const row = await this.simpleCommand(communityId, commandName);
     if (!row) return null;
     const template = String(row.response_template);
     if (!template.startsWith(ALIAS_PREFIX)) return null;
@@ -332,6 +380,7 @@ export class PostgresCommandExecutionRepository {
 
   // Returns the response template for a builtin or simple command, else null.
   private async resolveAnyCommand(
+    communityId: number,
     commandName: string,
   ): Promise<string | null> {
     const builtin = (await this.connection.query(
@@ -340,7 +389,7 @@ export class PostgresCommandExecutionRepository {
       [commandName],
     ))[0];
     if (builtin) return String(builtin.description_template);
-    const simple = await this.simpleCommand(commandName);
+    const simple = await this.simpleCommand(communityId, commandName);
     return simple ? String(simple.response_template) : null;
   }
 }

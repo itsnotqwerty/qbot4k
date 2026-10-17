@@ -3,6 +3,20 @@ import { TenantContext } from "../core/contexts.ts";
 import type { ReliabilityBucket, ReliabilitySummary } from "../core/health.ts";
 import { FernetCipher } from "../security/fernet.ts";
 import { OperatorAuthRepository, ScopedRepository } from "./repository.ts";
+import { PostgresBillingRepository } from "./billing_repository.ts";
+import {
+  type BackerService,
+  PostgresBackerRepository,
+  type RewardDelivery,
+  type RewardPayments,
+} from "./backer_repository.ts";
+import type { PlatformAdminService } from "../web/web_admin.ts";
+import {
+  PostgresStripeBillingRepository,
+  type StripeBillingService,
+} from "./stripe_billing_repository.ts";
+import type { StripeBillingGateway } from "../providers/stripe_billing.ts";
+import type { CustomerAccountService } from "../web/web_accounts.ts";
 import type { OperatorAuthStore } from "../web/web_auth.ts";
 import {
   DashboardQueryRepository,
@@ -159,7 +173,7 @@ export interface DatabaseConnection {
   ): Promise<T>;
 }
 
-export const EXPECTED_SCHEMA_VERSION = 28;
+export const EXPECTED_SCHEMA_VERSION = 32;
 
 export interface DatabaseHealth {
   readonly status: "ready" | "degraded";
@@ -506,6 +520,8 @@ export class PostgresDatabase {
     };
     return {
       enqueue: (input) => request((repository) => repository.enqueue(input)),
+      deferUnpaid: (jobId, workerId) =>
+        request((repository) => repository.deferUnpaid(jobId, workerId)),
       claim: (stage, workerId, jobTypes) =>
         request((repository) => repository.claim(stage, workerId, jobTypes)),
       complete: (jobId, workerId) =>
@@ -901,6 +917,106 @@ export class PostgresDatabase {
     };
   }
 
+  customerAccountService(): CustomerAccountService {
+    return {
+      createOrganization: (operatorId, name, slug, expectedSessionVersion) =>
+        this.withConnection((connection) =>
+          new PostgresBillingRepository(connection).createOrganization(
+            operatorId,
+            name,
+            slug,
+            expectedSessionVersion,
+          )
+        ),
+    };
+  }
+
+  stripeBillingService(provider: StripeBillingGateway): StripeBillingService {
+    const request = <Result>(
+      callback: (
+        repository: PostgresStripeBillingRepository,
+      ) => Promise<Result>,
+    ) =>
+      this.withConnection((connection) =>
+        callback(new PostgresStripeBillingRepository(connection, provider))
+      );
+    return {
+      organizations: (operatorId) =>
+        request((repository) => repository.organizations(operatorId)),
+      portal: (operatorId, organizationId, origin) =>
+        request((repository) =>
+          repository.portal(operatorId, organizationId, origin)
+        ),
+      checkout: (operatorId, organizationId, cadence, origin) =>
+        request((repository) =>
+          repository.checkout(operatorId, organizationId, cadence, origin)
+        ),
+      receive: (event) => request((repository) => repository.receive(event)),
+      processPending: () =>
+        request((repository) => repository.processPending()),
+    };
+  }
+
+  platformAdminService(): PlatformAdminService {
+    return {
+      rows: (operatorId, view, page) =>
+        this.withConnection((connection) =>
+          new PostgresBillingRepository(connection).adminRows(
+            operatorId,
+            view,
+            page,
+          )
+        ),
+    };
+  }
+
+  async communityPaidAccess(communityId: number): Promise<boolean> {
+    return await this.withConnection(async (connection) =>
+      (await connection.query(
+        "SELECT qbot_community_has_access($1) AS allowed",
+        [communityId],
+      ))[0]?.allowed === true
+    );
+  }
+
+  backerService(
+    delivery: RewardDelivery,
+    payments: RewardPayments | null,
+  ): BackerService {
+    const request = <Result>(
+      callback: (repository: PostgresBackerRepository) => Promise<Result>,
+    ) =>
+      this.withConnection((connection) =>
+        callback(new PostgresBackerRepository(connection, delivery, payments))
+      );
+    return {
+      overview: (actor, campaign, page) =>
+        request((repository) => repository.overview(actor, campaign, page)),
+      campaign: (actor, mapping, columns, live) =>
+        request((repository) =>
+          repository.campaign(actor, mapping, columns, live)
+        ),
+      activate: (actor, campaign) =>
+        request((repository) => repository.activate(actor, campaign)),
+      preview: (actor, campaign, csv) =>
+        request((repository) => repository.preview(actor, campaign, csv)),
+      previewDetail: (actor, id) =>
+        request((repository) => repository.previewDetail(actor, id)),
+      confirm: (actor, id) =>
+        request((repository) => repository.confirm(actor, id)),
+      resend: (actor, id) =>
+        request((repository) => repository.resend(actor, id)),
+      retry: (actor, id) =>
+        request((repository) => repository.retry(actor, id)),
+      claim: (actor, version, organization, code) =>
+        request((repository) =>
+          repository.claim(actor, version, organization, code)
+        ),
+      benefits: (actor) => request((repository) => repository.benefits(actor)),
+      process: () => request((repository) => repository.process()),
+    };
+  }
+
   operatorAuthStore(): OperatorAuthStore {
     const request = async <T>(
       callback: (repository: OperatorAuthRepository) => Promise<T>,
@@ -915,6 +1031,13 @@ export class PostgresDatabase {
       }
     };
     return {
+      isPlatformAdmin: (operatorId) =>
+        this.withConnection((connection) =>
+          new PostgresBillingRepository(connection).platformAllows(
+            operatorId,
+            "staff.manage",
+          )
+        ),
       completeLogin: (identity, role) =>
         request((repository) => repository.completeLogin(identity, role)),
       switchCommunity: (operatorId, communityId, previousCommunityId) =>
@@ -1194,8 +1317,9 @@ export class PostgresDatabase {
       }
     };
     return {
-      list: () => request((registry) => registry.list()),
-      update: (input) => request((registry) => registry.update(input)),
+      list: (communityId) => request((registry) => registry.list(communityId)),
+      update: (communityId, input) =>
+        request((registry) => registry.update(communityId, input)),
     };
   }
 

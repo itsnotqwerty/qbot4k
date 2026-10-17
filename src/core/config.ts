@@ -52,6 +52,16 @@ export const APPLICATION_ENV_KEYS = [
   "QBOT_MODERATION_SHADOW_MODE",
   "QBOT_SHADOW_READ_UPSTREAM_URL",
   "QBOT_WEB_READ_ONLY",
+  "QBOT_CUSTOMER_SIGNUP_ENABLED",
+  "STRIPE_PUBLISHABLE_KEY",
+  "STRIPE_SECRET_KEY",
+  "STRIPE_WEBHOOK_SECRET",
+  "QBOT_STRIPE_PRICE_MONTHLY",
+  "QBOT_STRIPE_PRICE_ANNUAL",
+  "QBOT_STRIPE_BACKER_COUPON_ID",
+  "QBOT_STRIPE_PORTAL_CONFIGURATION_ID",
+  "QBOT_REWARD_EMAIL_API_KEY",
+  "QBOT_REWARD_EMAIL_FROM",
 ] as const;
 
 export class ConfigError extends Error {
@@ -195,6 +205,16 @@ export interface AppSettingsValues {
   moderationShadowMode: boolean;
   shadowReadUpstreamUrl: string | null;
   webReadOnly: boolean;
+  customerSignupEnabled: boolean;
+  stripePublishableKey: string | null;
+  stripeSecretKey: string | null;
+  stripeWebhookSecret: string | null;
+  stripePriceMonthly: string | null;
+  stripePriceAnnual: string | null;
+  stripeBackerCouponId: string | null;
+  stripePortalConfigurationId: string | null;
+  rewardEmailApiKey: string | null;
+  rewardEmailFrom: string | null;
 }
 
 const nullable = (env: Environment, key: string): string | null =>
@@ -247,6 +267,16 @@ export class AppSettings implements AppSettingsValues {
   readonly moderationShadowMode: AppSettingsValues["moderationShadowMode"];
   readonly shadowReadUpstreamUrl: AppSettingsValues["shadowReadUpstreamUrl"];
   readonly webReadOnly: AppSettingsValues["webReadOnly"];
+  readonly customerSignupEnabled: AppSettingsValues["customerSignupEnabled"];
+  readonly stripePublishableKey: AppSettingsValues["stripePublishableKey"];
+  readonly stripeSecretKey: AppSettingsValues["stripeSecretKey"];
+  readonly stripeWebhookSecret: AppSettingsValues["stripeWebhookSecret"];
+  readonly stripePriceMonthly: AppSettingsValues["stripePriceMonthly"];
+  readonly stripePriceAnnual: AppSettingsValues["stripePriceAnnual"];
+  readonly stripeBackerCouponId: string | null;
+  readonly stripePortalConfigurationId: string | null;
+  readonly rewardEmailApiKey: string | null;
+  readonly rewardEmailFrom: string | null;
 
   private constructor(values: AppSettingsValues) {
     this.databasePath = values.databasePath;
@@ -288,6 +318,16 @@ export class AppSettings implements AppSettingsValues {
     this.moderationShadowMode = values.moderationShadowMode;
     this.shadowReadUpstreamUrl = values.shadowReadUpstreamUrl;
     this.webReadOnly = values.webReadOnly;
+    this.customerSignupEnabled = values.customerSignupEnabled;
+    this.stripePublishableKey = values.stripePublishableKey;
+    this.stripeSecretKey = values.stripeSecretKey;
+    this.stripeWebhookSecret = values.stripeWebhookSecret;
+    this.stripePriceMonthly = values.stripePriceMonthly;
+    this.stripePriceAnnual = values.stripePriceAnnual;
+    this.stripeBackerCouponId = values.stripeBackerCouponId;
+    this.stripePortalConfigurationId = values.stripePortalConfigurationId;
+    this.rewardEmailApiKey = values.rewardEmailApiKey;
+    this.rewardEmailFrom = values.rewardEmailFrom;
     Object.freeze(this);
   }
 
@@ -442,12 +482,95 @@ export class AppSettings implements AppSettingsValues {
         "QBOT_SHADOW_READ_UPSTREAM_URL",
       ),
       webReadOnly: parseBoolean(envMap.QBOT_WEB_READ_ONLY),
+      customerSignupEnabled: parseBoolean(envMap.QBOT_CUSTOMER_SIGNUP_ENABLED),
+      stripePublishableKey: nullable(envMap, "STRIPE_PUBLISHABLE_KEY"),
+      stripeSecretKey: nullable(envMap, "STRIPE_SECRET_KEY"),
+      stripeWebhookSecret: nullable(envMap, "STRIPE_WEBHOOK_SECRET"),
+      stripePriceMonthly: nullable(envMap, "QBOT_STRIPE_PRICE_MONTHLY"),
+      stripePriceAnnual: nullable(envMap, "QBOT_STRIPE_PRICE_ANNUAL"),
+      stripeBackerCouponId: nullable(envMap, "QBOT_STRIPE_BACKER_COUPON_ID"),
+      stripePortalConfigurationId: nullable(
+        envMap,
+        "QBOT_STRIPE_PORTAL_CONFIGURATION_ID",
+      ),
+      rewardEmailApiKey: nullable(envMap, "QBOT_REWARD_EMAIL_API_KEY"),
+      rewardEmailFrom: nullable(envMap, "QBOT_REWARD_EMAIL_FROM"),
     };
     AppSettings.validate(values);
     return new AppSettings(values);
   }
 
   private static validate(settings: AppSettingsValues): void {
+    for (
+      const [name, value, pattern] of [
+        [
+          "STRIPE_PUBLISHABLE_KEY",
+          settings.stripePublishableKey,
+          /^pk_(test|live)_[A-Za-z0-9]+$/u,
+        ],
+        [
+          "STRIPE_SECRET_KEY",
+          settings.stripeSecretKey,
+          /^(sk|rk)_(test|live)_[A-Za-z0-9]+$/u,
+        ],
+        [
+          "STRIPE_WEBHOOK_SECRET",
+          settings.stripeWebhookSecret,
+          /^whsec_[A-Za-z0-9]+$/u,
+        ],
+        [
+          "QBOT_STRIPE_PRICE_MONTHLY",
+          settings.stripePriceMonthly,
+          /^price_[A-Za-z0-9]+$/u,
+        ],
+        [
+          "QBOT_STRIPE_PRICE_ANNUAL",
+          settings.stripePriceAnnual,
+          /^price_[A-Za-z0-9]+$/u,
+        ],
+        [
+          "QBOT_STRIPE_BACKER_COUPON_ID",
+          settings.stripeBackerCouponId,
+          /^[A-Za-z0-9_-]{1,100}$/u,
+        ],
+        [
+          "QBOT_STRIPE_PORTAL_CONFIGURATION_ID",
+          settings.stripePortalConfigurationId,
+          /^bpc_[A-Za-z0-9]+$/u,
+        ],
+        [
+          "QBOT_REWARD_EMAIL_API_KEY",
+          settings.rewardEmailApiKey,
+          /^re_[A-Za-z0-9_-]+$/u,
+        ],
+        [
+          "QBOT_REWARD_EMAIL_FROM",
+          settings.rewardEmailFrom,
+          /^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/u,
+        ],
+      ] as const
+    ) {
+      if (value !== null && !pattern.test(value)) {
+        throw new ConfigError(`${name} has an invalid format`);
+      }
+    }
+    if (
+      settings.stripePublishableKey && settings.stripeSecretKey &&
+      settings.stripePublishableKey.split("_")[1] !==
+        settings.stripeSecretKey.split("_")[1]
+    ) {
+      throw new ConfigError(
+        "STRIPE_PUBLISHABLE_KEY and STRIPE_SECRET_KEY must use the same test/live mode",
+      );
+    }
+    if (
+      settings.stripePriceMonthly &&
+      settings.stripePriceMonthly === settings.stripePriceAnnual
+    ) {
+      throw new ConfigError(
+        "QBOT_STRIPE_PRICE_MONTHLY and QBOT_STRIPE_PRICE_ANNUAL must be different prices",
+      );
+    }
     if (!/^[A-Za-z0-9_.@:-]+\.service$/u.test(settings.systemdServiceName)) {
       throw new ConfigError(
         "QBOT_SYSTEMD_SERVICE_NAME must be a valid .service unit name",
@@ -504,6 +627,29 @@ export class AppSettings implements AppSettingsValues {
       }
     }
     if (settings.enabledServices.includes("web")) {
+      if (
+        settings.stripeSecretKey || settings.stripeWebhookSecret ||
+        settings.stripePriceMonthly || settings.stripePriceAnnual
+      ) {
+        if (
+          !settings.stripeSecretKey || !settings.stripeWebhookSecret ||
+          !settings.stripePriceMonthly || !settings.stripePriceAnnual
+        ) {
+          throw new ConfigError(
+            "Stripe Checkout requires STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, QBOT_STRIPE_PRICE_MONTHLY and QBOT_STRIPE_PRICE_ANNUAL",
+          );
+        }
+        const redirect = settings.discordOauthRedirectUri;
+        if (
+          !redirect || !URL.canParse(redirect) ||
+          new URL(redirect).protocol !== "https:" ||
+          new URL(redirect).username || new URL(redirect).password
+        ) {
+          throw new ConfigError(
+            "Stripe Checkout requires an explicit HTTPS QBOT_DISCORD_OAUTH_REDIRECT_URI for return URLs",
+          );
+        }
+      }
       const required = new Map<string, unknown>([
         ["QBOT_DASHBOARD_SESSION_SECRET", settings.dashboardSessionSecret],
         ["QBOT_DISCORD_OAUTH_CLIENT_ID", settings.discordOauthClientId],
@@ -521,7 +667,21 @@ export class AppSettings implements AppSettingsValues {
           `Missing web configuration: ${missing.join(", ")}`,
         );
       }
-      if (!settings.operatorGuildIds.length) {
+      if (settings.customerSignupEnabled) {
+        const redirect = settings.discordOauthRedirectUri;
+        if (
+          !redirect || !URL.canParse(redirect) ||
+          new URL(redirect).protocol !== "https:" ||
+          new URL(redirect).username || new URL(redirect).password
+        ) {
+          throw new ConfigError(
+            "Customer signup requires an explicit HTTPS QBOT_DISCORD_OAUTH_REDIRECT_URI",
+          );
+        }
+      }
+      if (
+        !settings.operatorGuildIds.length && !settings.customerSignupEnabled
+      ) {
         throw new ConfigError(
           "QBOT_OPERATOR_GUILD_IDS is required when web service is enabled",
         );
@@ -592,6 +752,20 @@ export class AppSettings implements AppSettingsValues {
       ),
       shadow_read_enabled: this.shadowReadUpstreamUrl !== null,
       web_read_only: this.webReadOnly,
+      customer_signup_enabled: this.customerSignupEnabled,
+      stripe_api_configured: Boolean(this.stripeSecretKey),
+      stripe_publishable_key_configured: Boolean(this.stripePublishableKey),
+      stripe_webhook_configured: Boolean(this.stripeWebhookSecret),
+      stripe_prices_configured: Boolean(
+        this.stripePriceMonthly && this.stripePriceAnnual,
+      ),
+      stripe_mode: this.stripeSecretKey?.split("_")[1] ?? null,
+      stripe_backer_coupon_configured: Boolean(this.stripeBackerCouponId),
+      stripe_portal_configured: Boolean(this.stripePortalConfigurationId),
+      reward_email_configured: Boolean(
+        this.rewardEmailApiKey && this.rewardEmailFrom &&
+          this.credentialEncryptionKey,
+      ),
       twitch_configured: Boolean(this.twitchBotToken),
       twitch_refresh_configured: Boolean(
         this.twitchRefreshToken && this.twitchClientId &&

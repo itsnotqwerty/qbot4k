@@ -49,6 +49,7 @@ export class PostgresAnnouncementDispatcher
                 AND lease.lease_holder IS NOT NULL
                 AND lease.lease_expires_at::timestamptz>CURRENT_TIMESTAMP)
           WHERE a.status='scheduled'
+            AND qbot_community_has_access(a.community_id)
             AND a.scheduled_at::timestamptz<=$1::timestamptz
             AND (SELECT COUNT(*) FROM community_announcement_deliveries d
                   WHERE d.announcement_id=a.id)<3
@@ -88,7 +89,7 @@ export class PostgresAnnouncementDispatcher
       const announcementId = positiveInteger(row.id, "announcement_id");
       const updated = await connection.query(
         `UPDATE community_announcements SET status='sending',updated_at=CURRENT_TIMESTAMP
-          WHERE id=$1 AND status='scheduled' RETURNING id`,
+          WHERE id=$1 AND status='scheduled' AND qbot_community_has_access(community_id) RETURNING id`,
         [announcementId],
       );
       if (!updated[0]) return null;

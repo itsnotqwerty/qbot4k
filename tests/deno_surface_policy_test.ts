@@ -49,6 +49,30 @@ Deno.test("surface guards reject mismatches", () => {
 });
 
 Deno.test("dashboard and provider policies preserve classifications", () => {
+  assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_billing_checkout"), {
+    capability: "billing.manage",
+    guard: "organization_billing_session",
+    scope: "organization",
+    kind: "http",
+  });
+  assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_stripe_webhook"), {
+    capability: "billing.events.ingest",
+    guard: "stripe_signature",
+    scope: "global",
+    kind: "http",
+  });
+  assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_account"), {
+    capability: "account.access",
+    guard: "account_session",
+    scope: "account",
+    kind: "http",
+  });
+  assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_dashboard_restart"), {
+    capability: "platform.manage",
+    guard: "platform_session",
+    scope: "global",
+    kind: "http",
+  });
   assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_public_home"), {
     capability: "public.access",
     guard: "public",

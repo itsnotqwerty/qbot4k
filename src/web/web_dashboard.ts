@@ -63,8 +63,8 @@ export class WebDashboardController {
   }
 
   async restart(request: Request): Promise<Response> {
-    const session = await this.authorizeCapability(request, "operators.manage");
-    if (session instanceof Response) return session;
+    const session = await this.auth.platformSession(request);
+    if (!session) return Response.json({ error: "forbidden" }, { status: 403 });
     if (!this.validOrigin(request)) {
       return Response.json({ error: "origin_mismatch" }, { status: 403 });
     }
@@ -79,8 +79,8 @@ export class WebDashboardController {
   }
 
   async resetDatabase(request: Request): Promise<Response> {
-    const session = await this.authorizeCapability(request, "operators.manage");
-    if (session instanceof Response) return session;
+    const session = await this.auth.platformSession(request);
+    if (!session) return Response.json({ error: "forbidden" }, { status: 403 });
     if (!this.validOrigin(request)) {
       return Response.json({ error: "origin_mismatch" }, { status: 403 });
     }

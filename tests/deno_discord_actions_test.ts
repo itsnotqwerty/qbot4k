@@ -33,6 +33,9 @@ class FakeConnection implements DatabaseConnection {
 
 class FakeApi implements DiscordApi {
   readonly calls: Array<{ operation: string; values: unknown[] }> = [];
+  getChannel() {
+    return Promise.resolve(null);
+  }
   sendMessage(channelId: string, payload: Readonly<Record<string, unknown>>) {
     this.calls.push({ operation: "send", values: [channelId, payload] });
     return Promise.resolve({ id: "sent-1" });
@@ -99,6 +102,35 @@ Deno.test("Discord API honors rate-limit retry metadata", async () => {
   assertEquals(requests.length, 2);
   assertEquals(requests[0].headers.get("Authorization"), "Bot secret");
   assertEquals(delays, [250]);
+});
+
+Deno.test("expired organization access prevents Discord sends and moderation", async () => {
+  const api = new FakeApi();
+  const repository = new PostgresDiscordActionRepository(
+    new FakeConnection([[{
+      paid_access: false,
+      capabilities_json: '["announcements"]',
+    }], [{ paid_access: false }]]),
+    api,
+  );
+  await assertRejects(
+    () =>
+      repository.sendMessage(
+        job(DISCORD_MESSAGE_JOB_TYPE, {
+          channel_id: "channel",
+          rendered_reply: { content: "test" },
+        }),
+      ),
+    Error,
+    "Organization access expired",
+  );
+  await assertRejects(
+    () =>
+      repository.moderate(job(DISCORD_MODERATION_JOB_TYPE, { message_id: 12 })),
+    Error,
+    "Organization access expired",
+  );
+  assertEquals(api.calls, []);
 });
 
 Deno.test("Discord API classifies revoked tokens as permanent", async () => {

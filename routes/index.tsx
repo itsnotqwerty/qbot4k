@@ -1,8 +1,15 @@
 import { AppShell } from "@/components/AppShell.tsx";
 import { RuntimePanel } from "@/components/RuntimePanel.tsx";
 import DemoCollage from "@/islands/DemoCollage.tsx";
+import { BILLING_CATALOG } from "@/src/domain/billing.ts";
 
 export default function Home() {
+  const currency = new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: BILLING_CATALOG.currency,
+  });
+  const { monthly, annual } = BILLING_CATALOG.subscriptions;
+  const annualSavings = monthly.amountCents * 12 - annual.amountCents;
   return (
     <AppShell>
       <section class="hero">
@@ -24,6 +31,45 @@ export default function Home() {
           <a class="button" href="/login">Link Discord</a>
           <a class="text-link" href="/login">Operator login</a>
         </div>
+      </section>
+      <section class="pricing" aria-labelledby="pricing-title">
+        <div class="pricing-heading">
+          <div>
+            <h2 id="pricing-title">Stripe pricing</h2>
+            <p>
+              USD per organization. Includes {BILLING_CATALOG.communityLimit}
+              {" "}
+              community, with {BILLING_CATALOG.installationLimits.twitch}{" "}
+              Twitch channel and up to{" "}
+              {BILLING_CATALOG.installationLimits.discord} Discord servers.
+            </p>
+          </div>
+          <a class="button" href="/billing">View billing</a>
+        </div>
+        <div class="pricing-grid">
+          <article>
+            <h3>Monthly</h3>
+            <p class="pricing-amount">
+              <strong>{currency.format(monthly.amountCents / 100)}</strong>
+              <span>/ month</span>
+            </p>
+            <p>Billed monthly.</p>
+          </article>
+          <article>
+            <h3>Annual</h3>
+            <p class="pricing-amount">
+              <strong>{currency.format(annual.amountCents / 100)}</strong>
+              <span>/ year</span>
+            </p>
+            <p>
+              Billed annually. Save {currency.format(annualSavings / 100)}{" "}
+              a year compared with monthly billing.
+            </p>
+          </article>
+        </div>
+        <p class="pricing-terms">
+          Subscriptions renew automatically until canceled.
+        </p>
       </section>
       <section class="capability-grid" aria-label="Platform capabilities">
         <article>

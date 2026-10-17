@@ -5,6 +5,14 @@ export interface ScopeRule {
 }
 
 const GLOBAL_TABLES = [
+  "backer_campaigns",
+  "backer_imports",
+  "backer_records",
+  "backer_audit",
+  "backer_claim_attempts",
+  "platform_billing_policy",
+  "stripe_event_inbox",
+  "platform_staff_roles",
   "audit_log",
   "cohort_anomalies",
   "cohort_baselines",
@@ -39,7 +47,6 @@ const GLOBAL_TABLES = [
   "server_boost_requests",
   "service_reliability_buckets",
   "signal_calculation_runs",
-  "simple_command_definitions",
   "social_score_components",
   "social_score_runs",
   "stream_states",
@@ -49,6 +56,10 @@ const GLOBAL_TABLES = [
 ] as const;
 
 const ORGANIZATION_TABLES = {
+  organization_stripe_billing: ["organization_id", "organizations"],
+  organization_operator_roles: ["organization_id", "organizations"],
+  organization_access_grants: ["organization_id", "organizations"],
+  organization_billing_audit: ["organization_id", "organizations"],
   api_clients: ["community_id", "communities"],
   api_request_usage: ["api_client_id", "api_clients"],
   communities: ["workspace_id", "workspaces"],
@@ -56,6 +67,7 @@ const ORGANIZATION_TABLES = {
 } as const;
 
 const COMMUNITY_TABLES = {
+  simple_command_definitions: ["community_id", "communities"],
   audience_edges: ["community_id", "communities"],
   data_subject_requests: ["community_id", "communities"],
   case_activity: ["case_id", "investigation_cases"],

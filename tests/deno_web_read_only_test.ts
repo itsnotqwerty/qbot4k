@@ -23,6 +23,10 @@ Deno.test("read-only web mode blocks writes before controllers run", async () =>
     assertEquals(response.status, 503);
     assertEquals(response.headers.get("cache-control"), "no-store");
   }
+  assertEquals(
+    (await handler(request("POST", "/account/organizations"))).status,
+    503,
+  );
   assertEquals(calls, 0);
 });
 

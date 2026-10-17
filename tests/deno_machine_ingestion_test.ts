@@ -17,6 +17,27 @@ import {
 
 const secret = "eventsub-test-secret";
 
+Deno.test("unpaid API clients are denied before usage or ingestion writes", async () => {
+  const connection = new FakeConnection([[{
+    id: 1,
+    scopes_json: '["events.write"]',
+    rate_limit_per_minute: 100,
+    paid_access: false,
+  }]]);
+  assertEquals(
+    await new PostgresMachineIngestionRepository(connection).authorizeApiClient(
+      "fixture",
+      4,
+    ),
+    false,
+  );
+  assertEquals(connection.calls.length, 1);
+  assertEquals(
+    connection.calls[0].sql.includes("qbot_community_has_access(community_id)"),
+    true,
+  );
+});
+
 class FakeConnection implements DatabaseConnection {
   readonly calls: Array<{
     sql: string;

@@ -128,23 +128,21 @@ Deno.test("operator community switching binds membership and audit scope atomica
   );
 });
 
-Deno.test("operator login casts legacy invitation expiry timestamps", async () => {
+Deno.test("operator login requires explicit membership and casts invitation expiry", async () => {
   const connection = new FakeConnection();
   connection.rowQueue = [
-    [],
     [{ id: 42, status: "active", session_version: 1 }],
     [],
     [],
     [],
     [],
     [],
-    [],
     [{ status: "active", session_version: 1 }],
-    [{ id: 1, name: "Default", slug: "default", role: "owner" }],
+    [],
   ];
   const repository = new OperatorAuthRepository(connection);
 
-  await repository.completeLogin({
+  const login = await repository.completeLogin({
     userId: "9001",
     username: "Operator",
     guildIds: ["guild-1"],
@@ -153,6 +151,13 @@ Deno.test("operator login casts legacy invitation expiry timestamps", async () =
     ownedGuildIds: [],
   }, "admin");
 
+  assertEquals(login.memberships, []);
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("INSERT INTO operator_community_roles")
+    ),
+    false,
+  );
   const invitationQueries = connection.queries.filter((query) =>
     query.sql.includes("operator_invitations")
   );
@@ -162,6 +167,36 @@ Deno.test("operator login casts legacy invitation expiry timestamps", async () =
       query.sql.includes("expires_at::timestamptz")
     ),
     true,
+  );
+});
+
+Deno.test("login cannot reactivate a disabled account through pending invitations", async () => {
+  const connection = new FakeConnection();
+  connection.rowQueue = [
+    [{ id: 42, status: "disabled", session_version: 3 }],
+    [{ status: "disabled", session_version: 3 }],
+    [],
+  ];
+  const login = await new OperatorAuthRepository(connection).completeLogin({
+    userId: "9001",
+    username: "Disabled",
+    guildIds: [],
+    permissions: {},
+    guildNames: {},
+    ownedGuildIds: [],
+  }, "viewer");
+  assertEquals(login.status, "disabled");
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("operator_invitations")
+    ),
+    false,
+  );
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("SET status = 'active'")
+    ),
+    false,
   );
 });
 

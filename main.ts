@@ -3,6 +3,10 @@ import Home from "./routes/index.tsx";
 import AppWrapper from "./routes/_app.tsx";
 import { healthResponse, type RoleHealthMonitor } from "./src/core/health.ts";
 import type { WebAuthController } from "./src/web/web_auth.ts";
+import type { WebAccountsController } from "./src/web/web_accounts.ts";
+import type { WebBillingController } from "./src/web/web_billing.ts";
+import type { WebAdminController } from "./src/web/web_admin.ts";
+import type { WebRewardsController } from "./src/web/web_rewards.ts";
 import {
   legalPage,
   type LegalSettings,
@@ -134,6 +138,10 @@ export function createApp(
   machineIngestion?: MachineIngestionController,
   intelligence?: WebIntelligenceController,
   statusStore?: import("./src/core/health.ts").StatusStore,
+  accounts?: WebAccountsController,
+  billing?: WebBillingController,
+  admin?: WebAdminController,
+  rewards?: WebRewardsController,
 ): App<unknown> {
   const stylesheet = () =>
     Deno.readTextFile("static/styles.css").then((css) =>
@@ -185,6 +193,41 @@ export function createApp(
         "/community/switch",
         (context) => auth.switchCommunity(context.req),
       );
+  }
+  if (accounts) {
+    app
+      .get("/account", (context) => accounts.page(context.req))
+      .post(
+        "/account/organizations",
+        (context) => accounts.create(context.req),
+      );
+  }
+  if (billing) {
+    app.get("/billing", (context) => billing.page(context.req))
+      .post("/billing/checkout", (context) => billing.checkout(context.req))
+      .post("/billing/portal", (context) => billing.checkout(context.req, true))
+      .post("/webhooks/stripe", (context) => billing.webhook(context.req));
+  }
+  if (admin) app.get("/admin", (context) => admin.page(context.req));
+  if (rewards) {
+    app.get(
+      "/admin/rewards/export.csv",
+      (context) => rewards.export(context.req),
+    );
+    app.get("/billing/rewards", (context) => rewards.page(context.req))
+      .post(
+        "/billing/rewards/claim",
+        (context) => rewards.action(context.req, "claim"),
+      )
+      .get("/admin/rewards", (context) => rewards.page(context.req, true));
+    for (
+      const action of ["campaign", "activate", "preview", "confirm", "recovery"]
+    ) {
+      app.post(
+        `/admin/rewards/${action}`,
+        (context) => rewards.action(context.req, action),
+      );
+    }
   }
   if (dashboard) {
     app

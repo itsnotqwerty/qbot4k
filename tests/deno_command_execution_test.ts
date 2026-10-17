@@ -72,7 +72,85 @@ Deno.test("moderator addcom persists custom command before queueing response", a
   const upsert = connection.queries.find((query) =>
     query.sql.includes("INSERT INTO simple_command_definitions")
   )!;
-  assertEquals(upsert.parameters, ["docs", "Read the docs"]);
+  assertEquals(upsert.parameters, [7, "docs", "Read the docs"]);
+});
+
+Deno.test("Discord organization owner can manage commands without a moderator role", async () => {
+  const connection = new FakeConnection([], (sql) => {
+    if (sql.includes("organization_operator_roles")) return [{ allowed: true }];
+    return [];
+  });
+  await new PostgresCommandExecutionRepository(connection).execute({
+    ...message,
+    isModerator: false,
+    contentRaw: "!addcom docs Owner response",
+  });
+  assertEquals(
+    connection.queries.some((query) =>
+      query.sql.includes("INSERT INTO simple_command_definitions")
+    ),
+    true,
+  );
+  const permission = connection.queries.find((query) =>
+    query.sql.includes("organization_operator_roles")
+  )!;
+  assertEquals(permission.parameters, [44, 7]);
+});
+
+Deno.test("Discord owner edit scopes the lookup and write to the message community", async () => {
+  const connection = new FakeConnection([], (sql) => {
+    if (sql.includes("organization_operator_roles")) return [{ allowed: true }];
+    if (sql.includes("FROM simple_command_definitions")) {
+      return [{ response_template: "Old" }];
+    }
+    return [];
+  });
+  await new PostgresCommandExecutionRepository(connection).execute({
+    ...message,
+    isModerator: false,
+    contentRaw: "!editcom docs New",
+  });
+  const lookup = connection.queries.find((query) =>
+    query.sql.includes("FROM simple_command_definitions")
+  )!;
+  assertEquals(lookup.parameters, [7, "docs"]);
+  assertEquals(lookup.sql.includes("community_id=$1"), true);
+  const update = connection.queries.find((query) =>
+    query.sql.includes("INSERT INTO simple_command_definitions")
+  )!;
+  assertEquals(update.parameters, [7, "docs", "New"]);
+});
+
+Deno.test("unrecognized Discord senders cannot manage commands using an owner username", async () => {
+  for (
+    const command of [
+      "!addcom docs New",
+      "!editcom docs New",
+      "!delcom docs",
+      "!alias d docs",
+    ]
+  ) {
+    const connection = new FakeConnection();
+    await new PostgresCommandExecutionRepository(connection).execute({
+      ...message,
+      username: "owner",
+      isModerator: false,
+      contentRaw: command,
+    });
+    assertEquals(
+      connection.queries.some((query) =>
+        query.sql.includes("simple_command_definitions")
+      ),
+      false,
+    );
+    const payload = JSON.parse(
+      String(connection.queries.at(-1)!.parameters[3]),
+    );
+    assertEquals(
+      payload.rendered_reply.embeds[0].description,
+      "Command management requires owner or moderator access.",
+    );
+  }
 });
 
 Deno.test("commands excluded from normalization resolve nothing", async () => {
@@ -99,7 +177,7 @@ Deno.test("moderator alias creates a pointer to an existing command", async () =
   const upsert = connection.queries.find((query) =>
     query.sql.includes("INSERT INTO simple_command_definitions")
   )!;
-  assertEquals(upsert.parameters, ["d", "alias:docs"]);
+  assertEquals(upsert.parameters, [7, "d", "alias:docs"]);
   const payload = JSON.parse(String(connection.queries.at(-1)!.parameters[3]));
   assertEquals(
     payload.rendered_reply.embeds[0].description.includes(

@@ -114,8 +114,13 @@ class FakeQueries implements DashboardQueryService {
   }
 }
 
-async function fixture(role = "viewer", operations?: DashboardOperations) {
+async function fixture(
+  role = "viewer",
+  operations?: DashboardOperations,
+  platformAdmin = false,
+) {
   const store: OperatorAuthStore = {
+    isPlatformAdmin: () => Promise.resolve(platformAdmin),
     completeLogin: () => Promise.reject(new Error("not used")),
     switchCommunity: () => Promise.resolve(null),
     auditLogout: () => Promise.resolve(),
@@ -170,7 +175,7 @@ Deno.test("legacy dashboard operations preserve admin redirects and confirmation
       return Promise.resolve({ rowsDeleted: 9 });
     },
   };
-  const { handler, headers } = await fixture("admin", operations);
+  const { handler, headers } = await fixture("admin", operations, true);
   const post = (path: string, body?: URLSearchParams) =>
     handler(
       new Request(`http://localhost${path}`, {
@@ -219,7 +224,7 @@ Deno.test("legacy dashboard operations reject denied roles and cross-origin requ
   );
   assertEquals(denied.status, 403);
 
-  const admin = await fixture("admin", operations);
+  const admin = await fixture("admin", operations, true);
   const crossOrigin = await admin.handler(
     new Request("http://localhost/dashboard/restart", {
       method: "POST",
@@ -228,6 +233,32 @@ Deno.test("legacy dashboard operations reject denied roles and cross-origin requ
   );
   assertEquals(crossOrigin.status, 403);
   assertEquals(await crossOrigin.json(), { error: "origin_mismatch" });
+});
+
+Deno.test("community owners cannot restart the service or reset shared data", async () => {
+  const calls: string[] = [];
+  const { handler, headers } = await fixture("owner", {
+    goLive: () => Promise.resolve(0),
+    restart: () => {
+      calls.push("restart");
+      return Promise.resolve("service");
+    },
+    resetDatabase: () => {
+      calls.push("reset");
+      return Promise.resolve({ rowsDeleted: 1 });
+    },
+  });
+  for (const endpoint of ["restart", "reset-database"]) {
+    const response = await handler(
+      new Request(`http://localhost/dashboard/${endpoint}`, {
+        method: "POST",
+        headers: { ...headers, origin: "http://localhost" },
+        body: new URLSearchParams({ confirmation: "RESET" }),
+      }),
+    );
+    assertEquals(response.status, 403);
+  }
+  assertEquals(calls, []);
 });
 
 Deno.test("DF3 dashboard HTML routes share tenant-scoped query services", async () => {

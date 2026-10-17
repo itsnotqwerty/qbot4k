@@ -8,9 +8,15 @@ workflows.
 
 ## Open Beta
 
-There is a free and open beta of QBot4K hosted at [qbot4k.dev](https://qbot4k.dev).
-The service will only be free as long as the beta is ongoing. As the service becomes
-more mature, a price will be set on monthly usage.
+There is a free and open beta of QBot4K hosted at
+[qbot4k.dev](https://qbot4k.dev). The service will only be free as long as the
+beta is ongoing. Planned paid access is $9.99/month or $99.99/year in USD per
+organization, initially covering one community. Hosted Stripe Checkout and
+signed-webhook processing are implemented; live rollout still requires sandbox
+acceptance testing and the remaining launch gates. Existing beta accounts are
+not subscribed automatically. See the
+[crowdfunding implementation status](docs/crowdfunding-readiness.md) for setup,
+approved Kickstarter rewards and remaining launch work.
 
 ## Current scope
 

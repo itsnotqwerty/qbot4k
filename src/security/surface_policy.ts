@@ -1,4 +1,9 @@
-export type SurfaceScope = "global" | "community" | "installation";
+export type SurfaceScope =
+  | "global"
+  | "account"
+  | "organization"
+  | "community"
+  | "installation";
 export type SurfaceKind =
   | "http"
   | "export"
@@ -16,6 +21,17 @@ export interface SurfacePolicy {
 }
 
 const dashboardHandlers = [
+  "_serve_rewards",
+  "_serve_reward_claim",
+  "_serve_backer_admin",
+  "_serve_backer_mutation",
+  "_serve_billing_portal",
+  "_serve_platform_admin",
+  "_serve_billing",
+  "_serve_billing_checkout",
+  "_serve_stripe_webhook",
+  "_serve_account",
+  "_serve_account_organization_create",
   "_serve_analytics",
   "_serve_analytics_export",
   "_serve_announcement_approve",
@@ -206,6 +222,23 @@ const liveControlHandlers = new Set([
 ]);
 
 function dashboardCapability(handler: string): string {
+  if (handler.startsWith("_serve_backer_")) return "staff.manage";
+  if (handler === "_serve_rewards" || handler === "_serve_reward_claim") {
+    return "billing.manage";
+  }
+  if (handler === "_serve_billing_portal") return "billing.manage";
+  if (handler === "_serve_platform_admin") return "staff.manage";
+  if (handler === "_serve_billing") return "billing.read";
+  if (handler === "_serve_billing_checkout") return "billing.manage";
+  if (handler === "_serve_stripe_webhook") return "billing.events.ingest";
+  if (
+    handler === "_serve_account" ||
+    handler === "_serve_account_organization_create"
+  ) return "account.access";
+  if (
+    handler === "_serve_dashboard_restart" ||
+    handler === "_serve_dashboard_reset_database"
+  ) return "platform.manage";
   if (publicHandlers.has(handler)) return "public.access";
   if (handler === "_serve_twitch_eventsub") return "events.ingest";
   if (ingestHandlers.has(handler)) return "events.write";
@@ -244,6 +277,26 @@ function dashboardCapability(handler: string): string {
 }
 
 function dashboardGuard(handler: string): string {
+  if (handler.startsWith("_serve_backer_")) return "platform_session";
+  if (handler === "_serve_rewards" || handler === "_serve_reward_claim") {
+    return "account_session";
+  }
+  if (handler === "_serve_billing_portal") {
+    return "organization_billing_session";
+  }
+  if (handler === "_serve_platform_admin") return "platform_session";
+  if (handler === "_serve_billing" || handler === "_serve_billing_checkout") {
+    return "organization_billing_session";
+  }
+  if (handler === "_serve_stripe_webhook") return "stripe_signature";
+  if (
+    handler === "_serve_account" ||
+    handler === "_serve_account_organization_create"
+  ) return "account_session";
+  if (
+    handler === "_serve_dashboard_restart" ||
+    handler === "_serve_dashboard_reset_database"
+  ) return "platform_session";
   if (publicHandlers.has(handler)) return "public";
   if (handler === "_serve_twitch_eventsub") return "webhook_signature";
   if (ingestHandlers.has(handler)) return "api_client_or_session";
@@ -258,7 +311,14 @@ export const DASHBOARD_SURFACE_POLICIES: ReadonlyMap<string, SurfacePolicy> =
       Object.freeze({
         capability: dashboardCapability(handler),
         guard: dashboardGuard(handler),
-        scope: publicHandlers.has(handler)
+        scope: dashboardGuard(handler) === "organization_billing_session"
+          ? "organization"
+          : handler === "_serve_stripe_webhook"
+          ? "global"
+          : dashboardGuard(handler) === "account_session"
+          ? "account"
+          : dashboardGuard(handler) === "platform_session" ||
+              publicHandlers.has(handler)
           ? "global"
           : handler === "_serve_twitch_eventsub"
           ? "installation"

@@ -26,6 +26,7 @@ export interface EnqueueProcessingJob {
 }
 
 export interface ProcessingJobStore {
+  deferUnpaid?(jobId: number, workerId: string): Promise<boolean>;
   enqueue(input: EnqueueProcessingJob): Promise<number | null>;
   claim(
     stage: ProcessingStage,
@@ -51,6 +52,19 @@ export interface ProcessingJobStore {
 
 export class PostgresProcessingJobRepository implements ProcessingJobStore {
   constructor(private readonly connection: DatabaseConnection) {}
+
+  async deferUnpaid(jobId: number, workerId: string): Promise<boolean> {
+    const rows = await this.connection.query(
+      `UPDATE processing_jobs SET status='pending',attempts=GREATEST(attempts-1,0),
+          claimed_at=NULL,claimed_by=NULL,lease_expires_at=NULL,
+          available_at=CURRENT_TIMESTAMP,last_error='Organization access expired',
+          updated_at=CURRENT_TIMESTAMP
+        WHERE id=$1 AND status='running' AND claimed_by=$2
+          AND NOT qbot_community_has_access(community_id) RETURNING id`,
+      [jobId, workerId],
+    );
+    return rows.length > 0;
+  }
 
   async enqueue(input: EnqueueProcessingJob): Promise<number | null> {
     const jobType = input.jobType.trim();
@@ -131,6 +145,7 @@ export class PostgresProcessingJobRepository implements ProcessingJobStore {
            SELECT DISTINCT community_id
              FROM processing_jobs
             WHERE stage=$1 AND community_id IS NOT NULL
+              AND qbot_community_has_access(community_id)
               AND ($3::text[] IS NULL OR job_type = ANY($3::text[]))
               AND EXISTS (
                 SELECT 1 FROM processing_job_ownership AS ownership
@@ -477,6 +492,7 @@ export class ProcessingWorker {
       this.registry.jobTypes(),
     );
     if (!job) return false;
+    if (await this.store.deferUnpaid?.(job.id, this.workerId)) return true;
     const leaseController = new AbortController();
     let leaseFailure: unknown;
     const renewal = this.maintainLease(job.id, leaseController.signal).catch(
@@ -492,6 +508,9 @@ export class ProcessingWorker {
       await renewal;
     }
     if (leaseFailure) throw leaseFailure;
+    if (
+      dispatchError && await this.store.deferUnpaid?.(job.id, this.workerId)
+    ) return true;
     if (!dispatchError) {
       await this.store.complete(job.id, this.workerId);
       return true;

@@ -33,6 +33,7 @@ export interface OperatorLogin {
 }
 
 export interface OperatorAuthStore {
+  isPlatformAdmin?(operatorId: number): Promise<boolean>;
   completeLogin(
     identity: DiscordIdentity,
     role: string,
@@ -56,14 +57,16 @@ export interface DiscordOAuthProvider {
   authenticate(code: string, redirectUri: string): Promise<DiscordIdentity>;
 }
 
-type AuthSettings = Pick<
-  AppSettings,
-  | "dashboardSessionSecret"
-  | "discordOauthClientId"
-  | "discordOauthClientSecret"
-  | "discordOauthRedirectUri"
-  | "operatorGuildIds"
->;
+type AuthSettings =
+  & Pick<
+    AppSettings,
+    | "dashboardSessionSecret"
+    | "discordOauthClientId"
+    | "discordOauthClientSecret"
+    | "discordOauthRedirectUri"
+    | "operatorGuildIds"
+  >
+  & { readonly customerSignupEnabled?: boolean };
 
 const text = (body: string, status: number): Response =>
   new Response(body, {
@@ -176,7 +179,7 @@ export class WebAuthController {
     const cookieState = cookieValue(request, "qbot4k_oauth_state") ?? "";
     if (
       !state ||
-      (state !== cookieState && !await verifyOauthState(secret, state))
+      (state !== cookieState || !await verifyOauthState(secret, state))
     ) {
       return text("Invalid OAuth state", 400);
     }
@@ -196,10 +199,10 @@ export class WebAuthController {
         identity,
         this.settings.operatorGuildIds,
       );
-      if (!role) {
+      if (!role && !this.settings.customerSignupEnabled) {
         return text("You are not authorized to access the dashboard", 403);
       }
-      const login = await this.store.completeLogin(identity, role);
+      const login = await this.store.completeLogin(identity, role ?? "viewer");
       if (login.status !== "active") {
         return text("Operator access is disabled", 403);
       }
@@ -207,14 +210,14 @@ export class WebAuthController {
       const session: DashboardSession = {
         userId: String(login.operatorId),
         username: identity.username,
-        role: active?.role ?? role,
+        role: active?.role ?? "viewer",
         expiresAt: new Date(this.now().valueOf() + 12 * 60 * 60_000)
           .toISOString(),
         communityId: active?.id ?? null,
         sessionVersion: login.sessionVersion,
       };
       const secure = isSecure(request, this.settings.discordOauthRedirectUri);
-      return redirect("/dashboard", [
+      return redirect(active ? "/dashboard" : "/account", [
         sessionCookie(await createSessionCookie(secret, session), secure),
         clearedCookie("qbot4k_oauth_state", secure),
       ]);
@@ -288,7 +291,7 @@ export class WebAuthController {
     if (!this.validOrigin(request)) {
       return Response.json({ error: "origin_mismatch" }, { status: 403 });
     }
-    const session = await this.readSession(request);
+    const session = await this.accountSession(request);
     if (!session || !/^\d+$/u.test(session.userId)) return redirect("/login");
     const form = await request.formData();
     const communityId = Number(form.get("community_id"));
@@ -322,6 +325,20 @@ export class WebAuthController {
   }
 
   async authorizedSession(
+    request: Request,
+  ): Promise<DashboardSession | null> {
+    const session = await this.accountSession(request);
+    return session?.communityId !== null ? session : null;
+  }
+
+  async platformSession(request: Request): Promise<DashboardSession | null> {
+    const session = await this.accountSession(request);
+    return session && await this.store.isPlatformAdmin?.(Number(session.userId))
+      ? session
+      : null;
+  }
+
+  async accountSession(
     request: Request,
   ): Promise<DashboardSession | null> {
     const session = await this.readSession(request);

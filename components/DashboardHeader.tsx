@@ -15,6 +15,7 @@ const workspaceLinks = [
   ["Announcements", "/announcements"],
   ["Audit", "/audit"],
   ["Settings", "/settings"],
+  ["Billing", "/billing"],
 ] as const;
 
 const accentSwatches = [
@@ -29,7 +30,12 @@ const accentSwatches = [
   ["Sage", "sage"],
 ] as const;
 
-export function DashboardHeader({ active }: { readonly active: string }) {
+export function DashboardHeader(
+  { active, platformAdmin = false }: {
+    readonly active: string;
+    readonly platformAdmin?: boolean;
+  },
+) {
   return (
     <header class="site-header dashboard-header">
       <a class="brand" href="/dashboard">QBot4K</a>
@@ -72,6 +78,14 @@ export function DashboardHeader({ active }: { readonly active: string }) {
                 {label}
               </a>
             ))}
+            {platformAdmin && (
+              <a
+                href="/admin"
+                aria-current={active === "/admin" ? "page" : undefined}
+              >
+                Platform admin
+              </a>
+            )}
           </div>
         </details>
       </nav>

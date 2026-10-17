@@ -111,7 +111,7 @@ export class PostgresTwitchActionRepository {
         `SELECT action.id,action.action_type,action.reason,
                 action.duration_seconds,account.platform_user_id,
                 installation.external_community_id,
-                installation.capabilities_json
+                installation.capabilities_json,qbot_community_has_access(action.community_id) AS paid_access
            FROM moderation_actions AS action
            JOIN messages AS message
              ON message.id=action.message_id
@@ -133,6 +133,9 @@ export class PostgresTwitchActionRepository {
         [job.communityId, messageId],
       );
       for (const action of actions) {
+        if (action.paid_access === false) {
+          throw new Error("Organization access expired");
+        }
         const actionId = positiveInteger(action.id, "action_id");
         if (
           !stringArray(action.capabilities_json).includes("moderation_actions")

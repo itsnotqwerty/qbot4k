@@ -331,10 +331,6 @@ export class OperatorAuthRepository implements OperatorAuthStore {
     role: string,
   ): Promise<OperatorLogin> {
     return await this.connection.transaction(async (connection) => {
-      const existing = await connection.query(
-        "SELECT id FROM operator_accounts WHERE discord_user_id = $1",
-        [identity.userId],
-      );
       const accounts = await connection.query(
         `INSERT INTO operator_accounts(discord_user_id, discord_username, role)
          VALUES ($1, $2, $3)
@@ -350,18 +346,8 @@ export class OperatorAuthRepository implements OperatorAuthStore {
         throw new TypeError("Failed to resolve operator account after upsert");
       }
       const operatorId = integer(account, "id");
-      if (!existing[0]) {
-        await connection.query(
-          `INSERT INTO operator_community_roles(operator_id, community_id, role)
-           VALUES ($1, 1, $2)
-           ON CONFLICT(operator_id, community_id) DO UPDATE SET role = EXCLUDED.role`,
-          [
-            operatorId,
-            role.toLocaleLowerCase() === "admin"
-              ? "owner"
-              : role.toLocaleLowerCase(),
-          ],
-        );
+      if (account.status !== "active") {
+        return await this.loginState(connection, operatorId);
       }
 
       await connection.query(

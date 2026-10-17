@@ -66,9 +66,12 @@ export async function consumeTenantQuota(
   const increment = Math.trunc(amount);
   if (increment < 1) throw new TypeError("quota amount must be positive");
   const policy = (await connection.query(
-    "SELECT limit_count,window_seconds FROM tenant_quota_policies WHERE community_id=$1 AND quota_type=$2",
+    "SELECT policy.limit_count,policy.window_seconds,qbot_community_has_access($1) AS paid_access FROM (SELECT 1) singleton LEFT JOIN tenant_quota_policies policy ON policy.community_id=$1 AND policy.quota_type=$2",
     [communityId, quotaType],
   ))[0];
+  if (policy?.paid_access === false && quotaType !== "exports") {
+    throw new TenantQuotaExceededError(quotaType, 900);
+  }
   const defaults = DEFAULT_TENANT_QUOTAS[quotaType];
   const limit = integer(
     policy?.limit_count ?? defaults.limitCount,

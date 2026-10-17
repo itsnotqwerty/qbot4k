@@ -166,7 +166,7 @@ export class PostgresDiscordActionRepository {
       );
     }
     const installation = (await this.connection.query(
-      `SELECT installation.capabilities_json
+      `SELECT installation.capabilities_json,qbot_community_has_access(observation.community_id) AS paid_access
          FROM observations AS observation
          JOIN community_installations AS installation
            ON installation.id=observation.installation_id
@@ -183,6 +183,9 @@ export class PostgresDiscordActionRepository {
       throw new PermanentJobError(
         "Discord message installation is not active for the job tenant",
       );
+    }
+    if (installation.paid_access === false) {
+      throw new Error("Organization access expired");
     }
     if (
       !stringArray(installation.capabilities_json).includes("announcements")
@@ -203,7 +206,7 @@ export class PostgresDiscordActionRepository {
                 action.duration_seconds,message.platform_message_id,
                 message.channel_id,account.platform_user_id,
                 installation.external_community_id,
-                installation.capabilities_json
+                installation.capabilities_json,qbot_community_has_access(action.community_id) AS paid_access
            FROM moderation_actions AS action
            JOIN messages AS message
              ON message.id=action.message_id
@@ -225,6 +228,9 @@ export class PostgresDiscordActionRepository {
         [job.communityId, messageId],
       );
       for (const action of actions) {
+        if (action.paid_access === false) {
+          throw new Error("Organization access expired");
+        }
         const actionId = positiveInteger(action.id, "action_id");
         if (
           !stringArray(action.capabilities_json).includes("moderation_actions")

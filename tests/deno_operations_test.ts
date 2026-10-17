@@ -6,6 +6,11 @@ import type {
   DatabaseRow,
 } from "../src/data/database.ts";
 import { MIGRATION_NAMES, OperationalService } from "../src/data/operations.ts";
+import { EXPECTED_SCHEMA_VERSION } from "../src/data/database.ts";
+
+Deno.test("migration markers match the readiness schema version", () => {
+  assertEquals(MIGRATION_NAMES.length, EXPECTED_SCHEMA_VERSION);
+});
 
 class FakeConnection implements DatabaseConnection {
   readonly calls: Array<

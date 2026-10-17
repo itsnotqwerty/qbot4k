@@ -73,3 +73,54 @@ Deno.test("structured logger redacts credentials recursively", () => {
     "postgresql://[REDACTED]@db.example/qbot4k token=[REDACTED]",
   );
 });
+
+Deno.test("Stripe credentials are redacted in messages, errors and nested context", () => {
+  const records: LogRecord[] = [];
+  const logger = new StructuredLogger(
+    "qbot4k.stripe",
+    "INFO",
+    (record) => records.push(record),
+  );
+  logger.error(
+    "Stripe rejected sk_test_privateFixture",
+    new Error("Invalid rk_live_restrictedFixture"),
+    {
+      provider_response: ["whsec_signingFixture", "sk_live_otherFixture"],
+      STRIPE_SECRET_KEY: "nonstandard-secret-value",
+      stripeWebhookSecret: "nonstandard-webhook-value",
+    },
+  );
+  const serialized = JSON.stringify(records);
+  for (
+    const value of [
+      "sk_test_privateFixture",
+      "rk_live_restrictedFixture",
+      "whsec_signingFixture",
+      "sk_live_otherFixture",
+      "nonstandard-secret-value",
+      "nonstandard-webhook-value",
+    ]
+  ) {
+    assertEquals(serialized.includes(value), false);
+  }
+  assertEquals(records[0].message, "Stripe rejected [REDACTED]");
+});
+
+Deno.test("reward email credentials and claim fields are redacted", () => {
+  const records: LogRecord[] = [];
+  new StructuredLogger("reward", "INFO", (record) => records.push(record))
+    .error("re_fixtureSecret", new Error("re_another-secret"), {
+      claimCode: "fixture-code",
+      claim_hash: "fixture-hash",
+      claim_nonce: "fixture-nonce",
+    });
+  for (
+    const value of [
+      "re_fixtureSecret",
+      "re_another-secret",
+      "fixture-code",
+      "fixture-hash",
+      "fixture-nonce",
+    ]
+  ) assertEquals(JSON.stringify(records).includes(value), false);
+});

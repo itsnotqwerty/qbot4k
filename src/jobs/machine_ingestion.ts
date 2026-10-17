@@ -109,10 +109,10 @@ export class PostgresMachineIngestionRepository
     const keyHash = await sha256(plaintextKey);
     return await this.connection.transaction(async (connection) => {
       const client = (await connection.query(
-        "SELECT id,scopes_json,rate_limit_per_minute FROM api_clients WHERE key_hash=$1 AND community_id=$2 AND status='active' FOR UPDATE",
+        "SELECT id,scopes_json,rate_limit_per_minute,qbot_community_has_access(community_id) AS paid_access FROM api_clients WHERE key_hash=$1 AND community_id=$2 AND status='active' FOR UPDATE",
         [keyHash, communityId],
       ))[0];
-      if (!client) return false;
+      if (!client || client.paid_access === false) return false;
       const scopes = decodeArray(client.scopes_json);
       if (!scopes.includes("events.write") && !scopes.includes("*")) {
         return false;

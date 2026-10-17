@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@1.0.14";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.14";
 import type {
   DatabaseConnection,
   DatabaseParameter,
@@ -100,4 +100,32 @@ Deno.test("Twitch moderation repository completes tenant-scoped capable actions"
   assertEquals(calls, [["broadcaster-1", "user-1", "ban", "abuse", 0]]);
   assertEquals(connection.calls[0].parameters, [4, 12]);
   assertEquals(connection.calls[1].sql.includes("status='completed'"), true);
+});
+
+Deno.test("expired organization access preserves pending Twitch actions without provider calls", async () => {
+  let calls = 0;
+  const connection = new FakeConnection([[{ paid_access: false }]]);
+  const repository = new PostgresTwitchActionRepository(connection, {
+    moderate: () => {
+      calls++;
+      return Promise.resolve({});
+    },
+  });
+  await assertRejects(
+    () =>
+      repository.moderate({
+        id: 1,
+        communityId: 4,
+        stage: "action",
+        jobType: TWITCH_MODERATION_JOB_TYPE,
+        observationId: null,
+        payload: { message_id: 12 },
+        attempts: 1,
+        maxAttempts: 3,
+      }),
+    Error,
+    "Organization access expired",
+  );
+  assertEquals(calls, 0);
+  assertEquals(connection.calls.length, 1);
 });

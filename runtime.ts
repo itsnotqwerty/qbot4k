@@ -15,6 +15,15 @@ import {
   WebAuthController,
 } from "./src/web/web_auth.ts";
 import { WebDashboardController } from "./src/web/web_dashboard.ts";
+import { WebAccountsController } from "./src/web/web_accounts.ts";
+import { WebBillingController } from "./src/web/web_billing.ts";
+import { WebAdminController } from "./src/web/web_admin.ts";
+import { WebRewardsController } from "./src/web/web_rewards.ts";
+import { createPaidAccessHandler } from "./src/web/web_paid_access.ts";
+import { ResendRewardDelivery } from "./src/providers/reward_email.ts";
+import type { BackerService } from "./src/data/backer_repository.ts";
+import { StripeBillingProvider } from "./src/providers/stripe_billing.ts";
+import type { StripeBillingService } from "./src/data/stripe_billing_repository.ts";
 import { WebIntelligenceController } from "./src/web/web_intelligence.ts";
 import { WebModerationController } from "./src/web/web_moderation.ts";
 import { WebCommandsController } from "./src/web/web_commands.ts";
@@ -389,6 +398,8 @@ export class JobsRoleService implements RoleService {
 
 export class WebRoleService implements RoleService {
   private server: Deno.HttpServer | null = null;
+  private billingAbort: AbortController | null = null;
+  private billingTask: Promise<void> | null = null;
 
   constructor(
     private readonly settings: AppSettings,
@@ -481,6 +492,22 @@ export class WebRoleService implements RoleService {
       this.database.observationCollector(),
       this.settings,
     );
+    const stripe =
+      this.settings.stripeSecretKey && this.settings.stripeWebhookSecret &&
+        this.settings.stripePriceMonthly && this.settings.stripePriceAnnual
+        ? new StripeBillingProvider(this.settings)
+        : null;
+    const billing = stripe ? this.database.stripeBillingService(stripe) : null;
+    const billingOrigin = stripe && this.settings.discordOauthRedirectUri
+      ? new URL(this.settings.discordOauthRedirectUri).origin
+      : null;
+    const delivery = new ResendRewardDelivery(
+      this.settings.rewardEmailApiKey,
+      this.settings.rewardEmailFrom,
+      billingOrigin,
+      this.settings.credentialEncryptionKey,
+    );
+    const rewards = this.database.backerService(delivery, stripe);
     const freshApp = createApp(
       this.monitor,
       auth,
@@ -496,10 +523,22 @@ export class WebRoleService implements RoleService {
       machineIngestion,
       intelligence,
       this.database,
+      new WebAccountsController(
+        auth,
+        this.database.customerAccountService(),
+        this.settings.customerSignupEnabled,
+      ),
+      new WebBillingController(auth, billing, stripe, billingOrigin),
+      new WebAdminController(auth, this.database.platformAdminService()),
+      new WebRewardsController(auth, rewards, billing, delivery.ready),
     );
     const { attachProdBuildCache } = await import("./main.ts");
     await attachProdBuildCache(freshApp);
-    const handler = freshApp.handler();
+    const handler = createPaidAccessHandler(
+      freshApp.handler(),
+      auth,
+      (communityId) => this.database.communityPaidAccess(communityId),
+    );
     const shadowHandler = this.settings.shadowReadUpstreamUrl
       ? createShadowReadHandler(
         handler,
@@ -520,9 +559,38 @@ export class WebRoleService implements RoleService {
       },
       runtimeHandler,
     );
+    if (billing && !this.settings.webReadOnly) {
+      this.billingAbort = new AbortController();
+      this.billingTask = this.processBilling(
+        billing,
+        rewards,
+        AbortSignal.any([signal, this.billingAbort.signal]),
+      );
+    }
+  }
+
+  private async processBilling(
+    service: StripeBillingService,
+    rewards: BackerService,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const logger = new StructuredLogger("qbot4k.stripe");
+    while (!signal.aborted) {
+      try {
+        await service.processPending();
+        await rewards.process();
+      } catch {
+        logger.warning("Stripe billing worker pass failed; retry scheduled");
+      }
+      await abortableDelay(30_000, signal);
+    }
   }
 
   async stop(): Promise<void> {
+    this.billingAbort?.abort();
+    await this.billingTask;
+    this.billingAbort = null;
+    this.billingTask = null;
     if (!this.server) return;
     await this.server.shutdown();
     this.server = null;

@@ -9,13 +9,16 @@ import { roleAllows } from "./web_dashboard.ts";
 import { dashboardDocument } from "./web_document.ts";
 
 export interface CommandRegistry {
-  list(): Promise<
+  list(communityId: number): Promise<
     {
       readonly builtins: readonly DatabaseRow[];
       readonly simple: readonly DatabaseRow[];
     }
   >;
-  update(input: Readonly<Record<string, string | boolean>>): Promise<string>;
+  update(
+    communityId: number,
+    input: Readonly<Record<string, string | boolean>>,
+  ): Promise<string>;
 }
 
 const reserved = new Set(["addcom", "delcom", "editcom", "alias"]);
@@ -23,17 +26,19 @@ const reserved = new Set(["addcom", "delcom", "editcom", "alias"]);
 export class PostgresCommandRegistry implements CommandRegistry {
   constructor(private readonly connection: DatabaseConnection) {}
 
-  async list() {
+  async list(communityId: number) {
     const builtins = await this.connection.query(
       "SELECT command_name,title,description_template,footer_template,enabled FROM command_definitions WHERE command_name NOT IN ('addcom','delcom','editcom') ORDER BY command_name",
     );
     const simple = await this.connection.query(
-      "SELECT command_name,response_template,enabled FROM simple_command_definitions WHERE command_name NOT IN ('addcom','delcom','editcom','alias') ORDER BY command_name",
+      "SELECT command_name,response_template,enabled FROM simple_command_definitions WHERE community_id=$1 AND command_name NOT IN ('addcom','delcom','editcom','alias') ORDER BY command_name",
+      [communityId],
     );
     return Object.freeze({ builtins, simple });
   }
 
   async update(
+    communityId: number,
     input: Readonly<Record<string, string | boolean>>,
   ): Promise<string> {
     const name = String(input.command_name ?? "").trim().toLocaleLowerCase()
@@ -45,8 +50,8 @@ export class PostgresCommandRegistry implements CommandRegistry {
     if (reserved.has(name)) throw new TypeError(`${name} is reserved`);
     if (type === "simple" && action === "delete") {
       await this.connection.query(
-        "DELETE FROM simple_command_definitions WHERE command_name=$1",
-        [name],
+        "DELETE FROM simple_command_definitions WHERE community_id=$1 AND command_name=$2",
+        [communityId, name],
       );
       return `Deleted simple command ${name}`;
     }
@@ -54,8 +59,8 @@ export class PostgresCommandRegistry implements CommandRegistry {
       const response = String(input.response_template ?? "").trim();
       if (!response) throw new TypeError("response_template must not be empty");
       await this.connection.query(
-        `INSERT INTO simple_command_definitions(command_name,response_template,enabled) VALUES ($1,$2,$3) ON CONFLICT(command_name) DO UPDATE SET response_template=EXCLUDED.response_template,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP`,
-        [name, response, input.enabled ? 1 : 0],
+        `INSERT INTO simple_command_definitions(community_id,command_name,response_template,enabled) VALUES ($1,$2,$3,$4) ON CONFLICT(community_id,command_name) DO UPDATE SET response_template=EXCLUDED.response_template,enabled=EXCLUDED.enabled,updated_at=CURRENT_TIMESTAMP`,
+        [communityId, name, response, input.enabled ? 1 : 0],
       );
       return `Saved simple command ${name}`;
     }
@@ -82,11 +87,14 @@ export class WebCommandsController {
   async page(request: Request): Promise<Response> {
     const session = await this.authorize(request);
     if (session instanceof Response) return session;
+    const commands = await this.registry.list(session.communityId!);
+    const platformAdmin = await this.auth.platformSession(request);
     return new Response(
       dashboardDocument(
         render(
           h(CommandsWorkspace, {
-            ...await this.registry.list(),
+            ...commands,
+            builtins: platformAdmin ? commands.builtins : [],
             status: new URL(request.url).searchParams.get("status") ?? "",
           }),
         ),
@@ -103,7 +111,14 @@ export class WebCommandsController {
     }
     try {
       const form = await request.formData();
-      const status = await this.registry.update({
+      const recordType = String(form.get("record_type") ?? "builtin").trim()
+        .toLocaleLowerCase();
+      if (
+        recordType !== "simple" && !await this.auth.platformSession(request)
+      ) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const status = await this.registry.update(session.communityId!, {
         ...Object.fromEntries(form),
         enabled: form.get("enabled") === "1",
       });
