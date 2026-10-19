@@ -3,7 +3,10 @@ import { Buffer } from "node:buffer";
 import { chromium, expect } from "@playwright/test";
 import { createApp } from "../main.ts";
 import { createSessionCookie } from "../src/security/security.ts";
-import { WebAuthController } from "../src/web/web_auth.ts";
+import {
+  type OperatorMembership,
+  WebAuthController,
+} from "../src/web/web_auth.ts";
 import { WebAccountsController } from "../src/web/web_accounts.ts";
 import { WebBillingController } from "../src/web/web_billing.ts";
 import { StripeBillingProvider } from "../src/providers/stripe_billing.ts";
@@ -17,6 +20,7 @@ for (
   Deno.test(`account signup browser ${viewport.width}px`, async () => {
     let writes = 0;
     let platformAdmin = false;
+    let memberships: readonly OperatorMembership[] = [];
     const secret = "local-browser-fixture";
     const auth = new WebAuthController({
       dashboardSessionSecret: secret,
@@ -33,14 +37,18 @@ for (
       completeLogin: () => {
         throw new Error("unused");
       },
-      switchCommunity: () => Promise.resolve(null),
+      switchCommunity: (_operatorId, communityId) =>
+        Promise.resolve(
+          memberships.find((membership) => membership.id === communityId)
+            ?.role ?? null,
+        ),
       auditLogout: () => Promise.resolve(),
       isPlatformAdmin: () => Promise.resolve(platformAdmin),
       resolveSession: () =>
         Promise.resolve({
           status: "active",
           sessionVersion: 1,
-          memberships: [],
+          memberships,
         }),
     });
     const accounts = new WebAccountsController(auth, {
@@ -382,6 +390,76 @@ for (
       );
       const denied = await page.goto(`${baseUrl}/admin`);
       assertEquals(denied?.status(), 403);
+      await page.goto(`${baseUrl}/billing`);
+      const communitySelect = page.getByLabel("Community", { exact: true });
+      await expect(communitySelect).toBeDisabled();
+      await expect(communitySelect.locator("option")).toHaveText(
+        "No communities available",
+      );
+      memberships = [
+        { id: 7, name: "Alpha", slug: "alpha", role: "owner" },
+        {
+          id: 8,
+          name:
+            "Beta <Community> with a very long name for a shared streaming workspace",
+          slug: "beta",
+          role: "viewer",
+        },
+      ];
+      await page.route(
+        "**/account/communities",
+        (route) => route.fulfill({ status: 503, body: "Unavailable" }),
+      );
+      await page.reload();
+      await expect(page.getByRole("status")).toHaveText(
+        "Communities unavailable.",
+      );
+      await expect(communitySelect).toBeDisabled();
+      await page.unroute("**/account/communities");
+      await page.getByRole("button", { name: "Retry", exact: true }).click();
+      await expect(communitySelect).toBeEnabled();
+      await expect(communitySelect.locator("option")).toHaveCount(3);
+      await communitySelect.selectOption("7");
+      await page.getByRole("button", { name: "Switch", exact: true }).click();
+      await expect(page).toHaveURL(`${baseUrl}/dashboard`);
+      await page.goto(`${baseUrl}/billing`);
+      await expect(communitySelect).toHaveValue("7");
+      await expect(page.getByRole("button", { name: "Switch", exact: true }))
+        .toBeDisabled();
+      await communitySelect.selectOption("8");
+      await page.getByRole("button", { name: "Switch", exact: true }).click();
+      await expect(page).toHaveURL(`${baseUrl}/dashboard`);
+      const switched = await page.evaluate(async () => {
+        const response = await fetch("/account/communities");
+        return await response.json();
+      });
+      assertEquals(switched.communityId, 8);
+      const cookies = await context.cookies();
+      const switchedSession = await auth.readSession(
+        new Request(baseUrl, {
+          headers: {
+            cookie: cookies.map((item) => `${item.name}=${item.value}`).join(
+              "; ",
+            ),
+          },
+        }),
+      );
+      assertEquals(switchedSession?.role, "viewer");
+      await page.goto(`${baseUrl}/billing`);
+      await expect(communitySelect).toHaveValue("8");
+      await expect(communitySelect.locator('option[value="8"]')).toHaveText(
+        memberships[1].name,
+      );
+      assertEquals(
+        await page.evaluate(() =>
+          document.documentElement.scrollWidth <= globalThis.innerWidth
+        ),
+        true,
+      );
+      await page.screenshot({
+        path: `test-results/community-switcher-${viewport.width}.png`,
+        fullPage: true,
+      });
       assertEquals(errors, []);
     } finally {
       await browser?.close();

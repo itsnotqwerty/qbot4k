@@ -67,6 +67,12 @@ Deno.test("dashboard and provider policies preserve classifications", () => {
     scope: "account",
     kind: "http",
   });
+  assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_account_communities"), {
+    capability: "account.access",
+    guard: "account_session",
+    scope: "account",
+    kind: "http",
+  });
   assertEquals(DASHBOARD_SURFACE_POLICIES.get("_serve_dashboard_restart"), {
     capability: "platform.manage",
     guard: "platform_session",

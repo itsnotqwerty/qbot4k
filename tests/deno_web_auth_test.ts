@@ -311,6 +311,30 @@ Deno.test("dashboard and community switch enforce the signed tenant session", as
   assertEquals(originMismatch.status, 403);
 });
 
+Deno.test("community list is authenticated, uncached and membership scoped", async () => {
+  const { handler } = fixture();
+  const url = "https://qbot.example/account/communities";
+  const anonymous = await handler(new Request(url));
+  assertEquals(anonymous.status, 401);
+  assertEquals(anonymous.headers.get("cache-control"), "no-store");
+  const session = await createSessionCookie(settings.dashboardSessionSecret, {
+    userId: "42",
+    username: "Operator",
+    role: "owner",
+    expiresAt: "2026-01-02T15:04:05.000Z",
+    communityId: 7,
+    sessionVersion: 3,
+  });
+  const response = await handler(
+    new Request(url, {
+      headers: { cookie: `qbot4k_session=${session}` },
+    }),
+  );
+  assertEquals(response.status, 200);
+  assertEquals(response.headers.get("cache-control"), "no-store");
+  assertEquals(await response.json(), { communityId: 7, memberships });
+});
+
 Deno.test("account-only sessions cannot authorize community dashboards", async () => {
   const auth = new WebAuthController(
     settings,
@@ -369,6 +393,13 @@ Deno.test("community switching rejects revoked and disabled account sessions", a
     assertEquals(response.status, 302);
     assertEquals(response.headers.get("location"), "/login");
     assertEquals(store.switches, []);
+    const list = await auth.communities(
+      new Request("https://qbot.example/account/communities", {
+        headers: { cookie: `qbot4k_session=${cookie}` },
+      }),
+    );
+    assertEquals(list.status, 401);
+    assertEquals(await list.json(), { error: "unauthorized" });
   }
 });
 

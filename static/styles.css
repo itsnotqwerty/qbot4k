@@ -148,6 +148,51 @@ footer a {
 
 .dashboard-header {
   padding: 14px 0;
+  flex-wrap: wrap;
+}
+
+.community-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-width: 0;
+}
+
+.community-switcher label {
+  color: var(--muted);
+}
+
+.community-switcher select {
+  width: 220px;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 36px;
+  padding: 6px 28px 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+  text-overflow: ellipsis;
+}
+
+.community-switcher button {
+  min-height: 36px;
+  padding: 6px 10px;
+}
+
+.community-switcher [hidden] {
+  display: none;
+}
+
+.community-switch-status {
+  color: var(--muted);
+}
+
+.community-switch-status:empty {
+  display: none;
 }
 
 .dashboard-nav {

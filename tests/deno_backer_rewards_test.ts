@@ -214,6 +214,7 @@ Deno.test("paid web gate preserves recovery routes and platform staff access", a
       "/billing",
       "/billing/rewards/claim",
       "/account",
+      "/account/communities",
       "/login",
       "/admin/rewards",
       "/users/42/export.json",

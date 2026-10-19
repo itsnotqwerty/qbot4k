@@ -31,6 +31,7 @@ const dashboardHandlers = [
   "_serve_billing_checkout",
   "_serve_stripe_webhook",
   "_serve_account",
+  "_serve_account_communities",
   "_serve_account_organization_create",
   "_serve_analytics",
   "_serve_analytics_export",
@@ -233,6 +234,7 @@ function dashboardCapability(handler: string): string {
   if (handler === "_serve_stripe_webhook") return "billing.events.ingest";
   if (
     handler === "_serve_account" ||
+    handler === "_serve_account_communities" ||
     handler === "_serve_account_organization_create"
   ) return "account.access";
   if (
@@ -291,6 +293,7 @@ function dashboardGuard(handler: string): string {
   if (handler === "_serve_stripe_webhook") return "stripe_signature";
   if (
     handler === "_serve_account" ||
+    handler === "_serve_account_communities" ||
     handler === "_serve_account_organization_create"
   ) return "account_session";
   if (

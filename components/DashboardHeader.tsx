@@ -39,6 +39,21 @@ export function DashboardHeader(
   return (
     <header class="site-header dashboard-header">
       <a class="brand" href="/dashboard">QBot4K</a>
+      <form
+        class="community-switcher"
+        method="post"
+        action="/community/switch"
+        data-community-switcher
+      >
+        <label for="header-community">Community</label>
+        <select id="header-community" name="community_id" disabled required>
+          <option value="">Loading communities...</option>
+        </select>
+        <button type="submit" disabled>Switch</button>
+        <button type="button" data-community-retry hidden>Retry</button>
+        <span class="community-switch-status" role="status" />
+        <noscript>Enable JavaScript to select a community.</noscript>
+      </form>
       <nav class="dashboard-nav" aria-label="Dashboard navigation">
         {primaryLinks.map(([label, href]) => (
           <a href={href} aria-current={active === href ? "page" : undefined}>

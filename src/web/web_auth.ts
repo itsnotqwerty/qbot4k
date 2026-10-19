@@ -287,6 +287,19 @@ export class WebAuthController {
     );
   }
 
+  async communities(request: Request): Promise<Response> {
+    const headers = { "cache-control": "no-store" };
+    const session = await this.accountSession(request);
+    if (!session) {
+      return Response.json({ error: "unauthorized" }, { status: 401, headers });
+    }
+    const state = await this.store.resolveSession(Number(session.userId));
+    return Response.json({
+      communityId: session.communityId,
+      memberships: state?.memberships ?? [],
+    }, { headers });
+  }
+
   async switchCommunity(request: Request): Promise<Response> {
     if (!this.validOrigin(request)) {
       return Response.json({ error: "origin_mismatch" }, { status: 403 });

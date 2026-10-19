@@ -20,6 +20,47 @@ const THEME_BOOTSTRAP = `
   const accent = localStorage.getItem("qbot4k-theme-accent") || "sky";
   root.dataset.themeMode = mode === "light" ? "light" : "dark";
   root.dataset.themeAccent = swatches.includes(accent) ? accent : "sky";
+  document.addEventListener("DOMContentLoaded", () => {
+    const form = document.querySelector("[data-community-switcher]");
+    if (!form) return;
+    const select = form.querySelector("select");
+    const submit = form.querySelector('[type="submit"]');
+    const retry = form.querySelector("[data-community-retry]");
+    const status = form.querySelector('[role="status"]');
+    let activeCommunity = "";
+    const load = async () => {
+      retry.hidden = true;
+      status.textContent = "";
+      select.disabled = true;
+      submit.disabled = true;
+      try {
+        const response = await fetch("/account/communities", {
+          credentials: "same-origin", cache: "no-store"
+        });
+        if (!response.ok) throw new Error("Community lookup failed");
+        const data = await response.json();
+        activeCommunity = String(data.communityId ?? "");
+        select.replaceChildren();
+        if (data.communityId === null || data.memberships.length === 0) {
+          select.add(new Option(data.memberships.length ? "Select a community" : "No communities available", ""));
+        }
+        for (const membership of data.memberships) {
+          select.add(new Option(membership.name, String(membership.id)));
+        }
+        select.value = activeCommunity;
+        select.disabled = data.memberships.length === 0;
+      } catch {
+        status.textContent = "Communities unavailable.";
+        retry.hidden = false;
+      }
+    };
+    select.addEventListener("change", () => {
+      submit.disabled = !select.value || select.value === activeCommunity;
+    });
+    retry.addEventListener("click", load);
+    form.addEventListener("submit", () => { submit.disabled = true; });
+    load();
+  });
   document.addEventListener("click", (event) => {
     const button = event.target.closest("[data-theme-accent],[data-theme-mode]");
     if (!button) return;

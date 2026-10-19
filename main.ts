@@ -189,6 +189,7 @@ export function createApp(
         (context) => auth.systemHealth(context.req, monitor),
       )
       .post("/logout", (context) => auth.logout(context.req))
+      .get("/account/communities", (context) => auth.communities(context.req))
       .post(
         "/community/switch",
         (context) => auth.switchCommunity(context.req),
