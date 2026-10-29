@@ -51,11 +51,19 @@ export function AccountWorkspace({
                   required
                   maxLength={80}
                   pattern="[a-z0-9]+(-[a-z0-9]+)*"
+                  aria-describedby="organization-slug-help"
+                  title="Use lowercase letters and numbers, separated by single hyphens. No spaces or leading or trailing hyphens."
                   value={slug}
                   autoCapitalize="none"
                   spellcheck={false}
                 />
               </label>
+              <small id="organization-slug-help">
+                Choose a unique slug, 1-80 characters long. Use lowercase
+                letters (a-z) and numbers (0-9), separated by single hyphens. No
+                spaces, underscores, or leading or trailing hyphens. Examples:
+                my-team, team42, acme-2026.
+              </small>
               <div class="form-actions">
                 <button type="submit">Create organization</button>
               </div>

@@ -227,6 +227,11 @@ for (
       await page.goto(`${baseUrl}/account`);
       await expect(page.getByRole("heading", { name: "Create organization" }))
         .toBeVisible();
+      await expect(page.locator("#organization-slug-help")).toBeVisible();
+      await expect(page.getByLabel("Organization slug"))
+        .toHaveAccessibleDescription(
+          "Choose a unique slug, 1-80 characters long. Use lowercase letters (a-z) and numbers (0-9), separated by single hyphens. No spaces, underscores, or leading or trailing hyphens. Examples: my-team, team42, acme-2026.",
+        );
       await page.getByLabel("Organization name").fill("Example Organization");
       await page.getByLabel("Organization slug").fill("INVALID");
       await page.getByRole("button", {

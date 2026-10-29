@@ -2,6 +2,8 @@ import type { AnnouncementSender } from "../../jobs/announcement_dispatch.ts";
 import type { TwitchIrcClient } from "./twitch_irc.ts";
 
 export class TwitchAnnouncementSender implements AnnouncementSender {
+  readonly platform = "twitch";
+
   constructor(private readonly client: TwitchIrcClient) {}
 
   send(

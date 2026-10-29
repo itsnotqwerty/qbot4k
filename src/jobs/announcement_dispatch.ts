@@ -1,6 +1,7 @@
 import type { DatabaseConnection, DatabaseRow } from "../data/database.ts";
 
 export interface AnnouncementSender {
+  readonly platform: string;
   send(
     platform: string,
     externalCommunityId: string,
@@ -49,6 +50,7 @@ export class PostgresAnnouncementDispatcher
                 AND lease.lease_holder IS NOT NULL
                 AND lease.lease_expires_at::timestamptz>CURRENT_TIMESTAMP)
           WHERE a.status='scheduled'
+            AND a.platform=$4
             AND qbot_community_has_access(a.community_id)
             AND a.scheduled_at::timestamptz<=$1::timestamptz
             AND (SELECT COUNT(*) FROM community_announcement_deliveries d
@@ -60,6 +62,7 @@ export class PostgresAnnouncementDispatcher
         now.toISOString(),
         Math.max(1, Math.min(Math.trunc(perCommunityLimit), 100)),
         Math.max(1, Math.min(Math.trunc(limit), 500)),
+        this.sender.platform,
       ],
     );
     let delivered = 0;

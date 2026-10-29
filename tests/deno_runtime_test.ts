@@ -11,6 +11,7 @@ import { StructuredLogger } from "../src/core/logging.ts";
 import type { MaintenanceRunner } from "../src/jobs/maintenance.ts";
 import {
   AnalysisRoleService,
+  AnnouncementWorker,
   JobsRoleService,
   type RoleService,
   runRole,
@@ -207,4 +208,57 @@ Deno.test("Twitch stream polling worker runs immediately and stops on abort", as
   });
   await worker.run(controller.signal);
   assertEquals(polls, 1);
+});
+
+Deno.test("announcement worker dispatches immediately and stops on abort", async () => {
+  const controller = new AbortController();
+  let dispatches = 0;
+  const worker = new AnnouncementWorker({
+    dispatch: () => {
+      dispatches += 1;
+      controller.abort();
+      return Promise.resolve(1);
+    },
+  });
+  await worker.run(controller.signal);
+  assertEquals(dispatches, 1);
+});
+
+Deno.test("announcement worker does not dispatch before its provider is ready", async () => {
+  const controller = new AbortController();
+  let dispatches = 0;
+  const worker = new AnnouncementWorker(
+    {
+      dispatch: () => {
+        dispatches += 1;
+        return Promise.resolve(0);
+      },
+    },
+    500,
+    () => undefined,
+    () => {
+      controller.abort();
+      return false;
+    },
+  );
+  await worker.run(controller.signal);
+  assertEquals(dispatches, 0);
+});
+
+Deno.test("announcement worker reports dispatch errors and stops cleanly", async () => {
+  const controller = new AbortController();
+  const failure = new Error("Database unavailable");
+  const errors: unknown[] = [];
+  const worker = new AnnouncementWorker(
+    {
+      dispatch: () => Promise.reject(failure),
+    },
+    500,
+    (error) => {
+      errors.push(error);
+      controller.abort();
+    },
+  );
+  await worker.run(controller.signal);
+  assertEquals(errors, [failure]);
 });

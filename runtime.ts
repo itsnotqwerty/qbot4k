@@ -70,6 +70,7 @@ import {
   TwitchIrcClient,
 } from "./src/providers/twitch/twitch_irc.ts";
 import { TwitchAnnouncementSender } from "./src/providers/twitch/twitch_announcements.ts";
+import { DiscordAnnouncementSender } from "./src/providers/discord/discord_announcements.ts";
 import type { AnnouncementDispatchService } from "./src/jobs/announcement_dispatch.ts";
 import type { TwitchStreamPollReport } from "./src/providers/twitch/twitch_stream_polling.ts";
 import { ProviderLeaseCoordinator } from "./src/providers/provider_lease_coordinator.ts";
@@ -242,17 +243,17 @@ export class TwitchRoleService implements RoleService {
   }
 }
 
-export class TwitchAnnouncementWorker implements WorkerPool {
+export class AnnouncementWorker implements WorkerPool {
   constructor(
-    private readonly client: TwitchIrcClient,
     private readonly dispatcher: AnnouncementDispatchService,
     private readonly intervalMilliseconds = 500,
     private readonly onError: (error: unknown) => void = () => undefined,
+    private readonly isReady: () => boolean = () => true,
   ) {}
 
   async run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
-      if (this.client.health().status === "ready") {
+      if (this.isReady()) {
         try {
           await this.dispatcher.dispatch();
         } catch (error) {
@@ -261,6 +262,22 @@ export class TwitchAnnouncementWorker implements WorkerPool {
       }
       await abortableDelay(this.intervalMilliseconds, signal);
     }
+  }
+}
+
+export class TwitchAnnouncementWorker extends AnnouncementWorker {
+  constructor(
+    client: TwitchIrcClient,
+    dispatcher: AnnouncementDispatchService,
+    intervalMilliseconds = 500,
+    onError: (error: unknown) => void = () => undefined,
+  ) {
+    super(
+      dispatcher,
+      intervalMilliseconds,
+      onError,
+      () => client.health().status === "ready",
+    );
   }
 }
 
@@ -727,6 +744,15 @@ export async function main(args = Deno.args): Promise<void> {
         5_000,
         settings.discordGuildIds,
         database.discordInstallationHealth(),
+      ),
+      new AnnouncementWorker(
+        database.announcementDispatcher(
+          new DiscordAnnouncementSender(
+            new FetchDiscordApi(settings.discordBotToken!),
+          ),
+        ),
+        500,
+        (error) => logger.error("Discord announcement worker failed", error),
       ),
       new ProcessingWorkerPool(
         database.processingJobStore(),
